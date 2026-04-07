@@ -11,4 +11,9 @@ const (
 	// downloads land. The km-meeting-pipeline.sh upload cron picks files up
 	// from here.
 	meetingsInboxDir = "/data/km/meetings/inbox"
+
+	// Default location of km-meeting-pipeline.sh on the production VPS.
+	// Override at runtime via KM_MEETING_PIPELINE_SCRIPT env var
+	// (used by dev hosts and integration tests).
+	meetingsPipelineScript = "/home/ubuntu/odoo_dev/esmith-specs/scripts/km-meeting-pipeline.sh"
 )

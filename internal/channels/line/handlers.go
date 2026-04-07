@@ -62,6 +62,12 @@ func (c *Channel) handleEvent(event *linebot.Event) {
 	switch msg := event.Message.(type) {
 	case *linebot.TextMessage:
 		text = msg.Text
+		// Process any GDrive shared links in the message body asynchronously.
+		// The agent still sees the original text via HandleMessage below — a
+		// user message like "請整理 https://drive..." should still get an
+		// agent acknowledgment, with the actual file ingestion happening in
+		// parallel. Successes are silent; failures reply via LINE.
+		go c.ingestGdriveLinks(msg.Text, chatID)
 	case *linebot.ImageMessage:
 		path, err := c.downloadContent(msg.ID)
 		if err != nil {
