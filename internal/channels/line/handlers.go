@@ -69,6 +69,14 @@ func (c *Channel) handleEvent(event *linebot.Event) {
 			return
 		}
 		mediaFiles = append(mediaFiles, path)
+	case *linebot.AudioMessage:
+		// Audio messages bypass the agent and go straight to the
+		// km-meeting-pipeline inbox. The downstream cron handles ffmpeg
+		// compression and nlm transcription independently.
+		if err := c.ingestLineAudio(msg, userID, chatID); err != nil {
+			slog.Error("LINE: failed to ingest audio", "err", err, "message_id", msg.ID)
+		}
+		return
 	default:
 		// Unsupported message type — ignore.
 		return
