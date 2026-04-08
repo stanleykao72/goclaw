@@ -16,6 +16,14 @@ import (
 
 // handleEvent dispatches a single LINE webhook event.
 func (c *Channel) handleEvent(event *linebot.Event) {
+	// Postback events drive the meeting writeback Flex flow. They never
+	// need policy filtering or sender bookkeeping — the conversation is
+	// always anchored on a draft that already passed those checks at
+	// AudioMessage time.
+	if event.Type == linebot.EventTypePostback {
+		c.handlePostback(event)
+		return
+	}
 	if event.Type != linebot.EventTypeMessage {
 		return
 	}
@@ -67,7 +75,11 @@ func (c *Channel) handleEvent(event *linebot.Event) {
 		// user message like "請整理 https://drive..." should still get an
 		// agent acknowledgment, with the actual file ingestion happening in
 		// parallel. Successes are silent; failures reply via LINE.
-		go c.ingestGdriveLinks(msg.Text, chatID)
+		//
+		// Per-URL dedup happens inside ingestGdriveLinks itself so the
+		// agent path still receives the original text on resends — only
+		// the file download is suppressed.
+		go c.ingestGdriveLinks(msg.Text, userID, chatID)
 	case *linebot.ImageMessage:
 		path, err := c.downloadContent(msg.ID)
 		if err != nil {
@@ -76,6 +88,19 @@ func (c *Channel) handleEvent(event *linebot.Event) {
 		}
 		mediaFiles = append(mediaFiles, path)
 	case *linebot.AudioMessage:
+		// LINE webhook resend detection — same Message.ID arriving within
+		// the dedup TTL means LINE retried because the first response was
+		// slow. We MUST NOT re-ingest (would create a second draft) — push
+		// a "已收到此會議錄音" reply so the user knows their original send
+		// is still in flight.
+		if c.dedup != nil && c.dedup.SeenOrMark(audioMessageKey(msg.ID)) {
+			slog.Info("LINE: audio message resend detected, skipping ingest",
+				"message_id", msg.ID, "chat", chatID)
+			_ = c.sendChunks(chatID, []string{
+				"⏳ 已收到此會議錄音，正在處理中。完成後會自動傳送選單請你補欄位。",
+			})
+			return
+		}
 		// Audio messages bypass the agent and go straight to the
 		// km-meeting-pipeline inbox. The downstream cron handles ffmpeg
 		// compression and nlm transcription independently.
