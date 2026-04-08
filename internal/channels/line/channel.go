@@ -28,6 +28,13 @@ type Channel struct {
 	cfg            config.LineConfig
 	pairingService store.PairingStore
 	replyTokens    sync.Map // chatID → replyTokenEntry
+
+	// conv tracks the in-progress meeting writeback conversations.
+	// See conversation.go for the full state machine.
+	conv *conversationState
+
+	// watcherCancel stops the draft watcher goroutine on Stop().
+	watcherCancel context.CancelFunc
 }
 
 // New creates a new LINE channel.
@@ -45,21 +52,29 @@ func New(cfg config.LineConfig, msgBus *bus.MessageBus, pairingSvc store.Pairing
 		bot:            bot,
 		cfg:            cfg,
 		pairingService: pairingSvc,
+		conv:           newConversationState(),
 	}, nil
 }
 
 // Type returns the channel type.
 func (c *Channel) Type() string { return "line" }
 
-// Start begins listening. Webhook mode — nothing to poll.
-func (c *Channel) Start(_ context.Context) error {
+// Start begins listening. Webhook mode — the only background work is the
+// km-meeting draft watcher that drives the post-summarization Flex flow.
+func (c *Channel) Start(ctx context.Context) error {
 	c.SetRunning(true)
+	watcherCtx, cancel := context.WithCancel(ctx)
+	c.watcherCancel = cancel
+	go c.startDraftWatcher(watcherCtx)
 	slog.Info("LINE channel started (webhook mode)")
 	return nil
 }
 
 // Stop shuts down the channel.
 func (c *Channel) Stop(_ context.Context) error {
+	if c.watcherCancel != nil {
+		c.watcherCancel()
+	}
 	c.SetRunning(false)
 	slog.Info("LINE channel stopped")
 	return nil

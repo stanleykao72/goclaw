@@ -1,0 +1,310 @@
+package line
+
+import (
+	_ "embed"
+	"encoding/json"
+	"fmt"
+	"net/url"
+	"strconv"
+)
+
+// flexTemplatesVersion is bumped whenever the postback data schema changes.
+// Embedded so the build artifact carries provenance for production debugging.
+//
+//go:embed flex/version.txt
+var flexTemplatesVersion string
+
+// project is a tiny view of project.project for the picker.
+type project struct {
+	ID   int
+	Name string
+}
+
+// partner is a tiny view of res.partner for the attendees picker.
+type partner struct {
+	ID   int
+	Name string
+}
+
+// buildPostbackData encodes the canonical postback payload used by every
+// picker bubble. The format is a URL-encoded query string so handlePostback
+// can route on `action` regardless of which bubble emitted the event.
+//
+//	action=update&ref=<ref>&field=<field>&value=<value>
+//	action=finalize&ref=<ref>
+//	action=cancel&ref=<ref>
+//	action=toggle&ref=<ref>&value=<partner_id>
+//	action=submit_attendees&ref=<ref>
+func buildPostbackData(values map[string]string) string {
+	v := url.Values{}
+	for k, val := range values {
+		v.Set(k, val)
+	}
+	return v.Encode()
+}
+
+// buildProjectPicker renders the project_picker bubble. The user is shown up
+// to 10 most-recently-active projects; tapping a button emits a postback that
+// publish-odoo update <ref> project_id <id> consumes.
+func buildProjectPicker(ref, subject string, projects []project) ([]byte, error) {
+	if len(projects) == 0 {
+		return nil, fmt.Errorf("no projects to show")
+	}
+	if len(projects) > 10 {
+		projects = projects[:10]
+	}
+
+	header := flexTextBox(
+		"📝 "+truncate(subject, 60),
+		"size", "md",
+		"weight", "bold",
+		"wrap", true,
+	)
+	subheader := flexTextBox(
+		"請選擇此次會議所屬專案：",
+		"size", "sm",
+		"color", "#868e96",
+		"wrap", true,
+	)
+
+	body := []map[string]any{header, subheader, flexSeparator(8)}
+
+	for _, p := range projects {
+		body = append(body, flexButton(
+			truncate(p.Name, 38),
+			buildPostbackData(map[string]string{
+				"action": "update",
+				"ref":    ref,
+				"field":  "project_id",
+				"value":  strconv.Itoa(p.ID),
+			}),
+		))
+	}
+
+	bubble := map[string]any{
+		"type": "bubble",
+		"size": "mega",
+		"body": map[string]any{
+			"type":     "box",
+			"layout":   "vertical",
+			"spacing":  "sm",
+			"contents": body,
+		},
+	}
+	return json.Marshal(bubble)
+}
+
+// buildLocationPicker renders the location_picker bubble — 4 fixed
+// quick-reply style buttons.
+func buildLocationPicker(ref string) ([]byte, error) {
+	options := []string{"線上", "工地會議室", "辦公室", "其他"}
+	body := []map[string]any{
+		flexTextBox(
+			"📍 會議地點？",
+			"size", "md",
+			"weight", "bold",
+		),
+		flexSeparator(8),
+	}
+	for _, opt := range options {
+		body = append(body, flexButton(
+			opt,
+			buildPostbackData(map[string]string{
+				"action": "update",
+				"ref":    ref,
+				"field":  "meeting_location",
+				"value":  opt,
+			}),
+		))
+	}
+	bubble := map[string]any{
+		"type": "bubble",
+		"body": map[string]any{
+			"type":     "box",
+			"layout":   "vertical",
+			"spacing":  "sm",
+			"contents": body,
+		},
+	}
+	return json.Marshal(bubble)
+}
+
+// buildAttendeesPicker renders a bubble with toggleable partner buttons.
+// Selected partners are visually distinguished (✓ prefix) and remembered in
+// goclaw memory until the user taps the "完成" submit button.
+func buildAttendeesPicker(ref string, partners []partner, selected map[int]bool) ([]byte, error) {
+	if len(partners) > 10 {
+		partners = partners[:10]
+	}
+	body := []map[string]any{
+		flexTextBox(
+			"👥 出席者（可複選）",
+			"size", "md",
+			"weight", "bold",
+		),
+		flexTextBox(
+			fmt.Sprintf("已選 %d 人", countSelected(selected)),
+			"size", "sm",
+			"color", "#868e96",
+		),
+		flexSeparator(8),
+	}
+	for _, p := range partners {
+		label := truncate(p.Name, 36)
+		style := "secondary"
+		if selected[p.ID] {
+			label = "✓ " + label
+			style = "primary"
+		}
+		btn := flexButton(
+			label,
+			buildPostbackData(map[string]string{
+				"action": "toggle",
+				"ref":    ref,
+				"value":  strconv.Itoa(p.ID),
+			}),
+		)
+		btn["style"] = style
+		body = append(body, btn)
+	}
+
+	body = append(body, flexSeparator(8))
+	doneBtn := flexButton(
+		"✅ 完成選擇",
+		buildPostbackData(map[string]string{
+			"action": "submit_attendees",
+			"ref":    ref,
+		}),
+	)
+	doneBtn["style"] = "primary"
+	doneBtn["color"] = "#51cf66"
+	body = append(body, doneBtn)
+
+	bubble := map[string]any{
+		"type": "bubble",
+		"size": "mega",
+		"body": map[string]any{
+			"type":     "box",
+			"layout":   "vertical",
+			"spacing":  "sm",
+			"contents": body,
+		},
+	}
+	return json.Marshal(bubble)
+}
+
+// buildConfirmBubble renders the final summary + Yes/No bubble.
+func buildConfirmBubble(ref, subject, projectName, location string, attendeeCount int) ([]byte, error) {
+	rows := []map[string]any{
+		flexTextBox("📋 會議記錄確認", "size", "md", "weight", "bold"),
+		flexSeparator(8),
+		flexKVRow("主題", truncate(subject, 60)),
+		flexKVRow("專案", truncate(projectName, 40)),
+		flexKVRow("地點", location),
+		flexKVRow("出席", fmt.Sprintf("%d 人", attendeeCount)),
+		flexSeparator(8),
+	}
+
+	yes := flexButton("✅ 建立會議記錄", buildPostbackData(map[string]string{
+		"action": "finalize",
+		"ref":    ref,
+	}))
+	yes["style"] = "primary"
+	yes["color"] = "#51cf66"
+
+	no := flexButton("❌ 取消", buildPostbackData(map[string]string{
+		"action": "cancel",
+		"ref":    ref,
+	}))
+	no["style"] = "secondary"
+
+	rows = append(rows, yes, no)
+
+	bubble := map[string]any{
+		"type": "bubble",
+		"body": map[string]any{
+			"type":     "box",
+			"layout":   "vertical",
+			"spacing":  "sm",
+			"contents": rows,
+		},
+	}
+	return json.Marshal(bubble)
+}
+
+// --- low-level Flex builders -------------------------------------------------
+
+func flexTextBox(text string, kv ...any) map[string]any {
+	m := map[string]any{
+		"type": "text",
+		"text": text,
+	}
+	for i := 0; i+1 < len(kv); i += 2 {
+		key, _ := kv[i].(string)
+		m[key] = kv[i+1]
+	}
+	return m
+}
+
+func flexButton(label, postbackData string) map[string]any {
+	return map[string]any{
+		"type":   "button",
+		"style":  "secondary",
+		"height": "sm",
+		"action": map[string]any{
+			"type":        "postback",
+			"label":       label,
+			"data":        postbackData,
+			"displayText": label,
+		},
+	}
+}
+
+func flexSeparator(margin int) map[string]any {
+	return map[string]any{
+		"type":   "separator",
+		"margin": fmt.Sprintf("%dpx", margin),
+	}
+}
+
+func flexKVRow(key, value string) map[string]any {
+	return map[string]any{
+		"type":    "box",
+		"layout":  "horizontal",
+		"spacing": "md",
+		"contents": []map[string]any{
+			{
+				"type":  "text",
+				"text":  key,
+				"size":  "sm",
+				"color": "#868e96",
+				"flex":  2,
+			},
+			{
+				"type": "text",
+				"text": value,
+				"size": "sm",
+				"flex": 5,
+				"wrap": true,
+			},
+		},
+	}
+}
+
+func truncate(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max-1]) + "…"
+}
+
+func countSelected(m map[int]bool) int {
+	n := 0
+	for _, v := range m {
+		if v {
+			n++
+		}
+	}
+	return n
+}

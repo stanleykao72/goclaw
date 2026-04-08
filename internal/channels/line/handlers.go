@@ -16,6 +16,14 @@ import (
 
 // handleEvent dispatches a single LINE webhook event.
 func (c *Channel) handleEvent(event *linebot.Event) {
+	// Postback events drive the meeting writeback Flex flow. They never
+	// need policy filtering or sender bookkeeping — the conversation is
+	// always anchored on a draft that already passed those checks at
+	// AudioMessage time.
+	if event.Type == linebot.EventTypePostback {
+		c.handlePostback(event)
+		return
+	}
 	if event.Type != linebot.EventTypeMessage {
 		return
 	}
