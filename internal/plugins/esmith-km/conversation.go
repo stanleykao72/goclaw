@@ -1018,18 +1018,23 @@ func (h *Hook) fetchProjectsViaLIFF(ctx context.Context, lineUserID string) ([]p
 		return nil, fmt.Errorf("liff error: %s", decoded.Result.Error)
 	}
 
-	// Collect the top N job.project.ids and their favorite flags.
+	// Collect ONLY the favorites. Per user feedback on 2026-04-08 E2E:
+	// the picker should show "我的收藏" only, not the full FR three-tier
+	// list (favorites + recent + others). Users curate their meeting
+	// picker explicitly via the FR "我的專案" screen star button; if
+	// they haven't starred anything, fall back to MCP further down.
 	type staged struct {
 		jobProjectID int
 		name         string
-		isFavorite   bool
 	}
 	stagedRows := make([]staged, 0, maxProjectsPerPicker)
 	for _, p := range decoded.Result.Projects {
+		if !p.IsFavorite {
+			continue
+		}
 		stagedRows = append(stagedRows, staged{
 			jobProjectID: p.ID,
 			name:         p.Name,
-			isFavorite:   p.IsFavorite,
 		})
 		if len(stagedRows) >= maxProjectsPerPicker {
 			break
@@ -1072,8 +1077,9 @@ func (h *Hook) fetchProjectsViaLIFF(ctx context.Context, lineUserID string) ([]p
 	}
 
 	// Build the final picker slice with project.project.id as the key.
-	// Preserves the LIFF three-tier order (favorites → recent → others)
-	// since we iterate stagedRows in the same order they arrived.
+	// Preserves the LIFF favorites order (by field.recorder.favorite.sequence).
+	// Every entry here is a favorite by construction — we filtered above —
+	// so IsFavorite is hardcoded true.
 	out := make([]project, 0, len(stagedRows))
 	for _, s := range stagedRows {
 		ppID, ok := ppByJobID[s.jobProjectID]
@@ -1085,7 +1091,7 @@ func (h *Hook) fetchProjectsViaLIFF(ctx context.Context, lineUserID string) ([]p
 		out = append(out, project{
 			ID:         ppID,
 			Name:       s.name,
-			IsFavorite: s.isFavorite,
+			IsFavorite: true,
 		})
 	}
 	return out, nil
