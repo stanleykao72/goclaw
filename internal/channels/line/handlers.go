@@ -56,8 +56,8 @@ func (c *Channel) fanOutPostback(ev PostbackEvent) {
 func (c *Channel) handleEvent(event *linebot.Event) {
 	// Postback events are delivered to every registered MessageHook.
 	// The LINE channel itself has no business-logic opinion on postbacks;
-	// hooks (e.g. esmith-km) interpret the `data` payload and route to
-	// their own state machine.
+	// hooks interpret the `data` payload and route to their own state
+	// machine.
 	if event.Type == linebot.EventTypePostback {
 		var uid, cid string
 		switch event.Source.Type {
@@ -122,9 +122,9 @@ func (c *Channel) handleEvent(event *linebot.Event) {
 	switch msg := event.Message.(type) {
 	case *linebot.TextMessage:
 		text = msg.Text
-		// Fan out to hooks for any subscribers (e.g. esmith-km's GDrive
-		// link handler). The agent still sees the original text via
-		// HandleMessage below — hooks run in parallel to the agent path.
+		// Fan out to hooks for any subscribers. The agent still sees
+		// the original text via HandleMessage below — hooks run in
+		// parallel to the agent path.
 		c.fanOutText(TextEvent{
 			UserID:     userID,
 			ChatID:     chatID,

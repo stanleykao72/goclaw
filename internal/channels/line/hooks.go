@@ -2,7 +2,7 @@
 // goclaw deployments subscribe to LINE webhook events without modifying the
 // channel adapter itself.
 //
-// Design intent (see change goclaw-line-channel-extract-esmith):
+// Design intent:
 //
 //   - Hooks receive flat, typed event structs (AudioEvent, TextEvent,
 //     PostbackEvent). They must NOT import linebot SDK types.
