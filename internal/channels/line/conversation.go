@@ -474,9 +474,33 @@ func (c *Channel) handleFinalize(chatID, ref string) {
 	msg := "✅ 會議記錄已建立"
 	if id > 0 {
 		msg = fmt.Sprintf("%s（id=%d）", msg, id)
+		if link := buildOdooDeepLink("job.meeting.minutes", id); link != "" {
+			msg = msg + "\n\n📎 點此查看：\n" + link
+		}
 	}
 	c.conv.clearRef(ref)
 	_ = c.sendChunks(chatID, []string{msg})
+}
+
+// buildOdooDeepLink returns a clickable web URL to a job.meeting.minutes
+// (or any model) record on stage35. Empty string when the base URL cannot
+// be determined — caller should fall back to a no-link message.
+//
+// Resolution order:
+//  1. ODOO_STAGE35_BASE_URL env (explicit)
+//  2. Strip "/mcp/v1" suffix from ODOO_STAGE35_MCP_URL
+func buildOdooDeepLink(model string, id int) string {
+	base := os.Getenv("ODOO_STAGE35_BASE_URL")
+	if base == "" {
+		mcp := os.Getenv("ODOO_STAGE35_MCP_URL")
+		if mcp == "" {
+			return ""
+		}
+		// Strip path suffix — accept both /mcp/v1 and /mcp/v1/.
+		base = strings.TrimSuffix(strings.TrimSuffix(mcp, "/"), "/mcp/v1")
+	}
+	return fmt.Sprintf("%s/web#id=%d&model=%s&view_type=form",
+		strings.TrimRight(base, "/"), id, model)
 }
 
 func (c *Channel) handleCancel(chatID, ref string) {
@@ -781,23 +805,33 @@ func fetchProjectAttendees(ctx context.Context, ref string) ([]partner, error) {
 	return out, nil
 }
 
+// fetchPartnersFallback returns partners that correspond to internal company
+// users (res.users with share=false). This is the canonical "company employee
+// picker list" — we deliberately do NOT show generic res.partner customer
+// contacts here. Per design D4, attendees are e-smith employees.
 func fetchPartnersFallback(ctx context.Context) ([]partner, error) {
 	var rows []struct {
-		ID   int    `json:"id"`
-		Name string `json:"name"`
+		ID        int   `json:"id"`
+		PartnerID []any `json:"partner_id"` // [id, name] many2one read format
 	}
 	if err := mcpToolCall(ctx, "search_records", map[string]any{
-		"model":  "res.partner",
-		"domain": [][]any{{"is_company", "=", false}, {"active", "=", true}},
-		"fields": []string{"id", "name"},
-		"order":  "id desc",
+		"model":  "res.users",
+		"domain": [][]any{{"active", "=", true}, {"share", "=", false}},
+		"fields": []string{"id", "partner_id"},
+		"order":  "name asc",
 		"limit":  maxAttendeesPerPicker,
 	}, &rows); err != nil {
 		return nil, err
 	}
 	out := make([]partner, 0, len(rows))
 	for _, r := range rows {
-		out = append(out, partner{ID: r.ID, Name: r.Name})
+		if len(r.PartnerID) >= 2 {
+			id, _ := r.PartnerID[0].(float64)
+			name, _ := r.PartnerID[1].(string)
+			if int(id) > 0 {
+				out = append(out, partner{ID: int(id), Name: name})
+			}
+		}
 	}
 	return out, nil
 }
