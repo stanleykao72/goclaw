@@ -75,7 +75,7 @@ func (c *Channel) handleEvent(event *linebot.Event) {
 		// user message like "請整理 https://drive..." should still get an
 		// agent acknowledgment, with the actual file ingestion happening in
 		// parallel. Successes are silent; failures reply via LINE.
-		go c.ingestGdriveLinks(msg.Text, chatID)
+		go c.ingestGdriveLinks(msg.Text, userID, chatID)
 	case *linebot.ImageMessage:
 		path, err := c.downloadContent(msg.ID)
 		if err != nil {

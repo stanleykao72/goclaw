@@ -8,7 +8,9 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
+	"time"
 )
 
 // gdriveURLRegex finds GDrive shared file URLs anywhere in a text body.
@@ -64,13 +66,17 @@ var gdriveErrorMessages = map[string]string{
 // user with an actionable Chinese message. Successes are deliberately
 // silent (per design D Open Q1 — avoid LINE notification spam).
 //
+// On success, the LINE provenance (user_id, chat_id) is patched into
+// the .source.json sidecar that bash wrote, so the eventual draft has
+// the line_chat_id needed for the Phase 3b project_picker push.
+//
 // Safe to call as `go c.ingestGdriveLinks(...)` from the webhook handler;
 // the LINE event return path is not blocked by ingestion latency.
 //
 // Note on reply token race: the agent's HandleMessage path will also try
 // to use the cached reply token. Whichever finishes first wins; the loser
 // silently falls back to PushMessage. Both messages reach the user.
-func (c *Channel) ingestGdriveLinks(text, chatID string) {
+func (c *Channel) ingestGdriveLinks(text, userID, chatID string) {
 	urls := extractGdriveURLs(text)
 	if len(urls) == 0 {
 		return
@@ -94,6 +100,10 @@ func (c *Channel) ingestGdriveLinks(text, chatID string) {
 				"size", result.Size,
 				"chat", chatID,
 			)
+			if perr := patchSidecarWithLineContext(result.File, userID, chatID, url); perr != nil {
+				slog.Warn("LINE: sidecar patch failed",
+					"err", perr, "file", result.File, "chat", chatID)
+			}
 			continue
 		}
 		// Non-ok result: result.Error is one of invalid_url /
@@ -106,6 +116,54 @@ func (c *Channel) ingestGdriveLinks(text, chatID string) {
 		)
 		c.replyGdriveError(chatID, result.Error, result.Message)
 	}
+}
+
+// patchSidecarWithLineContext adds line_user_id / line_chat_id (and the
+// original_url so backfill audits can trace) to the bash-written sidecar.
+// The bash side writes an initial sidecar with source_type=gdrive but
+// without LINE provenance — we merge in the missing fields here so the
+// downstream publish-odoo init builds a draft with line_chat_id set,
+// which is what the Phase 3b draft watcher needs to push the picker.
+//
+// `file` is the basename inside meetingsInboxDir; we resolve the
+// matching .source.json next to it.
+func patchSidecarWithLineContext(file, userID, chatID, originalURL string) error {
+	if file == "" {
+		return nil
+	}
+	sidecarPath := filepath.Join(meetingsInboxDir, file+".source.json")
+	data, err := os.ReadFile(sidecarPath)
+	if err != nil {
+		// No bash-written sidecar — write one fresh so downstream still works.
+		fresh := map[string]any{
+			"source_type":   "gdrive",
+			"line_user_id":  userID,
+			"line_chat_id":  chatID,
+			"original_url":  originalURL,
+			"received_at":   time.Now().UTC().Format(time.RFC3339),
+		}
+		raw, _ := json.MarshalIndent(fresh, "", "  ")
+		return os.WriteFile(sidecarPath, raw, 0o644)
+	}
+
+	var existing map[string]any
+	if err := json.Unmarshal(data, &existing); err != nil {
+		return fmt.Errorf("parse existing sidecar: %w", err)
+	}
+	if existing == nil {
+		existing = map[string]any{}
+	}
+	existing["line_user_id"] = userID
+	existing["line_chat_id"] = chatID
+	if _, ok := existing["original_url"]; !ok {
+		existing["original_url"] = originalURL
+	}
+
+	raw, err := json.MarshalIndent(existing, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(sidecarPath, raw, 0o644)
 }
 
 // runIngestGdrive executes the meeting-pipeline script and parses its
