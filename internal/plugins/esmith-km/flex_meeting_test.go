@@ -109,3 +109,34 @@ func TestBuildOdooDeepLink_EmptyWhenNeitherSet(t *testing.T) {
 		t.Errorf("expected empty, got %q", got)
 	}
 }
+
+// TestBuildProjectPicker_FavoritesGetStarPrefix verifies that projects
+// marked IsFavorite = true get a ⭐ prefix in the button label, and
+// non-favorites do not. Locked in so future edits can't silently
+// drop the star marker.
+func TestBuildProjectPicker_FavoritesGetStarPrefix(t *testing.T) {
+	projects := []project{
+		{ID: 41, Name: "A001-133-大同莊園", IsFavorite: true},
+		{ID: 89, Name: "A001-154-南港機廠社會住宅JV(信箱櫃工程)", IsFavorite: false},
+		{ID: 162, Name: "大陸-忠孝耑序-樓梯欄杆扶手", IsFavorite: true},
+	}
+	raw, err := buildProjectPicker("test-ref", "test-subject", projects)
+	if err != nil {
+		t.Fatalf("buildProjectPicker error: %v", err)
+	}
+	body := string(raw)
+
+	// Favorites must be prefixed with the star emoji.
+	if !strings.Contains(body, "\\u2b50 A001-133-大同莊園") && !strings.Contains(body, "⭐ A001-133-大同莊園") {
+		t.Errorf("expected ⭐ prefix on favorite 'A001-133'; got:\n%s", body)
+	}
+	if !strings.Contains(body, "\\u2b50 大陸-忠孝耑序") && !strings.Contains(body, "⭐ 大陸-忠孝耑序") {
+		t.Errorf("expected ⭐ prefix on favorite '大陸-忠孝耑序'; got:\n%s", body)
+	}
+
+	// Non-favorite must NOT have star prefix directly before its name.
+	if strings.Contains(body, "⭐ A001-154-南港機廠社會住宅JV(信箱") ||
+		strings.Contains(body, "\\u2b50 A001-154-南港機廠社會住宅JV(信箱") {
+		t.Errorf("non-favorite must not have star prefix; got:\n%s", body)
+	}
+}
