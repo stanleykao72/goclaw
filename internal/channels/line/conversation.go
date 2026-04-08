@@ -482,14 +482,21 @@ func (c *Channel) handleFinalize(chatID, ref string) {
 	_ = c.sendChunks(chatID, []string{msg})
 }
 
-// buildOdooDeepLink returns a clickable web URL to a job.meeting.minutes
-// (or any model) record on stage35. Empty string when the base URL cannot
-// be determined — caller should fall back to a no-link message.
+// buildOdooDeepLink returns a clickable Odoo 18 SPA URL to a record.
+// Odoo 18 dropped the legacy `/web#id=...` hash route in the new SPA
+// shell — `/odoo/action-<xml_id>/<id>` is the working format. We hard-
+// code the action XML id for job.meeting.minutes since this whole flow
+// is anchored on that one model; if other models need links later,
+// pass an actionXMLID parameter instead of the model alone.
 //
-// Resolution order:
+// Resolution order for the base URL:
 //  1. ODOO_STAGE35_BASE_URL env (explicit)
 //  2. Strip "/mcp/v1" suffix from ODOO_STAGE35_MCP_URL
-func buildOdooDeepLink(model string, id int) string {
+//
+// Empty string when the base URL cannot be determined.
+const meetingMinutesActionXMLID = "job_working_plan.action_job_meeting_minutes"
+
+func buildOdooDeepLink(_ string, id int) string {
 	base := os.Getenv("ODOO_STAGE35_BASE_URL")
 	if base == "" {
 		mcp := os.Getenv("ODOO_STAGE35_MCP_URL")
@@ -499,8 +506,8 @@ func buildOdooDeepLink(model string, id int) string {
 		// Strip path suffix — accept both /mcp/v1 and /mcp/v1/.
 		base = strings.TrimSuffix(strings.TrimSuffix(mcp, "/"), "/mcp/v1")
 	}
-	return fmt.Sprintf("%s/web#id=%d&model=%s&view_type=form",
-		strings.TrimRight(base, "/"), id, model)
+	return fmt.Sprintf("%s/odoo/action-%s/%d",
+		strings.TrimRight(base, "/"), meetingMinutesActionXMLID, id)
 }
 
 func (c *Channel) handleCancel(chatID, ref string) {
