@@ -1005,8 +1005,9 @@ func (h *Hook) fetchProjectsViaLIFF(ctx context.Context, lineUserID string) ([]p
 			Success  bool   `json:"success"`
 			Error    string `json:"error,omitempty"`
 			Projects []struct {
-				ID   int    `json:"id"`
-				Name string `json:"name"`
+				ID         int    `json:"id"` // job.project.id
+				Name       string `json:"name"`
+				IsFavorite bool   `json:"is_favorite"`
 			} `json:"projects"`
 		} `json:"result"`
 	}
@@ -1017,12 +1018,75 @@ func (h *Hook) fetchProjectsViaLIFF(ctx context.Context, lineUserID string) ([]p
 		return nil, fmt.Errorf("liff error: %s", decoded.Result.Error)
 	}
 
-	out := make([]project, 0, len(decoded.Result.Projects))
+	// Collect the top N job.project.ids and their favorite flags.
+	type staged struct {
+		jobProjectID int
+		name         string
+		isFavorite   bool
+	}
+	stagedRows := make([]staged, 0, maxProjectsPerPicker)
 	for _, p := range decoded.Result.Projects {
-		out = append(out, project{ID: p.ID, Name: p.Name})
-		if len(out) >= maxProjectsPerPicker {
+		stagedRows = append(stagedRows, staged{
+			jobProjectID: p.ID,
+			name:         p.Name,
+			isFavorite:   p.IsFavorite,
+		})
+		if len(stagedRows) >= maxProjectsPerPicker {
 			break
 		}
+	}
+	if len(stagedRows) == 0 {
+		return nil, nil
+	}
+
+	// Resolve job.project.id → project.project.id via the m2o. Required
+	// because job.meeting.minutes.project_id is a FK to project.project,
+	// not job.project — the LIFF endpoint exposes job.project rows keyed
+	// by their own PK so we cannot use those ids directly at finalize
+	// time (see the 2026-04-08 phase 6 E2E error: FK constraint
+	// job_meeting_minutes_project_id_fkey violated when goclaw passed
+	// job.project.id as the meeting's project_id).
+	jobIDs := make([]int, len(stagedRows))
+	for i, r := range stagedRows {
+		jobIDs[i] = r.jobProjectID
+	}
+	var jpRows []struct {
+		ID        int   `json:"id"`
+		ProjectID []any `json:"project_id"` // [pp_id, pp_name] in m2o read format
+	}
+	if err := mcpToolCall(ctx, h.cfg.MCPURL, h.cfg.MCPToken, "search_records", map[string]any{
+		"model":  "job.project",
+		"domain": [][]any{{"id", "in", jobIDs}},
+		"fields": []string{"id", "project_id"},
+		"limit":  len(jobIDs),
+	}, &jpRows); err != nil {
+		return nil, fmt.Errorf("resolve job.project.project_id: %w", err)
+	}
+	ppByJobID := make(map[int]int, len(jpRows))
+	for _, r := range jpRows {
+		if len(r.ProjectID) >= 2 {
+			if f, ok := r.ProjectID[0].(float64); ok && int(f) > 0 {
+				ppByJobID[r.ID] = int(f)
+			}
+		}
+	}
+
+	// Build the final picker slice with project.project.id as the key.
+	// Preserves the LIFF three-tier order (favorites → recent → others)
+	// since we iterate stagedRows in the same order they arrived.
+	out := make([]project, 0, len(stagedRows))
+	for _, s := range stagedRows {
+		ppID, ok := ppByJobID[s.jobProjectID]
+		if !ok {
+			slog.Warn("esmith-km: job.project missing project_id, skipping from picker",
+				"job_project_id", s.jobProjectID)
+			continue
+		}
+		out = append(out, project{
+			ID:         ppID,
+			Name:       s.name,
+			IsFavorite: s.isFavorite,
+		})
 	}
 	return out, nil
 }

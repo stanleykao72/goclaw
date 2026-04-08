@@ -26,9 +26,18 @@ func parseBaseURL(raw string) string {
 }
 
 // project is a tiny view of project.project for the picker.
+// project represents a pickable project in the picker bubble. ID is
+// always the project.project.id (NOT job.project.id) — the LIFF primary
+// path returns job.project records keyed by job.project.id, which we
+// immediately resolve to project.project.id via the job.project.project_id
+// m2o relation so downstream code (finalize → job.meeting.minutes.project_id
+// FK → project.project) never sees the wrong key. IsFavorite mirrors the
+// FR module's "我的專案" favorites flag so the picker bubble can prefix a
+// star marker.
 type project struct {
-	ID   int
-	Name string
+	ID         int
+	Name       string
+	IsFavorite bool
 }
 
 // partner is a tiny view of res.partner for the attendees picker.
@@ -84,8 +93,14 @@ func buildProjectPicker(ref, subject string, projects []project) ([]byte, error)
 	body := []map[string]any{header, subheader, line.FlexSeparator(8)}
 
 	for _, p := range projects {
+		label := line.Truncate(p.Name, 36)
+		if p.IsFavorite {
+			// Prefix with star so favorites are visually distinct,
+			// matching the FR "我的專案" SPA screen's visual language.
+			label = "⭐ " + label
+		}
 		body = append(body, line.FlexButton(
-			line.Truncate(p.Name, 38),
+			label,
 			buildPostbackData(map[string]string{
 				"action": "update",
 				"ref":    ref,
