@@ -52,8 +52,8 @@ import (
 const (
 	draftPushedSuffix      = ".pushed"
 	draftBindPendingSuffix = ".bind_pending"
-	maxProjectsPerPicker   = 10
-	maxAttendeesPerPicker  = 10
+	maxProjectsPerPicker   = 15
+	maxAttendeesPerPicker  = 30
 	mcpRequestTimeout      = 15 * time.Second
 	pipelineExecTimeout    = 30 * time.Second
 
@@ -530,7 +530,11 @@ func (h *Hook) pushProjectPickerForDraft(d *draftJSON) error {
 		return errBindPending
 	}
 
-	projects, err := h.fetchUserProjects(context.Background(), *d.ResolvedUserID)
+	var lineUID string
+	if d.LineUserID != nil {
+		lineUID = *d.LineUserID
+	}
+	projects, err := h.fetchUserProjects(context.Background(), lineUID, *d.ResolvedUserID)
 	if err != nil {
 		return fmt.Errorf("fetch projects: %w", err)
 	}
@@ -912,9 +916,121 @@ var mcpToolCall = func(ctx context.Context, endpoint, token, tool string, args m
 	return errors.New("mcp result has no usable payload")
 }
 
-// fetchUserProjects returns up to 10 most-recently-active project.project
-// rows for the given Odoo user_id. Falls back to all projects on miss.
-func (h *Hook) fetchUserProjects(ctx context.Context, userID int) ([]project, error) {
+// fetchUserProjects returns up to maxProjectsPerPicker projects to show
+// in the picker bubble.
+//
+// Primary path: call the e-smith job_field_recorder LIFF endpoint
+// `/liff/field_recorder/projects` with the LINE user ID. That endpoint
+// applies the FR module's "my projects" logic: favorites → recent →
+// others, scoped via Odoo record rules under the employee's user
+// context. This is the same three-tier ordering the FR SPA shows,
+// which is what operators expect.
+//
+// Fallback path (when LIFF is unreachable or returns zero): the older
+// MCP-based query against project.project filtered by user_id. That
+// path is known to be incomplete (see the 2026-04-08 dual-review
+// findings — it queries project.project instead of job.project, so
+// it may show projects without active working plans), but it is kept
+// as a safety net so the picker never silently fails.
+func (h *Hook) fetchUserProjects(ctx context.Context, lineUserID string, fallbackUserID int) ([]project, error) {
+	if lineUserID != "" {
+		projects, err := h.fetchProjectsViaLIFF(ctx, lineUserID)
+		if err == nil && len(projects) > 0 {
+			rememberProjectNames(projects)
+			return projects, nil
+		}
+		if err != nil {
+			slog.Warn("esmith-km: LIFF project fetch failed, falling back to MCP",
+				"line_user_id", lineUserID, "err", err)
+		}
+	}
+	return h.fetchUserProjectsViaMCP(ctx, fallbackUserID)
+}
+
+// fetchProjectsViaLIFF calls the e-smith job_field_recorder LIFF endpoint
+// `/liff/field_recorder/projects`. The endpoint uses `type='json'` which
+// means it follows the Odoo JSON-RPC 2.0 envelope:
+//
+//	{"jsonrpc":"2.0","method":"call","params":{...},"id":1}
+//
+// and returns:
+//
+//	{"jsonrpc":"2.0","id":1,"result":{"success":true,"projects":[...]}}
+//
+// On Odoo-side errors the `result` object has `success: false` and an
+// `error` field — we treat that as a non-nil error so the caller can
+// fall back to the MCP path.
+func (h *Hook) fetchProjectsViaLIFF(ctx context.Context, lineUserID string) ([]project, error) {
+	base := parseBaseURL(h.cfg.MCPURL)
+	if base == "" {
+		base = h.cfg.OdooBaseURL
+	}
+	if base == "" {
+		return nil, errors.New("esmith-km: LIFF base URL not configured")
+	}
+	endpoint := strings.TrimRight(base, "/") + "/liff/field_recorder/projects"
+
+	envelope := map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "call",
+		"id":      1,
+		"params": map[string]any{
+			"line_user_id": lineUserID,
+		},
+	}
+	raw, err := json.Marshal(envelope)
+	if err != nil {
+		return nil, err
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, mcpRequestTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, endpoint, bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("liff http: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("liff http %d", resp.StatusCode)
+	}
+
+	var decoded struct {
+		Result struct {
+			Success  bool   `json:"success"`
+			Error    string `json:"error,omitempty"`
+			Projects []struct {
+				ID   int    `json:"id"`
+				Name string `json:"name"`
+			} `json:"projects"`
+		} `json:"result"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+		return nil, fmt.Errorf("liff decode: %w", err)
+	}
+	if !decoded.Result.Success {
+		return nil, fmt.Errorf("liff error: %s", decoded.Result.Error)
+	}
+
+	out := make([]project, 0, len(decoded.Result.Projects))
+	for _, p := range decoded.Result.Projects {
+		out = append(out, project{ID: p.ID, Name: p.Name})
+		if len(out) >= maxProjectsPerPicker {
+			break
+		}
+	}
+	return out, nil
+}
+
+// fetchUserProjectsViaMCP is the legacy MCP-based query kept as a
+// fallback for when the LIFF endpoint is unreachable. See fetchUserProjects
+// for the primary path.
+func (h *Hook) fetchUserProjectsViaMCP(ctx context.Context, userID int) ([]project, error) {
 	args := map[string]any{
 		"model":  "project.project",
 		"domain": [][]any{{"user_id", "=", userID}},

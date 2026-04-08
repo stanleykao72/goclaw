@@ -213,8 +213,10 @@ func TestFetchUserProjects_UsesMCPCallAndFallsBackOnEmpty(t *testing.T) {
 	}
 
 	// Use a Hook with stub endpoint/token — the stub ignores them anyway.
+	// Pass empty lineUserID so fetchUserProjects skips the LIFF path and
+	// exercises the MCP fallback we're stubbing here.
 	h := New(Config{MCPURL: "http://stub", MCPToken: "stub-token"})
-	got, err := h.fetchUserProjects(context.Background(), 42)
+	got, err := h.fetchUserProjects(context.Background(), "", 42)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}

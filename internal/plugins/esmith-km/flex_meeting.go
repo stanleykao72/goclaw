@@ -10,6 +10,21 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/channels/line"
 )
 
+// parseBaseURL extracts the scheme+host origin from a URL, discarding any
+// path / query / fragment. Used by buildOdooDeepLink to derive the Odoo
+// base URL from the MCP endpoint (which points at `/mcp/v1/message` etc).
+// Returns empty string on parse failure.
+func parseBaseURL(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host
+}
+
 // project is a tiny view of project.project for the picker.
 type project struct {
 	ID   int
@@ -44,15 +59,13 @@ func buildPostbackData(values map[string]string) string {
 	return v.Encode()
 }
 
-// buildProjectPicker renders the project_picker bubble. The user is shown up
-// to 10 most-recently-active projects; tapping a button emits a postback that
-// publish-odoo update <ref> project_id <id> consumes.
+// buildProjectPicker renders the project_picker bubble. The caller is
+// responsible for enforcing the picker size cap — this builder trusts
+// whatever slice it receives. Upstream callers use maxProjectsPerPicker
+// as the hard limit.
 func buildProjectPicker(ref, subject string, projects []project) ([]byte, error) {
 	if len(projects) == 0 {
 		return nil, fmt.Errorf("no projects to show")
-	}
-	if len(projects) > 10 {
-		projects = projects[:10]
 	}
 
 	header := line.FlexTextBox(
@@ -133,10 +146,11 @@ func buildLocationPicker(ref string) ([]byte, error) {
 // buildAttendeesPicker renders a bubble with toggleable partner buttons.
 // Selected partners are visually distinguished (✓ prefix) and remembered in
 // goclaw memory until the user taps the "完成" submit button.
+//
+// The caller is responsible for enforcing the picker size cap — this
+// builder trusts whatever slice it receives. Upstream callers use
+// maxAttendeesPerPicker as the hard limit.
 func buildAttendeesPicker(ref string, partners []partner, selected map[int]bool) ([]byte, error) {
-	if len(partners) > 10 {
-		partners = partners[:10]
-	}
 	body := []map[string]any{
 		line.FlexTextBox(
 			"👥 出席者（可複選）",
@@ -241,15 +255,19 @@ func buildConfirmBubble(ref, subject, projectName, location string, attendeeCoun
 //
 // Resolution order for the base URL:
 //  1. h.cfg.OdooBaseURL (explicit)
-//  2. Strip "/mcp/v1" suffix from h.cfg.MCPURL
+//  2. scheme+host of h.cfg.MCPURL (via url.Parse)
 //
-// Empty string when the base URL cannot be determined. The plugin is now
-// a closed system w.r.t. config — no env-var fallback. cmd/ is responsible
-// for populating Config from env.
+// The previous TrimSuffix("/mcp/v1") approach was broken for MCP URLs
+// that ended with `/mcp/v1/message` (which stage35's MCP endpoint does
+// as of 2026-04) — the suffix never matched and the full URL including
+// `/mcp/v1/message` became the deep link base, producing 404s like
+// `https://.../mcp/v1/message/odoo/action-.../494`.
+//
+// Empty string when the base URL cannot be determined.
 func (h *Hook) buildOdooDeepLink(_ string, id int) string {
 	base := h.cfg.OdooBaseURL
-	if base == "" && h.cfg.MCPURL != "" {
-		base = strings.TrimSuffix(strings.TrimSuffix(h.cfg.MCPURL, "/"), "/mcp/v1")
+	if base == "" {
+		base = parseBaseURL(h.cfg.MCPURL)
 	}
 	if base == "" {
 		return ""
