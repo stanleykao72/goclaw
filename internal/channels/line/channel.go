@@ -33,6 +33,11 @@ type Channel struct {
 	// See conversation.go for the full state machine.
 	conv *conversationState
 
+	// dedup is the LINE webhook resend detector. Shared between
+	// AudioMessage and TextMessage (GDrive link) paths.
+	// See dedup.go for TTL semantics.
+	dedup *dedupCache
+
 	// watcherCancel stops the draft watcher goroutine on Stop().
 	watcherCancel context.CancelFunc
 }
@@ -53,6 +58,7 @@ func New(cfg config.LineConfig, msgBus *bus.MessageBus, pairingSvc store.Pairing
 		cfg:            cfg,
 		pairingService: pairingSvc,
 		conv:           newConversationState(),
+		dedup:          newDedupCache(dedupDefaultTTL),
 	}, nil
 }
 

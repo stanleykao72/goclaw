@@ -56,6 +56,12 @@ const (
 	maxAttendeesPerPicker  = 10
 	mcpRequestTimeout      = 15 * time.Second
 	pipelineExecTimeout    = 30 * time.Second
+
+	// Stale-cleanup runs as part of the draft watcher, but at a slower
+	// cadence so it does not race with the picker push pass. The TTL
+	// itself defaults to 24h to match km-meeting-pipeline.sh DRAFT_TTL_HOURS.
+	draftStaleCheckEvery = 5 * time.Minute
+	draftStaleTTL        = 24 * time.Hour
 )
 
 // finalizeIDRegex extracts the new id from `finalize OK ... id=<N>` lines
@@ -239,22 +245,108 @@ func draftPushedMarker(ref string) string {
 // the project_picker bubble pushed. Idempotent via .pushed marker file —
 // even if goclaw restarts, an already-pushed draft is not pushed again.
 //
+// A second slower ticker runs the stale-draft cleanup pass which pushes a
+// LINE expiry notification and removes drafts whose mtime is past TTL.
+//
 // The watcher exits when ctx is cancelled (Channel.Stop).
 func (c *Channel) startDraftWatcher(ctx context.Context) {
 	interval := getDraftPollInterval()
-	slog.Info("LINE meeting: draft watcher started", "dir", getDraftsDir(), "interval", interval)
+	slog.Info("LINE meeting: draft watcher started",
+		"dir", getDraftsDir(),
+		"interval", interval,
+		"stale_check_every", draftStaleCheckEvery,
+		"stale_ttl", draftStaleTTL,
+	)
 
-	t := time.NewTicker(interval)
-	defer t.Stop()
+	pickerTick := time.NewTicker(interval)
+	defer pickerTick.Stop()
+	staleTick := time.NewTicker(draftStaleCheckEvery)
+	defer staleTick.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			slog.Info("LINE meeting: draft watcher stopped")
 			return
-		case <-t.C:
+		case <-pickerTick.C:
 			c.scanDraftsOnce()
+		case <-staleTick.C:
+			c.cleanupStaleDraftsOnce()
 		}
+	}
+}
+
+// cleanupStaleDraftsOnce removes drafts whose mtime is past draftStaleTTL,
+// pushing a LINE expiry message to the original chat first when chat_id
+// is known. Idempotent: a draft removed in a previous pass simply isn't
+// there next time. Safe to call from a single goroutine.
+//
+// Spec scenario: "使用者放棄 draft → 24h TTL cleanup".
+func (c *Channel) cleanupStaleDraftsOnce() {
+	dir := getDraftsDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			slog.Warn("LINE meeting: stale-cleanup readdir failed", "err", err, "dir", dir)
+		}
+		return
+	}
+
+	cutoff := time.Now().Add(-draftStaleTTL)
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		ref := strings.TrimSuffix(name, ".json")
+		path := filepath.Join(dir, name)
+
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().After(cutoff) {
+			continue // not stale
+		}
+
+		// Best-effort notification before deletion. If the draft is
+		// missing chat_id (gdrive ingest with no LINE provenance), the
+		// notification step is silently skipped — we still delete.
+		d, derr := readDraft(path)
+		if derr == nil && d.LineChatID != nil && *d.LineChatID != "" {
+			msg := fmt.Sprintf(
+				"⏰ 會議草稿「%s」已超過 %d 小時未完成補欄位，已自動清除。\n\n下次傳新的語音檔或 GDrive 連結時可以重新開始。",
+				truncate(d.Subject, 40),
+				int(draftStaleTTL/time.Hour),
+			)
+			if perr := c.sendChunks(*d.LineChatID, []string{msg}); perr != nil {
+				slog.Warn("LINE meeting: stale-cleanup notify failed",
+					"ref", ref, "err", perr)
+				// Push failure does not block deletion — file age is
+				// the source of truth, not whether LINE took the message.
+			}
+		}
+
+		if rerr := os.Remove(path); rerr != nil {
+			slog.Warn("LINE meeting: stale-cleanup remove failed",
+				"ref", ref, "err", rerr)
+			continue
+		}
+		// Also drop the .pushed marker so the dir stays clean.
+		_ = os.Remove(draftPushedMarker(ref))
+
+		// Forget any per-ref in-memory state.
+		if c.conv != nil {
+			c.conv.clearRef(ref)
+		}
+
+		slog.Info("LINE meeting: stale draft removed",
+			"ref", ref,
+			"age_hours", time.Since(info.ModTime()).Hours(),
+		)
 	}
 }
 

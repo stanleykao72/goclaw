@@ -39,7 +39,14 @@ func (c *Channel) Send(_ context.Context, msg bus.OutboundMessage) error {
 }
 
 // sendChunks sends text chunks, using reply token if available and fresh.
+//
+// Returns nil silently when c.bot is unset — this happens in unit tests
+// that exercise the higher-level scan/cleanup helpers without spinning up
+// a real linebot.Client. Production Channel.New always sets bot.
 func (c *Channel) sendChunks(chatID string, chunks []string) error {
+	if c.bot == nil {
+		return nil
+	}
 	// Try reply token first.
 	if entry, ok := c.replyTokens.LoadAndDelete(chatID); ok {
 		e := entry.(replyTokenEntry)

@@ -85,6 +85,18 @@ func (c *Channel) ingestGdriveLinks(text, userID, chatID string) {
 	scriptPath := getMeetingPipelineScript()
 
 	for _, url := range urls {
+		// LINE webhook resend → same URL within dedup TTL means LINE
+		// retried the same TextMessage. Suppress the second ingest so we
+		// don't double-download or create a second draft. The agent path
+		// (HandleMessage in handleEvent) still sees the original text.
+		if c.dedup != nil && c.dedup.SeenOrMark(gdriveURLKey(url)) {
+			slog.Info("LINE: GDrive URL resend detected, skipping ingest",
+				"url", url, "chat", chatID)
+			_ = c.sendChunks(chatID, []string{
+				"⏳ 已收到此 GDrive 連結，正在處理中。完成後會自動傳送選單請你補欄位。",
+			})
+			continue
+		}
 		slog.Info("LINE: ingesting GDrive link", "url", url, "chat", chatID)
 		result, err := runIngestGdrive(scriptPath, url)
 		if err != nil {

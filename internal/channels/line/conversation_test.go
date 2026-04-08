@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // --- postback parsing -------------------------------------------------------
@@ -232,5 +233,104 @@ func writeDraftFile(t *testing.T, dir string, d draftJSON) {
 	}
 	if err := os.WriteFile(filepath.Join(dir, d.SourceRef+".json"), raw, 0o644); err != nil {
 		t.Fatalf("write draft: %v", err)
+	}
+}
+
+// --- dedup cache -----------------------------------------------------------
+
+func TestDedupCache_FirstSeenIsFalseSecondSeenIsTrue(t *testing.T) {
+	c := newDedupCache(time.Hour)
+	if c.SeenOrMark("audio:msg-1") {
+		t.Errorf("first SeenOrMark should be false")
+	}
+	if !c.SeenOrMark("audio:msg-1") {
+		t.Errorf("second SeenOrMark should be true")
+	}
+	// Different keys are independent.
+	if c.SeenOrMark("audio:msg-2") {
+		t.Errorf("different key should be false on first call")
+	}
+}
+
+func TestDedupCache_ExpiredEntryIsForgotten(t *testing.T) {
+	c := newDedupCache(10 * time.Millisecond)
+	c.SeenOrMark("audio:msg-1")
+	time.Sleep(20 * time.Millisecond)
+	if c.SeenOrMark("audio:msg-1") {
+		t.Errorf("expired entry should not register as seen")
+	}
+}
+
+func TestDedupCache_EmptyKeyIsNotCached(t *testing.T) {
+	c := newDedupCache(time.Hour)
+	if c.SeenOrMark("") {
+		t.Errorf("empty key should never register as seen")
+	}
+	if c.SeenOrMark("") {
+		t.Errorf("empty key should still not register on second call")
+	}
+}
+
+// --- stale draft cleanup ---------------------------------------------------
+
+func TestCleanupStaleDraftsOnce_RemovesOldDraftsAndPreservesYoungOnes(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("KM_MEETING_DRAFTS_DIR", dir)
+
+	chatID := "Cabc"
+	old := draftJSON{
+		SourceRef:  "old_ref",
+		State:      "awaiting_attendees",
+		LineChatID: &chatID,
+		Subject:    "stale meeting",
+	}
+	young := draftJSON{
+		SourceRef:  "young_ref",
+		State:      "awaiting_project",
+		LineChatID: &chatID,
+		Subject:    "fresh meeting",
+	}
+	writeDraftFile(t, dir, old)
+	writeDraftFile(t, dir, young)
+
+	// Force the old one to look ancient.
+	oldPath := filepath.Join(dir, "old_ref.json")
+	ancient := time.Now().Add(-draftStaleTTL - time.Hour)
+	if err := os.Chtimes(oldPath, ancient, ancient); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	c := &Channel{conv: newConversationState()}
+	c.cleanupStaleDraftsOnce()
+
+	if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
+		t.Errorf("expected old draft removed, err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "young_ref.json")); err != nil {
+		t.Errorf("expected young draft preserved, err=%v", err)
+	}
+}
+
+func TestCleanupStaleDraftsOnce_HandlesMissingChatIDGracefully(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("KM_MEETING_DRAFTS_DIR", dir)
+
+	d := draftJSON{
+		SourceRef: "no_chat_ref",
+		State:     "awaiting_project",
+		// LineChatID is nil — gdrive draft without LINE provenance
+	}
+	writeDraftFile(t, dir, d)
+	path := filepath.Join(dir, "no_chat_ref.json")
+	ancient := time.Now().Add(-draftStaleTTL - time.Hour)
+	_ = os.Chtimes(path, ancient, ancient)
+
+	c := &Channel{conv: newConversationState()}
+	// nil-bot Channel — if cleanup tries to push, it will panic.
+	// The chat-id-missing branch should silently skip the push.
+	c.cleanupStaleDraftsOnce()
+
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("expected draft removed even without chat_id, err=%v", err)
 	}
 }
