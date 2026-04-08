@@ -4,6 +4,8 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"sync"
+	"time"
 
 	"github.com/nextlevelbuilder/goclaw/internal/channels/line"
 )
@@ -20,6 +22,13 @@ var (
 type Hook struct {
 	cfg   Config
 	dedup *dedupCache
+	conv  *conversationState
+
+	// watcher lifecycle — Start records the cancel func, Stop calls it
+	// and waits briefly for the watcher goroutine to exit.
+	watcherMu     sync.Mutex
+	watcherCancel context.CancelFunc
+	watcherDone   chan struct{}
 }
 
 // New constructs a Hook with the given Config. Missing optional fields
@@ -32,6 +41,7 @@ func New(cfg Config) *Hook {
 	return &Hook{
 		cfg:   filled,
 		dedup: newDedupCache(filled.DedupTTL),
+		conv:  newConversationState(),
 	}
 }
 
@@ -68,20 +78,55 @@ func (h *Hook) OnText(_ context.Context, ev line.TextEvent) error {
 	return nil
 }
 
-// OnPostback is called by the LINE channel for every Postback event.
-// Phase 3: still no-op. Phase 4 moves handlePostback here when
-// conversation.go moves.
-func (h *Hook) OnPostback(_ context.Context, _ line.PostbackEvent) error {
+// OnPostback dispatches a LINE postback event through the km-meeting
+// conversation state machine. Routes on the `action` query-string field
+// to update / toggle / submit_attendees / finalize / cancel handlers.
+func (h *Hook) OnPostback(_ context.Context, ev line.PostbackEvent) error {
+	h.handlePostback(ev)
 	return nil
 }
 
-// Start launches any background goroutines the hook needs (the draft
-// watcher in phase 4). Phase 2: no-op.
-func (h *Hook) Start(_ context.Context) error {
+// Start launches the draft watcher goroutine. Called by the LINE channel's
+// Start after its own init completes. Idempotent — a second Start with a
+// watcher already running is a no-op.
+func (h *Hook) Start(ctx context.Context) error {
+	h.watcherMu.Lock()
+	defer h.watcherMu.Unlock()
+	if h.watcherCancel != nil {
+		return nil // already started
+	}
+	watcherCtx, cancel := context.WithCancel(ctx)
+	h.watcherCancel = cancel
+	h.watcherDone = make(chan struct{})
+	go func() {
+		defer close(h.watcherDone)
+		h.startDraftWatcher(watcherCtx)
+	}()
 	return nil
 }
 
-// Stop tears down background work started in Start. Phase 2: no-op.
+// Stop cancels the draft watcher context and waits briefly for the
+// goroutine to exit. The timeout is short because the watcher select
+// loop responds to ctx.Done within one tick; if it hangs longer than
+// that, we log and return anyway rather than blocking Channel.Stop.
 func (h *Hook) Stop() error {
+	h.watcherMu.Lock()
+	cancel := h.watcherCancel
+	done := h.watcherDone
+	h.watcherCancel = nil
+	h.watcherDone = nil
+	h.watcherMu.Unlock()
+
+	if cancel == nil {
+		return nil
+	}
+	cancel()
+	if done != nil {
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			slog.Warn("LINE meeting: watcher did not exit within 2s of Stop")
+		}
+	}
 	return nil
 }

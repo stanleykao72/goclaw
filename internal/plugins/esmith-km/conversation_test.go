@@ -1,4 +1,4 @@
-package line
+package esmithkm
 
 import (
 	"context"
@@ -9,7 +9,20 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/nextlevelbuilder/goclaw/internal/channels/line"
 )
+
+// newTestHook builds a Hook with a tmp drafts dir and the given sender.
+// Config.WithDefaults fills the rest. Tests that override runPipeline or
+// mcpToolCall must also restore them via deferred assignment.
+func newTestHook(t *testing.T, draftsDir string) *Hook {
+	t.Helper()
+	return New(Config{
+		DraftsDir:    draftsDir,
+		PublishedDir: filepath.Join(draftsDir, "published"),
+	})
+}
 
 // --- postback parsing -------------------------------------------------------
 
@@ -82,11 +95,12 @@ func TestAttendeeSelection_ClearRefRemovesAllStateForThatRef(t *testing.T) {
 func TestRunPublishUpdate_ParsesNextStateFromUpdateOK(t *testing.T) {
 	original := runPipeline
 	defer func() { runPipeline = original }()
-	runPipeline = func(args ...string) (string, error) {
+	runPipeline = func(scriptPath string, args ...string) (string, error) {
 		return "[publish-odoo] update OK 20260408_094612 (state=awaiting_location)\n", nil
 	}
 
-	state, err := runPublishUpdate("20260408_094612", "project_id", "224")
+	h := newTestHook(t, t.TempDir())
+	state, err := h.runPublishUpdate("20260408_094612", "project_id", "224")
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -98,11 +112,12 @@ func TestRunPublishUpdate_ParsesNextStateFromUpdateOK(t *testing.T) {
 func TestRunPublishFinalize_ExtractsNewID(t *testing.T) {
 	original := runPipeline
 	defer func() { runPipeline = original }()
-	runPipeline = func(args ...string) (string, error) {
+	runPipeline = func(scriptPath string, args ...string) (string, error) {
 		return "[publish-odoo] finalize OK 20260408_094612 → job.meeting.minutes id=490\n", nil
 	}
 
-	id, err := runPublishFinalize("20260408_094612")
+	h := newTestHook(t, t.TempDir())
+	id, err := h.runPublishFinalize("20260408_094612")
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -114,11 +129,12 @@ func TestRunPublishFinalize_ExtractsNewID(t *testing.T) {
 func TestRunPublishFinalize_IdempotentSuccessReturnsZeroNoError(t *testing.T) {
 	original := runPipeline
 	defer func() { runPipeline = original }()
-	runPipeline = func(args ...string) (string, error) {
+	runPipeline = func(scriptPath string, args ...string) (string, error) {
 		return "[publish-odoo] finalize: km_source_ref already exists in Odoo (idempotent success)\n", nil
 	}
 
-	id, err := runPublishFinalize("20260408_094612")
+	h := newTestHook(t, t.TempDir())
+	id, err := h.runPublishFinalize("20260408_094612")
 	if err != nil {
 		t.Fatalf("idempotent path should not error: %v", err)
 	}
@@ -131,7 +147,6 @@ func TestRunPublishFinalize_IdempotentSuccessReturnsZeroNoError(t *testing.T) {
 
 func TestScanDraftsOnce_SkipsAlreadyPushedRefs(t *testing.T) {
 	dir := t.TempDir()
-	t.Setenv("KM_MEETING_DRAFTS_DIR", dir)
 
 	chatID := "Cabc"
 	d := draftJSON{
@@ -145,15 +160,14 @@ func TestScanDraftsOnce_SkipsAlreadyPushedRefs(t *testing.T) {
 		t.Fatalf("write marker: %v", err)
 	}
 
-	// We pass a nil-bot Channel — if scanDraftsOnce tries to push, it
-	// will panic on bot.PushMessage. The test passes iff no panic.
-	c := &Channel{conv: newConversationState()}
-	c.scanDraftsOnce()
+	// We pass a Hook with nil Sender — if scanDraftsOnce tries to push, it
+	// will panic on Sender.PushFlex. The test passes iff no panic.
+	h := newTestHook(t, dir)
+	h.scanDraftsOnce()
 }
 
 func TestScanDraftsOnce_MarksNonInitialStateAsPushedAndDoesNotPush(t *testing.T) {
 	dir := t.TempDir()
-	t.Setenv("KM_MEETING_DRAFTS_DIR", dir)
 
 	chatID := "Cabc"
 	d := draftJSON{
@@ -163,8 +177,8 @@ func TestScanDraftsOnce_MarksNonInitialStateAsPushedAndDoesNotPush(t *testing.T)
 	}
 	writeDraftFile(t, dir, d)
 
-	c := &Channel{conv: newConversationState()}
-	c.scanDraftsOnce()
+	h := newTestHook(t, dir)
+	h.scanDraftsOnce()
 
 	if _, err := os.Stat(filepath.Join(dir, "ref2.pushed")); err != nil {
 		t.Errorf("expected .pushed marker after non-initial state scan: %v", err)
@@ -178,15 +192,6 @@ func TestSortedKeysAndJoinIntsCSV(t *testing.T) {
 	keys := sortedKeys(in)
 	if got := joinIntsCSV(keys); got != "522,610,701" {
 		t.Errorf("want 522,610,701, got %q", got)
-	}
-}
-
-func TestTruncateRespectsRuneCount(t *testing.T) {
-	in := strings.Repeat("中", 80)
-	out := truncate(in, 10)
-	// 9 runes + ellipsis
-	if r := []rune(out); len(r) != 10 {
-		t.Errorf("want 10 runes, got %d (%q)", len(r), out)
 	}
 }
 
@@ -264,7 +269,6 @@ func TestParseResolveStdout_ExtractsIDFromBareLine(t *testing.T) {
 
 func TestScanDraftsOnce_BindPendingDoesNotPushTwice(t *testing.T) {
 	dir := t.TempDir()
-	t.Setenv("KM_MEETING_DRAFTS_DIR", dir)
 
 	chatID := "Cabc"
 	uid := "Ufake_unbound_user"
@@ -280,13 +284,13 @@ func TestScanDraftsOnce_BindPendingDoesNotPushTwice(t *testing.T) {
 	// Stub the bash CLI so resolve always returns empty (still unbound).
 	original := runPipeline
 	defer func() { runPipeline = original }()
-	runPipeline = func(args ...string) (string, error) {
+	runPipeline = func(scriptPath string, args ...string) (string, error) {
 		return "", nil
 	}
 
-	c := &Channel{conv: newConversationState()}
+	h := newTestHook(t, dir)
 	// First scan: pushes hint, sets bind_pending marker.
-	c.scanDraftsOnce()
+	h.scanDraftsOnce()
 	if _, err := os.Stat(filepath.Join(dir, "bind_test_ref"+draftBindPendingSuffix)); err != nil {
 		t.Errorf("expected bind_pending marker after first scan, err=%v", err)
 	}
@@ -295,7 +299,7 @@ func TestScanDraftsOnce_BindPendingDoesNotPushTwice(t *testing.T) {
 	}
 
 	// Second scan: still unbound → must NOT re-push or set .pushed.
-	c.scanDraftsOnce()
+	h.scanDraftsOnce()
 	if _, err := os.Stat(filepath.Join(dir, "bind_test_ref"+draftPushedSuffix)); err == nil {
 		t.Errorf("did NOT expect .pushed marker after second unbound scan")
 	}
@@ -305,7 +309,6 @@ func TestScanDraftsOnce_BindPendingDoesNotPushTwice(t *testing.T) {
 
 func TestCleanupStaleDraftsOnce_RemovesOldDraftsAndPreservesYoungOnes(t *testing.T) {
 	dir := t.TempDir()
-	t.Setenv("KM_MEETING_DRAFTS_DIR", dir)
 
 	chatID := "Cabc"
 	old := draftJSON{
@@ -323,15 +326,15 @@ func TestCleanupStaleDraftsOnce_RemovesOldDraftsAndPreservesYoungOnes(t *testing
 	writeDraftFile(t, dir, old)
 	writeDraftFile(t, dir, young)
 
+	h := newTestHook(t, dir)
 	// Force the old one to look ancient.
 	oldPath := filepath.Join(dir, "old_ref.json")
-	ancient := time.Now().Add(-draftStaleTTL - time.Hour)
+	ancient := time.Now().Add(-h.cfg.DraftStaleTTL - time.Hour)
 	if err := os.Chtimes(oldPath, ancient, ancient); err != nil {
 		t.Fatalf("chtimes: %v", err)
 	}
 
-	c := &Channel{conv: newConversationState()}
-	c.cleanupStaleDraftsOnce()
+	h.cleanupStaleDraftsOnce()
 
 	if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
 		t.Errorf("expected old draft removed, err=%v", err)
@@ -343,7 +346,6 @@ func TestCleanupStaleDraftsOnce_RemovesOldDraftsAndPreservesYoungOnes(t *testing
 
 func TestCleanupStaleDraftsOnce_HandlesMissingChatIDGracefully(t *testing.T) {
 	dir := t.TempDir()
-	t.Setenv("KM_MEETING_DRAFTS_DIR", dir)
 
 	d := draftJSON{
 		SourceRef: "no_chat_ref",
@@ -351,16 +353,30 @@ func TestCleanupStaleDraftsOnce_HandlesMissingChatIDGracefully(t *testing.T) {
 		// LineChatID is nil — gdrive draft without LINE provenance
 	}
 	writeDraftFile(t, dir, d)
+
+	h := newTestHook(t, dir)
 	path := filepath.Join(dir, "no_chat_ref.json")
-	ancient := time.Now().Add(-draftStaleTTL - time.Hour)
+	ancient := time.Now().Add(-h.cfg.DraftStaleTTL - time.Hour)
 	_ = os.Chtimes(path, ancient, ancient)
 
-	c := &Channel{conv: newConversationState()}
-	// nil-bot Channel — if cleanup tries to push, it will panic.
-	// The chat-id-missing branch should silently skip the push.
-	c.cleanupStaleDraftsOnce()
+	// nil-sender Hook — if cleanup tries to push, Sender nil-check elides it.
+	// The chat-id-missing branch should silently skip the push regardless.
+	h.cleanupStaleDraftsOnce()
 
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Errorf("expected draft removed even without chat_id, err=%v", err)
+	}
+}
+
+// --- truncate --------------------------------------------------------------
+
+func TestTruncateRespectsRuneCount(t *testing.T) {
+	// line.Truncate is the canonical implementation; the plugin uses it via
+	// the line package. Verify here so any change in channels/line gets
+	// caught by the plugin test suite too.
+	in := strings.Repeat("中", 80)
+	out := line.Truncate(in, 10)
+	if r := []rune(out); len(r) != 10 {
+		t.Errorf("want 10 runes, got %d (%q)", len(r), out)
 	}
 }

@@ -34,21 +34,6 @@ type Channel struct {
 	// before Start() is called; not mutated thereafter (no lock needed
 	// post-start because Register/Start happen in cmd/main.go init).
 	hooks []MessageHook
-
-	// conv tracks the in-progress meeting writeback conversations.
-	// See conversation.go for the full state machine.
-	//
-	// DEPRECATED (phase 1 of goclaw-line-channel-extract-esmith): this
-	// field is kept for the parallel direct-call path that runs alongside
-	// the new hook fan-out. Will be removed in phase 4 once the esmith-km
-	// plugin owns the conversation state.
-	conv *conversationState
-
-	// watcherCancel stops the draft watcher goroutine on Stop().
-	//
-	// DEPRECATED (phase 1 of goclaw-line-channel-extract-esmith): the
-	// watcher moves into the esmith-km Hook.Start lifecycle in phase 4.
-	watcherCancel context.CancelFunc
 }
 
 // New creates a new LINE channel.
@@ -66,7 +51,6 @@ func New(cfg config.LineConfig, msgBus *bus.MessageBus, pairingSvc store.Pairing
 		bot:            bot,
 		cfg:            cfg,
 		pairingService: pairingSvc,
-		conv:           newConversationState(),
 	}, nil
 }
 
@@ -87,10 +71,6 @@ func (c *Channel) RegisterHook(h MessageHook) {
 // Lifecycle.Start on every registered hook that implements it.
 func (c *Channel) Start(ctx context.Context) error {
 	c.SetRunning(true)
-	// TODO(phase 4): remove once the draft watcher moves to esmith-km.
-	watcherCtx, cancel := context.WithCancel(ctx)
-	c.watcherCancel = cancel
-	go c.startDraftWatcher(watcherCtx)
 
 	// Lifecycle scan: start any hook that implements Lifecycle.
 	for _, h := range c.hooks {
@@ -114,9 +94,6 @@ func (c *Channel) Stop(_ context.Context) error {
 				slog.Error("LINE: hook Stop failed", "err", err)
 			}
 		}
-	}
-	if c.watcherCancel != nil {
-		c.watcherCancel()
 	}
 	c.SetRunning(false)
 	slog.Info("LINE channel stopped")

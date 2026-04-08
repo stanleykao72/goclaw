@@ -1,18 +1,15 @@
-package line
+package esmithkm
 
 import (
-	_ "embed"
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"os"
 	"strconv"
-)
+	"strings"
 
-// flexTemplatesVersion is bumped whenever the postback data schema changes.
-// Embedded so the build artifact carries provenance for production debugging.
-//
-//go:embed flex/version.txt
-var flexTemplatesVersion string
+	"github.com/nextlevelbuilder/goclaw/internal/channels/line"
+)
 
 // project is a tiny view of project.project for the picker.
 type project struct {
@@ -25,6 +22,11 @@ type partner struct {
 	ID   int
 	Name string
 }
+
+// meetingMinutesActionXMLID is the Odoo action XML id used to build deep
+// links to job.meeting.minutes records. This whole flow is anchored on
+// one model; if other models ever need links, pass an action id instead.
+const meetingMinutesActionXMLID = "job_working_plan.action_job_meeting_minutes"
 
 // buildPostbackData encodes the canonical postback payload used by every
 // picker bubble. The format is a URL-encoded query string so handlePostback
@@ -54,24 +56,24 @@ func buildProjectPicker(ref, subject string, projects []project) ([]byte, error)
 		projects = projects[:10]
 	}
 
-	header := flexTextBox(
-		"📝 "+truncate(subject, 60),
+	header := line.FlexTextBox(
+		"📝 "+line.Truncate(subject, 60),
 		"size", "md",
 		"weight", "bold",
 		"wrap", true,
 	)
-	subheader := flexTextBox(
+	subheader := line.FlexTextBox(
 		"請選擇此次會議所屬專案：",
 		"size", "sm",
 		"color", "#868e96",
 		"wrap", true,
 	)
 
-	body := []map[string]any{header, subheader, flexSeparator(8)}
+	body := []map[string]any{header, subheader, line.FlexSeparator(8)}
 
 	for _, p := range projects {
-		body = append(body, flexButton(
-			truncate(p.Name, 38),
+		body = append(body, line.FlexButton(
+			line.Truncate(p.Name, 38),
 			buildPostbackData(map[string]string{
 				"action": "update",
 				"ref":    ref,
@@ -99,15 +101,15 @@ func buildProjectPicker(ref, subject string, projects []project) ([]byte, error)
 func buildLocationPicker(ref string) ([]byte, error) {
 	options := []string{"線上", "工地會議室", "辦公室", "其他"}
 	body := []map[string]any{
-		flexTextBox(
+		line.FlexTextBox(
 			"📍 會議地點？",
 			"size", "md",
 			"weight", "bold",
 		),
-		flexSeparator(8),
+		line.FlexSeparator(8),
 	}
 	for _, opt := range options {
-		body = append(body, flexButton(
+		body = append(body, line.FlexButton(
 			opt,
 			buildPostbackData(map[string]string{
 				"action": "update",
@@ -137,26 +139,26 @@ func buildAttendeesPicker(ref string, partners []partner, selected map[int]bool)
 		partners = partners[:10]
 	}
 	body := []map[string]any{
-		flexTextBox(
+		line.FlexTextBox(
 			"👥 出席者（可複選）",
 			"size", "md",
 			"weight", "bold",
 		),
-		flexTextBox(
-			fmt.Sprintf("已選 %d 人", countSelected(selected)),
+		line.FlexTextBox(
+			fmt.Sprintf("已選 %d 人", line.CountSelected(selected)),
 			"size", "sm",
 			"color", "#868e96",
 		),
-		flexSeparator(8),
+		line.FlexSeparator(8),
 	}
 	for _, p := range partners {
-		label := truncate(p.Name, 36)
+		label := line.Truncate(p.Name, 36)
 		style := "secondary"
 		if selected[p.ID] {
 			label = "✓ " + label
 			style = "primary"
 		}
-		btn := flexButton(
+		btn := line.FlexButton(
 			label,
 			buildPostbackData(map[string]string{
 				"action": "toggle",
@@ -168,8 +170,8 @@ func buildAttendeesPicker(ref string, partners []partner, selected map[int]bool)
 		body = append(body, btn)
 	}
 
-	body = append(body, flexSeparator(8))
-	doneBtn := flexButton(
+	body = append(body, line.FlexSeparator(8))
+	doneBtn := line.FlexButton(
 		"✅ 完成選擇",
 		buildPostbackData(map[string]string{
 			"action": "submit_attendees",
@@ -196,23 +198,23 @@ func buildAttendeesPicker(ref string, partners []partner, selected map[int]bool)
 // buildConfirmBubble renders the final summary + Yes/No bubble.
 func buildConfirmBubble(ref, subject, projectName, location string, attendeeCount int) ([]byte, error) {
 	rows := []map[string]any{
-		flexTextBox("📋 會議記錄確認", "size", "md", "weight", "bold"),
-		flexSeparator(8),
-		flexKVRow("主題", truncate(subject, 60)),
-		flexKVRow("專案", truncate(projectName, 40)),
-		flexKVRow("地點", location),
-		flexKVRow("出席", fmt.Sprintf("%d 人", attendeeCount)),
-		flexSeparator(8),
+		line.FlexTextBox("📋 會議記錄確認", "size", "md", "weight", "bold"),
+		line.FlexSeparator(8),
+		line.FlexKVRow("主題", line.Truncate(subject, 60)),
+		line.FlexKVRow("專案", line.Truncate(projectName, 40)),
+		line.FlexKVRow("地點", location),
+		line.FlexKVRow("出席", fmt.Sprintf("%d 人", attendeeCount)),
+		line.FlexSeparator(8),
 	}
 
-	yes := flexButton("✅ 建立會議記錄", buildPostbackData(map[string]string{
+	yes := line.FlexButton("✅ 建立會議記錄", buildPostbackData(map[string]string{
 		"action": "finalize",
 		"ref":    ref,
 	}))
 	yes["style"] = "primary"
 	yes["color"] = "#51cf66"
 
-	no := flexButton("❌ 取消", buildPostbackData(map[string]string{
+	no := line.FlexButton("❌ 取消", buildPostbackData(map[string]string{
 		"action": "cancel",
 		"ref":    ref,
 	}))
@@ -232,79 +234,31 @@ func buildConfirmBubble(ref, subject, projectName, location string, attendeeCoun
 	return json.Marshal(bubble)
 }
 
-// --- low-level Flex builders -------------------------------------------------
-
-func flexTextBox(text string, kv ...any) map[string]any {
-	m := map[string]any{
-		"type": "text",
-		"text": text,
-	}
-	for i := 0; i+1 < len(kv); i += 2 {
-		key, _ := kv[i].(string)
-		m[key] = kv[i+1]
-	}
-	return m
-}
-
-func flexButton(label, postbackData string) map[string]any {
-	return map[string]any{
-		"type":   "button",
-		"style":  "secondary",
-		"height": "sm",
-		"action": map[string]any{
-			"type":        "postback",
-			"label":       label,
-			"data":        postbackData,
-			"displayText": label,
-		},
-	}
-}
-
-func flexSeparator(margin int) map[string]any {
-	return map[string]any{
-		"type":   "separator",
-		"margin": fmt.Sprintf("%dpx", margin),
-	}
-}
-
-func flexKVRow(key, value string) map[string]any {
-	return map[string]any{
-		"type":    "box",
-		"layout":  "horizontal",
-		"spacing": "md",
-		"contents": []map[string]any{
-			{
-				"type":  "text",
-				"text":  key,
-				"size":  "sm",
-				"color": "#868e96",
-				"flex":  2,
-			},
-			{
-				"type": "text",
-				"text": value,
-				"size": "sm",
-				"flex": 5,
-				"wrap": true,
-			},
-		},
-	}
-}
-
-func truncate(s string, max int) string {
-	r := []rune(s)
-	if len(r) <= max {
-		return s
-	}
-	return string(r[:max-1]) + "…"
-}
-
-func countSelected(m map[int]bool) int {
-	n := 0
-	for _, v := range m {
-		if v {
-			n++
+// buildOdooDeepLink returns a clickable Odoo 18 SPA URL to a record.
+// Odoo 18 dropped the legacy `/web#id=...` hash route in the new SPA
+// shell — `/odoo/action-<xml_id>/<id>` is the working format. The `model`
+// arg is currently ignored (everything goes through meetingMinutesActionXMLID)
+// but kept for API compatibility with the previous direct call site.
+//
+// Resolution order for the base URL:
+//  1. h.cfg.OdooBaseURL (explicit)
+//  2. Strip "/mcp/v1" suffix from h.cfg.MCPURL
+//  3. ODOO_STAGE35_BASE_URL env (legacy fallback)
+//
+// Empty string when the base URL cannot be determined.
+func (h *Hook) buildOdooDeepLink(_ string, id int) string {
+	base := h.cfg.OdooBaseURL
+	if base == "" {
+		if h.cfg.MCPURL != "" {
+			base = strings.TrimSuffix(strings.TrimSuffix(h.cfg.MCPURL, "/"), "/mcp/v1")
 		}
 	}
-	return n
+	if base == "" {
+		base = os.Getenv("ODOO_STAGE35_BASE_URL")
+	}
+	if base == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s/odoo/action-%s/%d",
+		strings.TrimRight(base, "/"), meetingMinutesActionXMLID, id)
 }

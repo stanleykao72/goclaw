@@ -54,15 +54,11 @@ func (c *Channel) fanOutPostback(ev PostbackEvent) {
 
 // handleEvent dispatches a single LINE webhook event.
 func (c *Channel) handleEvent(event *linebot.Event) {
-	// Postback events drive the meeting writeback Flex flow. They never
-	// need policy filtering or sender bookkeeping — the conversation is
-	// always anchored on a draft that already passed those checks at
-	// AudioMessage time.
-	//
-	// Phase 1 dual-path: call the existing direct handler AND fan out to
-	// hooks. The direct call is removed in phase 4 once esmith-km owns it.
+	// Postback events are delivered to every registered MessageHook.
+	// The LINE channel itself has no business-logic opinion on postbacks;
+	// hooks (e.g. esmith-km) interpret the `data` payload and route to
+	// their own state machine.
 	if event.Type == linebot.EventTypePostback {
-		c.handlePostback(event)
 		var uid, cid string
 		switch event.Source.Type {
 		case linebot.EventSourceTypeUser:
@@ -128,7 +124,7 @@ func (c *Channel) handleEvent(event *linebot.Event) {
 		text = msg.Text
 		// Fan out to hooks for any subscribers (e.g. esmith-km's GDrive
 		// link handler). The agent still sees the original text via
-		// HandleMessage below — hooks run in parallel, not instead.
+		// HandleMessage below — hooks run in parallel to the agent path.
 		c.fanOutText(TextEvent{
 			UserID:     userID,
 			ChatID:     chatID,
