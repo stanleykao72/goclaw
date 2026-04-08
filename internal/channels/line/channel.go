@@ -29,16 +29,33 @@ type Channel struct {
 	pairingService store.PairingStore
 	replyTokens    sync.Map // chatID → replyTokenEntry
 
+	// hooks are MessageHook plugins registered via RegisterHook.
+	// Events fan out to every hook in registration order. Populated
+	// before Start() is called; not mutated thereafter (no lock needed
+	// post-start because Register/Start happen in cmd/main.go init).
+	hooks []MessageHook
+
 	// conv tracks the in-progress meeting writeback conversations.
 	// See conversation.go for the full state machine.
+	//
+	// DEPRECATED (phase 1 of goclaw-line-channel-extract-esmith): this
+	// field is kept for the parallel direct-call path that runs alongside
+	// the new hook fan-out. Will be removed in phase 4 once the esmith-km
+	// plugin owns the conversation state.
 	conv *conversationState
 
 	// dedup is the LINE webhook resend detector. Shared between
 	// AudioMessage and TextMessage (GDrive link) paths.
 	// See dedup.go for TTL semantics.
+	//
+	// DEPRECATED (phase 1 of goclaw-line-channel-extract-esmith): will
+	// move to the esmith-km plugin in phase 3.
 	dedup *dedupCache
 
 	// watcherCancel stops the draft watcher goroutine on Stop().
+	//
+	// DEPRECATED (phase 1 of goclaw-line-channel-extract-esmith): the
+	// watcher moves into the esmith-km Hook.Start lifecycle in phase 4.
 	watcherCancel context.CancelFunc
 }
 
@@ -65,25 +82,71 @@ func New(cfg config.LineConfig, msgBus *bus.MessageBus, pairingSvc store.Pairing
 // Type returns the channel type.
 func (c *Channel) Type() string { return "line" }
 
-// Start begins listening. Webhook mode — the only background work is the
-// km-meeting draft watcher that drives the post-summarization Flex flow.
+// RegisterHook appends a MessageHook to the channel's fan-out list. Must be
+// called before Start(). Not safe for concurrent use — intended for cmd/main.go
+// wiring at process init.
+func (c *Channel) RegisterHook(h MessageHook) {
+	if h == nil {
+		return
+	}
+	c.hooks = append(c.hooks, h)
+}
+
+// Start begins listening (webhook mode). After its own init, Start calls
+// Lifecycle.Start on every registered hook that implements it.
 func (c *Channel) Start(ctx context.Context) error {
 	c.SetRunning(true)
+	// TODO(phase 4): remove once the draft watcher moves to esmith-km.
 	watcherCtx, cancel := context.WithCancel(ctx)
 	c.watcherCancel = cancel
 	go c.startDraftWatcher(watcherCtx)
-	slog.Info("LINE channel started (webhook mode)")
+
+	// Lifecycle scan: start any hook that implements Lifecycle.
+	for _, h := range c.hooks {
+		if lc, ok := h.(Lifecycle); ok {
+			if err := lc.Start(ctx); err != nil {
+				slog.Error("LINE: hook Start failed", "err", err)
+			}
+		}
+	}
+	slog.Info("LINE channel started (webhook mode)", "hooks", len(c.hooks))
 	return nil
 }
 
-// Stop shuts down the channel.
+// Stop shuts down the channel. Lifecycle hooks are stopped in reverse
+// registration order before the channel itself stops.
 func (c *Channel) Stop(_ context.Context) error {
+	// Stop hooks in reverse registration order.
+	for i := len(c.hooks) - 1; i >= 0; i-- {
+		if lc, ok := c.hooks[i].(Lifecycle); ok {
+			if err := lc.Stop(); err != nil {
+				slog.Error("LINE: hook Stop failed", "err", err)
+			}
+		}
+	}
 	if c.watcherCancel != nil {
 		c.watcherCancel()
 	}
 	c.SetRunning(false)
 	slog.Info("LINE channel stopped")
 	return nil
+}
+
+// SendChunks is the LineSender-interface wrapper around sendChunks. Exported
+// so plugin packages can call it through the LineSender interface without
+// importing the concrete *Channel type.
+func (c *Channel) SendChunks(chatID string, chunks []string) error {
+	return c.sendChunks(chatID, chunks)
+}
+
+// PushFlex is the LineSender-interface wrapper around pushFlex.
+func (c *Channel) PushFlex(chatID, altText string, flexJSON []byte) error {
+	return c.pushFlex(chatID, altText, flexJSON)
+}
+
+// ReplyFlex is the LineSender-interface wrapper around replyFlex.
+func (c *Channel) ReplyFlex(chatID, altText string, flexJSON []byte) error {
+	return c.replyFlex(chatID, altText, flexJSON)
 }
 
 // WebhookHandler returns the HTTP path and handler for LINE webhook callbacks.

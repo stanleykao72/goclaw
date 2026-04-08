@@ -2,6 +2,7 @@ package line
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,14 +15,69 @@ import (
 	"github.com/line/line-bot-sdk-go/v7/linebot"
 )
 
+// fanOutAudio delivers an AudioEvent to every registered hook in a goroutine
+// so one slow hook cannot block others. Errors are logged but do not retry.
+func (c *Channel) fanOutAudio(ev AudioEvent) {
+	for _, h := range c.hooks {
+		h := h
+		go func() {
+			if err := h.OnAudio(context.Background(), ev); err != nil {
+				slog.Error("LINE: hook OnAudio failed", "err", err)
+			}
+		}()
+	}
+}
+
+// fanOutText delivers a TextEvent to every registered hook.
+func (c *Channel) fanOutText(ev TextEvent) {
+	for _, h := range c.hooks {
+		h := h
+		go func() {
+			if err := h.OnText(context.Background(), ev); err != nil {
+				slog.Error("LINE: hook OnText failed", "err", err)
+			}
+		}()
+	}
+}
+
+// fanOutPostback delivers a PostbackEvent to every registered hook.
+func (c *Channel) fanOutPostback(ev PostbackEvent) {
+	for _, h := range c.hooks {
+		h := h
+		go func() {
+			if err := h.OnPostback(context.Background(), ev); err != nil {
+				slog.Error("LINE: hook OnPostback failed", "err", err)
+			}
+		}()
+	}
+}
+
 // handleEvent dispatches a single LINE webhook event.
 func (c *Channel) handleEvent(event *linebot.Event) {
 	// Postback events drive the meeting writeback Flex flow. They never
 	// need policy filtering or sender bookkeeping — the conversation is
 	// always anchored on a draft that already passed those checks at
 	// AudioMessage time.
+	//
+	// Phase 1 dual-path: call the existing direct handler AND fan out to
+	// hooks. The direct call is removed in phase 4 once esmith-km owns it.
 	if event.Type == linebot.EventTypePostback {
 		c.handlePostback(event)
+		var uid, cid string
+		switch event.Source.Type {
+		case linebot.EventSourceTypeUser:
+			uid, cid = event.Source.UserID, event.Source.UserID
+		case linebot.EventSourceTypeGroup:
+			uid, cid = event.Source.UserID, event.Source.GroupID
+		case linebot.EventSourceTypeRoom:
+			uid, cid = event.Source.UserID, event.Source.RoomID
+		}
+		c.fanOutPostback(PostbackEvent{
+			UserID:     uid,
+			ChatID:     cid,
+			Data:       event.Postback.Data,
+			ReplyToken: event.ReplyToken,
+		})
 		return
 	}
 	if event.Type != linebot.EventTypeMessage {
@@ -79,7 +135,15 @@ func (c *Channel) handleEvent(event *linebot.Event) {
 		// Per-URL dedup happens inside ingestGdriveLinks itself so the
 		// agent path still receives the original text on resends — only
 		// the file download is suppressed.
+		//
+		// Phase 1 dual-path: direct call + hook fan-out.
 		go c.ingestGdriveLinks(msg.Text, userID, chatID)
+		c.fanOutText(TextEvent{
+			UserID:     userID,
+			ChatID:     chatID,
+			Text:       msg.Text,
+			ReplyToken: event.ReplyToken,
+		})
 	case *linebot.ImageMessage:
 		path, err := c.downloadContent(msg.ID)
 		if err != nil {
@@ -104,9 +168,19 @@ func (c *Channel) handleEvent(event *linebot.Event) {
 		// Audio messages bypass the agent and go straight to the
 		// km-meeting-pipeline inbox. The downstream cron handles ffmpeg
 		// compression and nlm transcription independently.
+		//
+		// Phase 1 dual-path: direct call + hook fan-out. Hooks receive
+		// just the metadata; the direct call still does the download.
+		// In phase 3 the channel will download FIRST, then fan out to
+		// hooks with TempPath populated, and the direct call goes away.
 		if err := c.ingestLineAudio(msg, userID, chatID); err != nil {
 			slog.Error("LINE: failed to ingest audio", "err", err, "message_id", msg.ID)
 		}
+		c.fanOutAudio(AudioEvent{
+			UserID:    userID,
+			ChatID:    chatID,
+			MessageID: msg.ID,
+		})
 		return
 	default:
 		// Unsupported message type — ignore.
