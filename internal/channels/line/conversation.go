@@ -51,6 +51,7 @@ const (
 	defaultDraftsDir       = "/data/km/meetings/drafts"
 	defaultPublishedDir    = "/data/km/meetings/drafts/published"
 	draftPushedSuffix      = ".pushed"
+	draftBindPendingSuffix = ".bind_pending"
 	draftPollIntervalDef   = 10 * time.Second
 	maxProjectsPerPicker   = 10
 	maxAttendeesPerPicker  = 10
@@ -63,6 +64,12 @@ const (
 	draftStaleCheckEvery = 5 * time.Minute
 	draftStaleTTL        = 24 * time.Hour
 )
+
+// errBindPending is the sentinel returned by pushProjectPickerForDraft when
+// the LINE user is not bound and we want the scan loop to leave the draft
+// in "bind_pending" state (no .pushed marker, so the next scan will retry
+// resolve via tryRecoverBindPending).
+var errBindPending = errors.New("bind pending")
 
 // finalizeIDRegex extracts the new id from `finalize OK ... id=<N>` lines
 // emitted by km-meeting-pipeline.sh publish-odoo finalize.
@@ -239,6 +246,10 @@ func draftPushedMarker(ref string) string {
 	return filepath.Join(getDraftsDir(), ref+draftPushedSuffix)
 }
 
+func draftBindPendingMarker(ref string) string {
+	return filepath.Join(getDraftsDir(), ref+draftBindPendingSuffix)
+}
+
 // --- draft watcher ---------------------------------------------------------
 
 // startDraftWatcher polls drafts/ for new awaiting_project drafts that need
@@ -392,7 +403,27 @@ func (c *Channel) scanDraftsOnce() {
 			continue
 		}
 
+		// Bind-pending recovery: a previous scan pushed the /bind hint
+		// because the LINE user was not bound. Re-attempt resolve via
+		// the bash sync_line helper — if the user has bound since,
+		// patch the draft + clear the bind_pending marker so we can
+		// fall through into the normal picker push.
+		if _, err := os.Stat(draftBindPendingMarker(ref)); err == nil {
+			if c.tryRecoverBindPending(ref, d, path) {
+				// recovery succeeded, draft now has resolved_user_id
+			} else {
+				// still unbound — leave bind_pending marker so the
+				// next scan retries; do NOT re-push the hint to avoid
+				// LINE notification spam
+				continue
+			}
+		}
+
 		if err := c.pushProjectPickerForDraft(d); err != nil {
+			if errors.Is(err, errBindPending) {
+				// expected — scan again next tick to recover
+				continue
+			}
 			slog.Error("LINE meeting: push project_picker failed",
 				"ref", ref, "err", err)
 			continue
@@ -401,6 +432,8 @@ func (c *Channel) scanDraftsOnce() {
 			slog.Warn("LINE meeting: failed to write .pushed marker",
 				"ref", ref, "err", err)
 		}
+		// Clear bind-pending now that we've successfully pushed the picker.
+		_ = os.Remove(draftBindPendingMarker(ref))
 	}
 }
 
@@ -412,13 +445,112 @@ func touchPushedMarker(ref string) error {
 	return f.Close()
 }
 
+func touchBindPendingMarker(ref string) error {
+	f, err := os.Create(draftBindPendingMarker(ref))
+	if err != nil {
+		return err
+	}
+	return f.Close()
+}
+
+// tryRecoverBindPending re-attempts to resolve the LINE user via bash
+// sync_line_resolve helper. On success, patches the draft file in place
+// with the new resolved_user_id and updates the in-memory draftJSON,
+// then notifies the user that resolution succeeded so they understand
+// why a fresh picker bubble is about to land. Returns true on recovery.
+func (c *Channel) tryRecoverBindPending(ref string, d *draftJSON, path string) bool {
+	if d.LineUserID == nil || *d.LineUserID == "" {
+		return false
+	}
+	out, err := runPipeline("publish-odoo", "resolve", *d.LineUserID)
+	if err != nil {
+		slog.Debug("LINE meeting: bind recovery resolve still failing",
+			"ref", ref, "err", err)
+		return false
+	}
+	uid := parseResolveStdout(out)
+	if uid <= 0 {
+		return false
+	}
+
+	// Patch the draft JSON with the new resolved_user_id.
+	if perr := patchDraftResolvedUserID(path, uid); perr != nil {
+		slog.Warn("LINE meeting: bind recovery patch draft failed",
+			"ref", ref, "err", perr)
+		return false
+	}
+	d.ResolvedUserID = &uid
+
+	if d.LineChatID != nil {
+		_ = c.sendChunks(*d.LineChatID, []string{
+			"✅ 已偵測到你完成綁定，正在重新傳送會議補欄位選單…",
+		})
+	}
+	slog.Info("LINE meeting: bind recovery succeeded",
+		"ref", ref, "resolved_user_id", uid)
+	return true
+}
+
+// parseResolveStdout extracts a numeric user id from the bash
+// `publish-odoo resolve <uid>` stdout. The bash side prints just the
+// integer (or empty) on success.
+func parseResolveStdout(out string) int {
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "[") {
+			continue // skip log prefix lines
+		}
+		if id, err := strconv.Atoi(line); err == nil {
+			return id
+		}
+	}
+	return 0
+}
+
+// patchDraftResolvedUserID is an atomic JSON merge that updates exactly
+// one field on the bash-owned draft. We do not invoke jq here — keep
+// the dependency surface small and stay in Go.
+func patchDraftResolvedUserID(path string, uid int) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var m map[string]any
+	if err := json.Unmarshal(data, &m); err != nil {
+		return err
+	}
+	m["resolved_user_id"] = uid
+	out, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, out, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
 func (c *Channel) pushProjectPickerForDraft(d *draftJSON) error {
 	chatID := *d.LineChatID
 
 	if d.ResolvedUserID == nil {
-		// LINE user not bound to a res.users — instruct user to /bind.
-		msg := "👋 已收到語音檔，但找不到對應的 Odoo 使用者。\n\n請先傳送 `/bind <你的 e-smith email>` 完成綁定，之後再傳一次語音檔。"
-		return c.sendChunks(chatID, []string{msg})
+		// LINE user not bound to a res.users — instruct user to /bind
+		// AND mark this draft as bind_pending so the watcher knows to
+		// keep retrying resolve (instead of giving up after the first
+		// hint via the .pushed marker). The bind_pending marker is
+		// idempotent — it gets cleared once recovery succeeds.
+		msg := "👋 已收到語音檔，但找不到對應的 Odoo 使用者。\n\n請先傳送 `/bind <你的 e-smith email>` 完成綁定，綁定成功後系統會自動繼續對話。"
+		if err := touchBindPendingMarker(d.SourceRef); err != nil {
+			slog.Warn("LINE meeting: failed to write .bind_pending marker",
+				"ref", d.SourceRef, "err", err)
+		}
+		// Return a sentinel error so the caller does NOT touch the
+		// .pushed marker — bind-pending state is the authoritative one.
+		if perr := c.sendChunks(chatID, []string{msg}); perr != nil {
+			return perr
+		}
+		return errBindPending
 	}
 
 	projects, err := fetchUserProjects(context.Background(), *d.ResolvedUserID)

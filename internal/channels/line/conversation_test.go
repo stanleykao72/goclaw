@@ -236,6 +236,71 @@ func writeDraftFile(t *testing.T, dir string, d draftJSON) {
 	}
 }
 
+// --- parseResolveStdout ----------------------------------------------------
+
+func TestParseResolveStdout_ExtractsIDFromBareLine(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want int
+	}{
+		{"bare integer", "6\n", 6},
+		{"with log prefix above", "[2026-04-08 06:29:18] [publish-odoo] resolved Ufoo → res.users.id=6\n6\n", 6},
+		{"empty stdout", "", 0},
+		{"only log prefix lines", "[publish-odoo] not found\n", 0},
+		{"multiline whitespace", "  42  \n", 42},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseResolveStdout(tc.in)
+			if got != tc.want {
+				t.Errorf("want %d, got %d", tc.want, got)
+			}
+		})
+	}
+}
+
+// --- bind pending recovery -------------------------------------------------
+
+func TestScanDraftsOnce_BindPendingDoesNotPushTwice(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("KM_MEETING_DRAFTS_DIR", dir)
+
+	chatID := "Cabc"
+	uid := "Ufake_unbound_user"
+	d := draftJSON{
+		SourceRef:      "bind_test_ref",
+		State:          "awaiting_project",
+		LineChatID:     &chatID,
+		LineUserID:     &uid,
+		ResolvedUserID: nil, // unbound
+	}
+	writeDraftFile(t, dir, d)
+
+	// Stub the bash CLI so resolve always returns empty (still unbound).
+	original := runPipeline
+	defer func() { runPipeline = original }()
+	runPipeline = func(args ...string) (string, error) {
+		return "", nil
+	}
+
+	c := &Channel{conv: newConversationState()}
+	// First scan: pushes hint, sets bind_pending marker.
+	c.scanDraftsOnce()
+	if _, err := os.Stat(filepath.Join(dir, "bind_test_ref"+draftBindPendingSuffix)); err != nil {
+		t.Errorf("expected bind_pending marker after first scan, err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "bind_test_ref"+draftPushedSuffix)); err == nil {
+		t.Errorf("did NOT expect .pushed marker for unbound draft")
+	}
+
+	// Second scan: still unbound → must NOT re-push or set .pushed.
+	c.scanDraftsOnce()
+	if _, err := os.Stat(filepath.Join(dir, "bind_test_ref"+draftPushedSuffix)); err == nil {
+		t.Errorf("did NOT expect .pushed marker after second unbound scan")
+	}
+}
+
 // --- dedup cache -----------------------------------------------------------
 
 func TestDedupCache_FirstSeenIsFalseSecondSeenIsTrue(t *testing.T) {
