@@ -16,16 +16,18 @@ import (
 // Unknown types fall back to ".bin"; the km-meeting-pipeline.sh upload cron
 // will skip non-audio extensions, so unknown files do not enter the pipeline.
 var audioContentTypeToExt = map[string]string{
-	"audio/m4a":  ".m4a",
-	"audio/mp4":  ".m4a",
-	"audio/aac":  ".aac",
-	"audio/mp3":  ".mp3",
-	"audio/mpeg": ".mp3",
-	"audio/wav":  ".wav",
-	"audio/wave": ".wav",
+	"audio/m4a":   ".m4a",
+	"audio/x-m4a": ".m4a", // LINE iOS voice messages use this MIME type
+	"audio/mp4":   ".m4a",
+	"audio/aac":   ".aac",
+	"audio/x-aac": ".aac",
+	"audio/mp3":   ".mp3",
+	"audio/mpeg":  ".mp3",
+	"audio/wav":   ".wav",
+	"audio/wave":  ".wav",
 	"audio/x-wav": ".wav",
-	"audio/ogg":  ".ogg",
-	"audio/opus": ".opus",
+	"audio/ogg":   ".ogg",
+	"audio/opus":  ".opus",
 }
 
 // extensionForAudio returns a file extension for the given audio Content-Type.
