@@ -2,8 +2,10 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 
 	"github.com/google/uuid"
@@ -13,8 +15,8 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/channels"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/discord"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/feishu"
-	slackchannel "github.com/nextlevelbuilder/goclaw/internal/channels/slack"
 	linechannel "github.com/nextlevelbuilder/goclaw/internal/channels/line"
+	slackchannel "github.com/nextlevelbuilder/goclaw/internal/channels/slack"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/telegram"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/whatsapp"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/zalo"
@@ -23,9 +25,50 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/config"
 	"github.com/nextlevelbuilder/goclaw/internal/gateway"
 	"github.com/nextlevelbuilder/goclaw/internal/gateway/methods"
+	esmithkm "github.com/nextlevelbuilder/goclaw/internal/plugins/esmith-km"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
 )
+
+// registerEsmithKmHook reads esmith-km env vars and, if present, constructs
+// an esmithkm.Hook and registers it on the given LINE channel. If the
+// required env vars (ODOO_STAGE35_MCP_URL, ODOO_STAGE35_MCP_TOKEN) are
+// missing, the hook is NOT registered — the channel then behaves like a
+// generic LINE adapter, preserving backwards compatibility for any
+// deployment of this fork that does not need km-meeting writeback.
+//
+// This is a best-effort helper: errors are logged, not returned. A missing
+// hook never blocks channel startup.
+func registerEsmithKmHook(ch *linechannel.Channel) {
+	mcpURL := os.Getenv("ODOO_STAGE35_MCP_URL")
+	mcpToken := os.Getenv("ODOO_STAGE35_MCP_TOKEN")
+	if mcpURL == "" || mcpToken == "" {
+		slog.Info("esmith-km: MCP env not set, skipping hook registration")
+		return
+	}
+	hook := esmithkm.New(esmithkm.Config{
+		Sender:      ch,
+		MCPURL:      mcpURL,
+		MCPToken:    mcpToken,
+		OdooBaseURL: os.Getenv("ODOO_STAGE35_BASE_URL"),
+	})
+	ch.RegisterHook(hook)
+	slog.Info("esmith-km: hook registered on LINE channel")
+}
+
+// lineFactoryWithEsmithKm wraps linechannel.Factory to register the
+// esmith-km plugin on every LINE channel instance created from the DB.
+func lineFactoryWithEsmithKm(name string, creds json.RawMessage, cfg json.RawMessage,
+	msgBus *bus.MessageBus, pairingSvc store.PairingStore) (channels.Channel, error) {
+	ch, err := linechannel.Factory(name, creds, cfg, msgBus, pairingSvc)
+	if err != nil {
+		return nil, err
+	}
+	if lc, ok := ch.(*linechannel.Channel); ok {
+		registerEsmithKmHook(lc)
+	}
+	return ch, nil
+}
 
 // registerConfigChannels registers config-based channels as fallback when no DB instances are loaded.
 func registerConfigChannels(cfg *config.Config, channelMgr *channels.Manager, msgBus *bus.MessageBus, pgStores *store.Stores, instanceLoader *channels.InstanceLoader) {
@@ -102,6 +145,7 @@ func registerConfigChannels(cfg *config.Config, channelMgr *channels.Manager, ms
 		if err != nil {
 			slog.Error("failed to initialize line channel", "error", err)
 		} else {
+			registerEsmithKmHook(l)
 			channelMgr.RegisterChannel(channels.TypeLine, l)
 			slog.Info("line channel enabled (config)")
 		}
