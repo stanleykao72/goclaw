@@ -2,6 +2,8 @@ package esmithkm
 
 import (
 	"context"
+	"log/slog"
+	"os"
 
 	"github.com/nextlevelbuilder/goclaw/internal/channels/line"
 )
@@ -15,12 +17,9 @@ var (
 
 // Hook is the e-smith km-meeting plugin's line.MessageHook implementation.
 // It owns the full ingest → conversation → Odoo writeback pipeline.
-//
-// Phase 2: skeleton only. OnAudio / OnText / OnPostback are no-ops.
-// Phases 3-4 move the real logic from internal/channels/line/ into this
-// package and flesh out the methods.
 type Hook struct {
-	cfg Config
+	cfg   Config
+	dedup *dedupCache
 }
 
 // New constructs a Hook with the given Config. Missing optional fields
@@ -29,23 +28,49 @@ type Hook struct {
 // validate them so tests can pass zero values for fields they don't care
 // about.
 func New(cfg Config) *Hook {
-	return &Hook{cfg: cfg.WithDefaults()}
+	filled := cfg.WithDefaults()
+	return &Hook{
+		cfg:   filled,
+		dedup: newDedupCache(filled.DedupTTL),
+	}
 }
 
-// OnAudio is called by the LINE channel for every AudioMessage event.
-// Phase 2: no-op. Phase 3 moves ingestLineAudio here.
-func (h *Hook) OnAudio(_ context.Context, _ line.AudioEvent) error {
-	return nil
+// OnAudio handles a LINE AudioMessage event. The channel has already
+// downloaded the content to ev.TempPath. OnAudio takes ownership: moves
+// the file to the inbox with the km-meeting-pipeline naming convention
+// and writes a sidecar JSON with LINE provenance.
+//
+// Webhook resends (same MessageID within the dedup TTL) are suppressed:
+// the tmp file is deleted and a "已收到" reply is pushed so the user
+// knows their original send is still in flight.
+func (h *Hook) OnAudio(_ context.Context, ev line.AudioEvent) error {
+	if h.dedup != nil && h.dedup.SeenOrMark(audioMessageKey(ev.MessageID)) {
+		slog.Info("LINE: audio message resend detected, skipping ingest",
+			"message_id", ev.MessageID, "chat", ev.ChatID)
+		if ev.TempPath != "" {
+			_ = os.Remove(ev.TempPath)
+		}
+		if h.cfg.Sender != nil {
+			_ = h.cfg.Sender.SendChunks(ev.ChatID, []string{
+				"⏳ 已收到此會議錄音，正在處理中。完成後會自動傳送選單請你補欄位。",
+			})
+		}
+		return nil
+	}
+	return h.ingestAudio(ev.TempPath, ev.ContentType, ev.MessageID, ev.UserID, ev.ChatID)
 }
 
-// OnText is called by the LINE channel for every TextMessage event.
-// Phase 2: no-op. Phase 3 moves ingestGdriveLinks here.
-func (h *Hook) OnText(_ context.Context, _ line.TextEvent) error {
+// OnText handles a LINE TextMessage event. Scans the body for GDrive
+// shared-file URLs and ingests each one via km-meeting-pipeline.sh.
+// Non-URL messages are ignored (the agent path handles them separately).
+func (h *Hook) OnText(_ context.Context, ev line.TextEvent) error {
+	h.ingestGdriveLinks(ev.Text, ev.UserID, ev.ChatID)
 	return nil
 }
 
 // OnPostback is called by the LINE channel for every Postback event.
-// Phase 2: no-op. Phase 4 moves handlePostback here.
+// Phase 3: still no-op. Phase 4 moves handlePostback here when
+// conversation.go moves.
 func (h *Hook) OnPostback(_ context.Context, _ line.PostbackEvent) error {
 	return nil
 }

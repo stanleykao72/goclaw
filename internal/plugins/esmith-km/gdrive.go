@@ -1,4 +1,4 @@
-package line
+package esmithkm
 
 import (
 	"bytes"
@@ -76,25 +76,27 @@ var gdriveErrorMessages = map[string]string{
 // Note on reply token race: the agent's HandleMessage path will also try
 // to use the cached reply token. Whichever finishes first wins; the loser
 // silently falls back to PushMessage. Both messages reach the user.
-func (c *Channel) ingestGdriveLinks(text, userID, chatID string) {
+func (h *Hook) ingestGdriveLinks(text, userID, chatID string) {
 	urls := extractGdriveURLs(text)
 	if len(urls) == 0 {
 		return
 	}
 
-	scriptPath := getMeetingPipelineScript()
+	scriptPath := h.cfg.PipelineScript
 
 	for _, url := range urls {
 		// LINE webhook resend → same URL within dedup TTL means LINE
 		// retried the same TextMessage. Suppress the second ingest so we
 		// don't double-download or create a second draft. The agent path
 		// (HandleMessage in handleEvent) still sees the original text.
-		if c.dedup != nil && c.dedup.SeenOrMark(gdriveURLKey(url)) {
+		if h.dedup != nil && h.dedup.SeenOrMark(gdriveURLKey(url)) {
 			slog.Info("LINE: GDrive URL resend detected, skipping ingest",
 				"url", url, "chat", chatID)
-			_ = c.sendChunks(chatID, []string{
-				"⏳ 已收到此 GDrive 連結，正在處理中。完成後會自動傳送選單請你補欄位。",
-			})
+			if h.cfg.Sender != nil {
+				_ = h.cfg.Sender.SendChunks(chatID, []string{
+					"⏳ 已收到此 GDrive 連結，正在處理中。完成後會自動傳送選單請你補欄位。",
+				})
+			}
 			continue
 		}
 		slog.Info("LINE: ingesting GDrive link", "url", url, "chat", chatID)
@@ -102,7 +104,7 @@ func (c *Channel) ingestGdriveLinks(text, userID, chatID string) {
 		if err != nil {
 			slog.Error("LINE: ingest-gdrive runner error",
 				"err", err, "url", url, "chat", chatID)
-			c.replyGdriveError(chatID, "download_failed", err.Error())
+			h.replyGdriveError(chatID, "download_failed", err.Error())
 			continue
 		}
 		if result.Status == "ok" {
@@ -112,7 +114,7 @@ func (c *Channel) ingestGdriveLinks(text, userID, chatID string) {
 				"size", result.Size,
 				"chat", chatID,
 			)
-			if perr := patchSidecarWithLineContext(result.File, userID, chatID, url); perr != nil {
+			if perr := h.patchSidecarWithLineContext(result.File, userID, chatID, url); perr != nil {
 				slog.Warn("LINE: sidecar patch failed",
 					"err", perr, "file", result.File, "chat", chatID)
 			}
@@ -126,7 +128,7 @@ func (c *Channel) ingestGdriveLinks(text, userID, chatID string) {
 			"file_id", result.FileID,
 			"chat", chatID,
 		)
-		c.replyGdriveError(chatID, result.Error, result.Message)
+		h.replyGdriveError(chatID, result.Error, result.Message)
 	}
 }
 
@@ -139,11 +141,11 @@ func (c *Channel) ingestGdriveLinks(text, userID, chatID string) {
 //
 // `file` is the basename inside meetingsInboxDir; we resolve the
 // matching .source.json next to it.
-func patchSidecarWithLineContext(file, userID, chatID, originalURL string) error {
+func (h *Hook) patchSidecarWithLineContext(file, userID, chatID, originalURL string) error {
 	if file == "" {
 		return nil
 	}
-	sidecarPath := filepath.Join(meetingsInboxDir, file+".source.json")
+	sidecarPath := filepath.Join(h.cfg.InboxDir, file+".source.json")
 	data, err := os.ReadFile(sidecarPath)
 	if err != nil {
 		// No bash-written sidecar — write one fresh so downstream still works.
@@ -209,7 +211,7 @@ func runIngestGdrive(scriptPath, url string) (*ingestGdriveResult, error) {
 // replyGdriveError sends a single LINE message explaining the failure.
 // Uses the same reply-token-then-push fallback as the main agent send
 // path via sendChunks.
-func (c *Channel) replyGdriveError(chatID, errType, detail string) {
+func (h *Hook) replyGdriveError(chatID, errType, detail string) {
 	msg, ok := gdriveErrorMessages[errType]
 	if !ok {
 		msg = "GDrive 連結處理失敗：" + errType
@@ -221,17 +223,13 @@ func (c *Channel) replyGdriveError(chatID, errType, detail string) {
 		msg = msg + "\n（技術細節：" + detail + "）"
 	}
 
-	if err := c.sendChunks(chatID, []string{msg}); err != nil {
+	if h.cfg.Sender == nil {
+		slog.Warn("LINE: no sender configured, skipping GDrive error reply",
+			"chat", chatID, "error_type", errType)
+		return
+	}
+	if err := h.cfg.Sender.SendChunks(chatID, []string{msg}); err != nil {
 		slog.Error("LINE: failed to send GDrive error reply",
 			"err", err, "chat", chatID, "error_type", errType)
 	}
-}
-
-// getMeetingPipelineScript returns the absolute path of km-meeting-pipeline.sh,
-// honoring the KM_MEETING_PIPELINE_SCRIPT env var override.
-func getMeetingPipelineScript() string {
-	if v := os.Getenv("KM_MEETING_PIPELINE_SCRIPT"); v != "" {
-		return v
-	}
-	return meetingsPipelineScript
 }

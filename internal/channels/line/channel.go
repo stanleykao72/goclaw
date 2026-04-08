@@ -44,14 +44,6 @@ type Channel struct {
 	// plugin owns the conversation state.
 	conv *conversationState
 
-	// dedup is the LINE webhook resend detector. Shared between
-	// AudioMessage and TextMessage (GDrive link) paths.
-	// See dedup.go for TTL semantics.
-	//
-	// DEPRECATED (phase 1 of goclaw-line-channel-extract-esmith): will
-	// move to the esmith-km plugin in phase 3.
-	dedup *dedupCache
-
 	// watcherCancel stops the draft watcher goroutine on Stop().
 	//
 	// DEPRECATED (phase 1 of goclaw-line-channel-extract-esmith): the
@@ -75,7 +67,6 @@ func New(cfg config.LineConfig, msgBus *bus.MessageBus, pairingSvc store.Pairing
 		cfg:            cfg,
 		pairingService: pairingSvc,
 		conv:           newConversationState(),
-		dedup:          newDedupCache(dedupDefaultTTL),
 	}, nil
 }
 
