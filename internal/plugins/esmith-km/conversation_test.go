@@ -202,7 +202,7 @@ func TestFetchUserProjects_UsesMCPCallAndFallsBackOnEmpty(t *testing.T) {
 	defer func() { mcpToolCall = original }()
 
 	calls := 0
-	mcpToolCall = func(ctx context.Context, tool string, args map[string]any, dst any) error {
+	mcpToolCall = func(ctx context.Context, endpoint, token, tool string, args map[string]any, dst any) error {
 		calls++
 		if calls == 1 {
 			// First call: user's projects empty.
@@ -212,7 +212,9 @@ func TestFetchUserProjects_UsesMCPCallAndFallsBackOnEmpty(t *testing.T) {
 		return json.Unmarshal([]byte(`[{"id":7,"name":"Fallback Project"}]`), dst)
 	}
 
-	got, err := fetchUserProjects(context.Background(), 42)
+	// Use a Hook with stub endpoint/token — the stub ignores them anyway.
+	h := New(Config{MCPURL: "http://stub", MCPToken: "stub-token"})
+	got, err := h.fetchUserProjects(context.Background(), 42)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}

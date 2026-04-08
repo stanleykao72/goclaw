@@ -100,8 +100,10 @@ func (h *Hook) ingestAudio(tmpPath, contentType, messageID, userID, chatID strin
 
 	if err := os.Rename(tmpPath, finalPath); err != nil {
 		// Cross-device rename can fail (e.g. /tmp on tmpfs, /data on disk).
-		// Fall back to copy + remove.
+		// Fall back to copy + remove. copyFile uses os.Create so a partial
+		// finalPath may exist after a failed copy — clean both paths.
 		if cerr := copyFile(tmpPath, finalPath); cerr != nil {
+			os.Remove(finalPath)
 			os.Remove(tmpPath)
 			return fmt.Errorf("move to inbox: %w", cerr)
 		}

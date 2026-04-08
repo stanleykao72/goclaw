@@ -15,13 +15,27 @@ import (
 	"github.com/line/line-bot-sdk-go/v7/linebot"
 )
 
+// hookContext returns c.hookCtx or context.Background() if the channel
+// has not been Start'd yet. The fallback exists so unit tests that
+// exercise fan-out helpers directly without calling Start still work.
+func (c *Channel) hookContext() context.Context {
+	if c.hookCtx != nil {
+		return c.hookCtx
+	}
+	return context.Background()
+}
+
 // fanOutAudio delivers an AudioEvent to every registered hook in a goroutine
 // so one slow hook cannot block others. Errors are logged but do not retry.
+// Goroutines are tracked via hookWG so Stop can wait for them to drain.
 func (c *Channel) fanOutAudio(ev AudioEvent) {
+	ctx := c.hookContext()
 	for _, h := range c.hooks {
 		h := h
+		c.hookWG.Add(1)
 		go func() {
-			if err := h.OnAudio(context.Background(), ev); err != nil {
+			defer c.hookWG.Done()
+			if err := h.OnAudio(ctx, ev); err != nil {
 				slog.Error("LINE: hook OnAudio failed", "err", err)
 			}
 		}()
@@ -30,10 +44,13 @@ func (c *Channel) fanOutAudio(ev AudioEvent) {
 
 // fanOutText delivers a TextEvent to every registered hook.
 func (c *Channel) fanOutText(ev TextEvent) {
+	ctx := c.hookContext()
 	for _, h := range c.hooks {
 		h := h
+		c.hookWG.Add(1)
 		go func() {
-			if err := h.OnText(context.Background(), ev); err != nil {
+			defer c.hookWG.Done()
+			if err := h.OnText(ctx, ev); err != nil {
 				slog.Error("LINE: hook OnText failed", "err", err)
 			}
 		}()
@@ -42,10 +59,13 @@ func (c *Channel) fanOutText(ev TextEvent) {
 
 // fanOutPostback delivers a PostbackEvent to every registered hook.
 func (c *Channel) fanOutPostback(ev PostbackEvent) {
+	ctx := c.hookContext()
 	for _, h := range c.hooks {
 		h := h
+		c.hookWG.Add(1)
 		go func() {
-			if err := h.OnPostback(context.Background(), ev); err != nil {
+			defer c.hookWG.Done()
+			if err := h.OnPostback(ctx, ev); err != nil {
 				slog.Error("LINE: hook OnPostback failed", "err", err)
 			}
 		}()

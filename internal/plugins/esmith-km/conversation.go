@@ -530,7 +530,7 @@ func (h *Hook) pushProjectPickerForDraft(d *draftJSON) error {
 		return errBindPending
 	}
 
-	projects, err := fetchUserProjects(context.Background(), *d.ResolvedUserID)
+	projects, err := h.fetchUserProjects(context.Background(), *d.ResolvedUserID)
 	if err != nil {
 		return fmt.Errorf("fetch projects: %w", err)
 	}
@@ -841,15 +841,14 @@ func (e *mcpError) Error() string {
 // The MCP server's `tools/call` returns a structuredContent envelope; we
 // unmarshal directly into the caller-provided dst pointer.
 //
-// Package-level var with env-var reads retained as the default. Tests stub
-// this with a closure. In production, cmd/ populates h.cfg.MCPURL and
-// MCPToken — but because this function cannot see the Hook (tests need to
-// stub it without a Hook receiver), it still reads env vars as fallback.
-var mcpToolCall = func(ctx context.Context, tool string, args map[string]any, dst any) error {
-	endpoint := os.Getenv("ODOO_STAGE35_MCP_URL")
-	token := os.Getenv("ODOO_STAGE35_MCP_TOKEN")
+// Package-level var so tests can stub it (see conversation_test.go's
+// `original := mcpToolCall; mcpToolCall = func(...)` pattern). Endpoint
+// and token are passed in by the Hook's callers from h.cfg — this keeps
+// the function free of env-var reads and makes Hook.cfg the single
+// source of truth for MCP configuration.
+var mcpToolCall = func(ctx context.Context, endpoint, token, tool string, args map[string]any, dst any) error {
 	if endpoint == "" || token == "" {
-		return errors.New("ODOO_STAGE35_MCP_URL / ODOO_STAGE35_MCP_TOKEN not set")
+		return errors.New("esmith-km: MCP endpoint/token not configured (h.cfg.MCPURL / h.cfg.MCPToken)")
 	}
 
 	body := mcpRequest{
@@ -915,7 +914,7 @@ var mcpToolCall = func(ctx context.Context, tool string, args map[string]any, ds
 
 // fetchUserProjects returns up to 10 most-recently-active project.project
 // rows for the given Odoo user_id. Falls back to all projects on miss.
-func fetchUserProjects(ctx context.Context, userID int) ([]project, error) {
+func (h *Hook) fetchUserProjects(ctx context.Context, userID int) ([]project, error) {
 	args := map[string]any{
 		"model":  "project.project",
 		"domain": [][]any{{"user_id", "=", userID}},
@@ -928,13 +927,13 @@ func fetchUserProjects(ctx context.Context, userID int) ([]project, error) {
 		ID   int    `json:"id"`
 		Name string `json:"name"`
 	}
-	if err := mcpToolCall(ctx, "search_records", args, &rows); err != nil {
+	if err := mcpToolCall(ctx, h.cfg.MCPURL, h.cfg.MCPToken, "search_records", args, &rows); err != nil {
 		return nil, err
 	}
 	if len(rows) == 0 {
 		// Fallback: any active project the bearer-token user can see.
 		args["domain"] = [][]any{{"active", "=", true}}
-		if err := mcpToolCall(ctx, "search_records", args, &rows); err != nil {
+		if err := mcpToolCall(ctx, h.cfg.MCPURL, h.cfg.MCPToken, "search_records", args, &rows); err != nil {
 			return nil, err
 		}
 	}
@@ -964,7 +963,7 @@ func (h *Hook) fetchProjectAttendees(ctx context.Context, ref string) ([]partner
 		ID      int   `json:"id"`
 		UserIDs []int `json:"user_ids"`
 	}
-	if err := mcpToolCall(ctx, "search_records", map[string]any{
+	if err := mcpToolCall(ctx, h.cfg.MCPURL, h.cfg.MCPToken, "search_records", map[string]any{
 		"model":  "project.project",
 		"domain": [][]any{{"id", "=", *d.Answers.ProjectID}},
 		"fields": []string{"id", "user_ids"},
@@ -973,7 +972,7 @@ func (h *Hook) fetchProjectAttendees(ctx context.Context, ref string) ([]partner
 		return nil, err
 	}
 	if len(projectRows) == 0 || len(projectRows[0].UserIDs) == 0 {
-		return fetchPartnersFallback(ctx)
+		return h.fetchPartnersFallback(ctx)
 	}
 
 	// Resolve user_ids → partner_id.
@@ -981,7 +980,7 @@ func (h *Hook) fetchProjectAttendees(ctx context.Context, ref string) ([]partner
 		ID        int   `json:"id"`
 		PartnerID []any `json:"partner_id"` // [id, name] in Odoo many2one read format
 	}
-	if err := mcpToolCall(ctx, "search_records", map[string]any{
+	if err := mcpToolCall(ctx, h.cfg.MCPURL, h.cfg.MCPToken, "search_records", map[string]any{
 		"model":  "res.users",
 		"domain": [][]any{{"id", "in", projectRows[0].UserIDs}},
 		"fields": []string{"id", "partner_id"},
@@ -1001,7 +1000,7 @@ func (h *Hook) fetchProjectAttendees(ctx context.Context, ref string) ([]partner
 		}
 	}
 	if len(out) == 0 {
-		return fetchPartnersFallback(ctx)
+		return h.fetchPartnersFallback(ctx)
 	}
 	return out, nil
 }
@@ -1010,12 +1009,12 @@ func (h *Hook) fetchProjectAttendees(ctx context.Context, ref string) ([]partner
 // users (res.users with share=false). This is the canonical "company employee
 // picker list" — we deliberately do NOT show generic res.partner customer
 // contacts here. Per design D4, attendees are e-smith employees.
-func fetchPartnersFallback(ctx context.Context) ([]partner, error) {
+func (h *Hook) fetchPartnersFallback(ctx context.Context) ([]partner, error) {
 	var rows []struct {
 		ID        int   `json:"id"`
 		PartnerID []any `json:"partner_id"` // [id, name] many2one read format
 	}
-	if err := mcpToolCall(ctx, "search_records", map[string]any{
+	if err := mcpToolCall(ctx, h.cfg.MCPURL, h.cfg.MCPToken, "search_records", map[string]any{
 		"model":  "res.users",
 		"domain": [][]any{{"active", "=", true}, {"share", "=", false}},
 		"fields": []string{"id", "partner_id"},

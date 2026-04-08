@@ -31,21 +31,39 @@ import (
 )
 
 // registerEsmithKmHook reads esmith-km env vars and, if present, constructs
-// an esmithkm.Hook and registers it on the given LINE channel. If the
-// required env vars (ODOO_STAGE35_MCP_URL, ODOO_STAGE35_MCP_TOKEN) are
-// missing, the hook is NOT registered — the channel then behaves like a
-// generic LINE adapter, preserving backwards compatibility for any
-// deployment of this fork that does not need km-meeting writeback.
+// an esmithkm.Hook and registers it on the given LINE channel.
 //
-// This is a best-effort helper: errors are logged, not returned. A missing
-// hook never blocks channel startup.
+// Three cases:
+//
+//  1. Both ODOO_STAGE35_MCP_URL and ODOO_STAGE35_MCP_TOKEN set → hook
+//     registered.
+//  2. Both unset → hook NOT registered, log at Info level. This is the
+//     backwards-compatible path for any goclaw deployment of this fork
+//     that does not need km-meeting writeback.
+//  3. One set but not the other → hook NOT registered, log at ERROR
+//     level. Partial config indicates operator intent to use esmith-km
+//     that failed at env-var wiring; silently skipping would be a
+//     silent functional regression for an e-smith deployment.
+//
+// This helper does not return an error because LINE channel startup
+// should not block on plugin config — but the error log in case 3 is
+// loud enough that any deployment monitoring slog output will catch it.
 func registerEsmithKmHook(ch *linechannel.Channel) {
 	mcpURL := os.Getenv("ODOO_STAGE35_MCP_URL")
 	mcpToken := os.Getenv("ODOO_STAGE35_MCP_TOKEN")
-	if mcpURL == "" || mcpToken == "" {
-		slog.Info("esmith-km: MCP env not set, skipping hook registration")
+
+	switch {
+	case mcpURL == "" && mcpToken == "":
+		slog.Info("esmith-km: MCP env not set, skipping hook registration (non-esmith deployment)")
+		return
+	case mcpURL == "" || mcpToken == "":
+		slog.Error("esmith-km: partial MCP config detected, HOOK WILL NOT BE REGISTERED",
+			"url_set", mcpURL != "",
+			"token_set", mcpToken != "",
+			"action", "Set both ODOO_STAGE35_MCP_URL and ODOO_STAGE35_MCP_TOKEN, or neither")
 		return
 	}
+
 	hook := esmithkm.New(esmithkm.Config{
 		Sender:      ch,
 		MCPURL:      mcpURL,
@@ -139,6 +157,8 @@ func registerConfigChannels(cfg *config.Config, channelMgr *channels.Manager, ms
 		} else {
 			channelMgr.RegisterChannel(channels.TypeFeishu, f)
 			slog.Info("feishu/lark channel enabled (config)")
+		}
+	}
 
 	if cfg.Channels.Line.Enabled && cfg.Channels.Line.ChannelAccessToken != "" && instanceLoader == nil {
 		l, err := linechannel.New(cfg.Channels.Line, msgBus, pgStores.Pairing)
@@ -148,8 +168,6 @@ func registerConfigChannels(cfg *config.Config, channelMgr *channels.Manager, ms
 			registerEsmithKmHook(l)
 			channelMgr.RegisterChannel(channels.TypeLine, l)
 			slog.Info("line channel enabled (config)")
-		}
-	}
 		}
 	}
 }

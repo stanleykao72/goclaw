@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 
@@ -243,18 +242,14 @@ func buildConfirmBubble(ref, subject, projectName, location string, attendeeCoun
 // Resolution order for the base URL:
 //  1. h.cfg.OdooBaseURL (explicit)
 //  2. Strip "/mcp/v1" suffix from h.cfg.MCPURL
-//  3. ODOO_STAGE35_BASE_URL env (legacy fallback)
 //
-// Empty string when the base URL cannot be determined.
+// Empty string when the base URL cannot be determined. The plugin is now
+// a closed system w.r.t. config — no env-var fallback. cmd/ is responsible
+// for populating Config from env.
 func (h *Hook) buildOdooDeepLink(_ string, id int) string {
 	base := h.cfg.OdooBaseURL
-	if base == "" {
-		if h.cfg.MCPURL != "" {
-			base = strings.TrimSuffix(strings.TrimSuffix(h.cfg.MCPURL, "/"), "/mcp/v1")
-		}
-	}
-	if base == "" {
-		base = os.Getenv("ODOO_STAGE35_BASE_URL")
+	if base == "" && h.cfg.MCPURL != "" {
+		base = strings.TrimSuffix(strings.TrimSuffix(h.cfg.MCPURL, "/"), "/mcp/v1")
 	}
 	if base == "" {
 		return ""

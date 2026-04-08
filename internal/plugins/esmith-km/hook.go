@@ -53,7 +53,15 @@ func New(cfg Config) *Hook {
 // Webhook resends (same MessageID within the dedup TTL) are suppressed:
 // the tmp file is deleted and a "已收到" reply is pushed so the user
 // knows their original send is still in flight.
-func (h *Hook) OnAudio(_ context.Context, ev line.AudioEvent) error {
+func (h *Hook) OnAudio(ctx context.Context, ev line.AudioEvent) error {
+	if err := ctx.Err(); err != nil {
+		// Channel is shutting down — still clean up the tmp file so we
+		// don't leak it, but skip the ingest + dedup mark.
+		if ev.TempPath != "" {
+			_ = os.Remove(ev.TempPath)
+		}
+		return err
+	}
 	if h.dedup != nil && h.dedup.SeenOrMark(audioMessageKey(ev.MessageID)) {
 		slog.Info("LINE: audio message resend detected, skipping ingest",
 			"message_id", ev.MessageID, "chat", ev.ChatID)
@@ -73,7 +81,10 @@ func (h *Hook) OnAudio(_ context.Context, ev line.AudioEvent) error {
 // OnText handles a LINE TextMessage event. Scans the body for GDrive
 // shared-file URLs and ingests each one via km-meeting-pipeline.sh.
 // Non-URL messages are ignored (the agent path handles them separately).
-func (h *Hook) OnText(_ context.Context, ev line.TextEvent) error {
+func (h *Hook) OnText(ctx context.Context, ev line.TextEvent) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	h.ingestGdriveLinks(ev.Text, ev.UserID, ev.ChatID)
 	return nil
 }
@@ -81,7 +92,10 @@ func (h *Hook) OnText(_ context.Context, ev line.TextEvent) error {
 // OnPostback dispatches a LINE postback event through the km-meeting
 // conversation state machine. Routes on the `action` query-string field
 // to update / toggle / submit_attendees / finalize / cancel handlers.
-func (h *Hook) OnPostback(_ context.Context, ev line.PostbackEvent) error {
+func (h *Hook) OnPostback(ctx context.Context, ev line.PostbackEvent) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	h.handlePostback(ev)
 	return nil
 }
