@@ -35,6 +35,21 @@ type routeRegistrar interface {
 	RegisterRoutes(mux *http.ServeMux)
 }
 
+// HTTPRoutes is the exported alias of routeRegistrar so out-of-tree plugin
+// packages can attach HTTP endpoints to the gateway mux via
+// Server.RegisterPluginHandler without importing an unexported name.
+type HTTPRoutes = routeRegistrar
+
+// RegisterPluginHandler appends a plugin-provided HTTP handler to the
+// gateway mux. Prefer the concrete Set*Handler methods for built-in APIs;
+// use this for plugin-local surfaces such as the esmith-km LIFF endpoints.
+func (s *Server) RegisterPluginHandler(h HTTPRoutes) {
+	if h == nil {
+		return
+	}
+	s.handlers = append(s.handlers, h)
+}
+
 type Server struct {
 	cfg      *config.Config
 	eventPub bus.EventPublisher

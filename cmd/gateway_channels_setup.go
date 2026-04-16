@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/google/uuid"
 
@@ -31,7 +32,9 @@ import (
 )
 
 // registerEsmithKmHook reads esmith-km env vars and, if present, constructs
-// an esmithkm.Hook and registers it on the given LINE channel.
+// an esmithkm.Hook and registers it on the given LINE channel. Returns the
+// constructed hook (or nil) so the caller can wire auxiliary surfaces such
+// as the LIFF HTTP handler against the same channel instance.
 //
 // Three cases:
 //
@@ -48,48 +51,151 @@ import (
 // This helper does not return an error because LINE channel startup
 // should not block on plugin config — but the error log in case 3 is
 // loud enough that any deployment monitoring slog output will catch it.
-func registerEsmithKmHook(ch *linechannel.Channel) {
+func registerEsmithKmHook(ch *linechannel.Channel) *esmithkm.Hook {
 	mcpURL := os.Getenv("ODOO_STAGE35_MCP_URL")
 	mcpToken := os.Getenv("ODOO_STAGE35_MCP_TOKEN")
+	liffURL := os.Getenv("ESMITH_KM_ATTENDEES_LIFF_URL")
 
 	switch {
 	case mcpURL == "" && mcpToken == "":
 		slog.Info("esmith-km: MCP env not set, skipping hook registration (non-esmith deployment)")
-		return
+		return nil
 	case mcpURL == "" || mcpToken == "":
 		slog.Error("esmith-km: partial MCP config detected, HOOK WILL NOT BE REGISTERED",
 			"url_set", mcpURL != "",
 			"token_set", mcpToken != "",
 			"action", "Set both ODOO_STAGE35_MCP_URL and ODOO_STAGE35_MCP_TOKEN, or neither")
-		return
+		return nil
+	}
+	if liffURL == "" {
+		slog.Error("esmith-km: ESMITH_KM_ATTENDEES_LIFF_URL not set, attendees bubble will degrade to configuration-hint",
+			"action", "Set ESMITH_KM_ATTENDEES_LIFF_URL=https://liff.line.me/<liff_id> to enable the LIFF attendees picker")
 	}
 
 	hook := esmithkm.New(esmithkm.Config{
-		Sender:      ch,
-		MCPURL:      mcpURL,
-		MCPToken:    mcpToken,
-		OdooBaseURL: os.Getenv("ODOO_STAGE35_BASE_URL"),
+		Sender:           ch,
+		MCPURL:           mcpURL,
+		MCPToken:         mcpToken,
+		OdooBaseURL:      os.Getenv("ODOO_STAGE35_BASE_URL"),
+		LIFFAttendeesURL: liffURL,
 	})
 	ch.RegisterHook(hook)
-	slog.Info("esmith-km: hook registered on LINE channel")
+	slog.Info("esmith-km: hook registered on LINE channel",
+		"liff_attendees_url_set", liffURL != "")
+	return hook
 }
 
-// lineFactoryWithEsmithKm wraps linechannel.Factory to register the
-// esmith-km plugin on every LINE channel instance created from the DB.
-func lineFactoryWithEsmithKm(name string, creds json.RawMessage, cfg json.RawMessage,
-	msgBus *bus.MessageBus, pairingSvc store.PairingStore) (channels.Channel, error) {
-	ch, err := linechannel.Factory(name, creds, cfg, msgBus, pairingSvc)
-	if err != nil {
-		return nil, err
+// buildEsmithKmLiffHandler constructs the km-meeting attendees LIFF HTTP
+// handler. Returns nil when the plugin is not configured so the caller can
+// skip registration on the gateway mux.
+//
+// ID token verification: LIFF tokens are signed with the LINE LOGIN channel
+// secret (the one that owns the LIFF App), not the messaging channel secret
+// that the goclaw bot uses. They are different channels with different
+// secrets. Rather than surface a second secret via env vars, we call LINE's
+// online verify endpoint with just the LIFF client id (public — the prefix of
+// the LIFF ID before the dash). See internal/plugins/esmith-km/liff_verifier.go.
+func buildEsmithKmLiffHandler(ch *linechannel.Channel) *esmithkm.LiffHandler {
+	mcpURL := os.Getenv("ODOO_STAGE35_MCP_URL")
+	mcpToken := os.Getenv("ODOO_STAGE35_MCP_TOKEN")
+	liffURL := os.Getenv("ESMITH_KM_ATTENDEES_LIFF_URL")
+	if mcpURL == "" || mcpToken == "" || ch == nil {
+		return nil
 	}
-	if lc, ok := ch.(*linechannel.Channel); ok {
-		registerEsmithKmHook(lc)
+
+	// Derive LIFF client id. Path ends in `<channel_id>-<app_token>` — e.g.
+	// `https://liff.line.me/2009610420-ClGgYLB1` → client id `2009610420`.
+	clientID := ""
+	if liffURL != "" {
+		if idx := strings.LastIndex(liffURL, "/"); idx >= 0 && idx+1 < len(liffURL) {
+			tail := liffURL[idx+1:]
+			if dash := strings.Index(tail, "-"); dash > 0 {
+				clientID = tail[:dash]
+			}
+		}
 	}
-	return ch, nil
+	if clientID == "" {
+		slog.Error("esmith-km: cannot derive LIFF client id from ESMITH_KM_ATTENDEES_LIFF_URL; LIFF handler will reject every token",
+			"liff_url", liffURL,
+			"action", "Set ESMITH_KM_ATTENDEES_LIFF_URL=https://liff.line.me/<channel_id>-<app_token>")
+	}
+	verifier := esmithkm.NewLINELiffVerifier(clientID)
+
+	draftsDir := os.Getenv("ESMITH_KM_DRAFTS_DIR")
+	if draftsDir == "" {
+		// Production default; mirrors esmithkm.Config.WithDefaults.
+		draftsDir = "/data/km/meetings/drafts"
+	}
+	origins := strings.Split(os.Getenv("ESMITH_KM_LIFF_ALLOW_ORIGINS"), ",")
+	for i, o := range origins {
+		origins[i] = strings.TrimSpace(o)
+	}
+	// Strip empties so a missing env doesn't produce a single empty-string
+	// entry that every origin string trivially compares against.
+	cleaned := origins[:0]
+	for _, o := range origins {
+		if o != "" {
+			cleaned = append(cleaned, o)
+		}
+	}
+	if len(cleaned) == 0 {
+		// Safe defaults: allow the known staging + production Odoo hosts.
+		cleaned = []string{
+			"https://odoo-esmith*.odoo.com",
+			"https://odoo-esmith*.dev.odoo.com",
+		}
+	}
+	return esmithkm.NewLiffHandler(verifier, draftsDir, mcpURL, mcpToken, cleaned)
+}
+
+// liffHandlerOnce guarantees the km-meeting LIFF HTTP handler is registered
+// on the gateway mux at most once even if multiple LINE channel instances are
+// loaded. The handler is wired to the first LINE channel it sees — e-smith
+// runs a single LINE channel, so this is the expected shape. A multi-channel
+// deployment would need a per-tenant dispatch front-end in front of
+// NewLiffHandler, which is out of scope for T-057.
+var liffHandlerOnce sync.Once
+
+func registerEsmithKmLiffOnGateway(srv *gateway.Server, lc *linechannel.Channel) {
+	if srv == nil || lc == nil {
+		return
+	}
+	handler := buildEsmithKmLiffHandler(lc)
+	if handler == nil {
+		return
+	}
+	liffHandlerOnce.Do(func() {
+		srv.RegisterPluginHandler(handler)
+		slog.Info("esmith-km: LIFF HTTP handler registered on gateway",
+			"routes", []string{
+				"GET /km/meeting/attendees/bootstrap",
+				"POST /km/meeting/attendees/submit",
+			})
+	})
+}
+
+// makeLineFactoryWithEsmithKm closes over the gateway server so each LINE
+// channel instance can wire both the plugin hook and (once) the LIFF HTTP
+// handler. Passing srv via closure avoids a package-level global while still
+// honoring the channels.ChannelFactory signature instanceLoader expects.
+func makeLineFactoryWithEsmithKm(srv *gateway.Server) channels.ChannelFactory {
+	return func(name string, creds json.RawMessage, cfg json.RawMessage,
+		msgBus *bus.MessageBus, pairingSvc store.PairingStore) (channels.Channel, error) {
+		ch, err := linechannel.Factory(name, creds, cfg, msgBus, pairingSvc)
+		if err != nil {
+			return nil, err
+		}
+		if lc, ok := ch.(*linechannel.Channel); ok {
+			if hook := registerEsmithKmHook(lc); hook != nil {
+				registerEsmithKmLiffOnGateway(srv, lc)
+			}
+		}
+		return ch, nil
+	}
 }
 
 // registerConfigChannels registers config-based channels as fallback when no DB instances are loaded.
-func registerConfigChannels(cfg *config.Config, channelMgr *channels.Manager, msgBus *bus.MessageBus, pgStores *store.Stores, instanceLoader *channels.InstanceLoader) {
+func registerConfigChannels(cfg *config.Config, channelMgr *channels.Manager, msgBus *bus.MessageBus, pgStores *store.Stores, instanceLoader *channels.InstanceLoader, srv *gateway.Server) {
 	if instanceLoader != nil {
 		return
 	}
@@ -208,7 +314,9 @@ func registerConfigChannels(cfg *config.Config, channelMgr *channels.Manager, ms
 		if err != nil {
 			slog.Error("failed to initialize line channel", "error", err)
 		} else {
-			registerEsmithKmHook(l)
+			if hook := registerEsmithKmHook(l); hook != nil {
+				registerEsmithKmLiffOnGateway(srv, l)
+			}
 			channelMgr.RegisterChannel(channels.TypeLine, l)
 			slog.Info("line channel enabled (config)")
 		}

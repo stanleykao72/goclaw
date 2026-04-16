@@ -41,9 +41,14 @@ type project struct {
 }
 
 // partner is a tiny view of res.partner for the attendees picker.
+//
+// JSON tags are load-bearing: the LIFF bootstrap endpoint serializes this
+// struct directly into the page payload, and the IIFE JS reads p.id / p.name
+// (lowercase). Without tags Go would emit `ID` / `Name` and the LIFF page
+// would render empty checkbox rows.
 type partner struct {
-	ID   int
-	Name string
+	ID   int    `json:"id"`
+	Name string `json:"name"`
 }
 
 // meetingMinutesActionXMLID is the Odoo action XML id used to build deep
@@ -58,8 +63,6 @@ const meetingMinutesActionXMLID = "job_working_plan.action_job_meeting_minutes"
 //	action=update&ref=<ref>&field=<field>&value=<value>
 //	action=finalize&ref=<ref>
 //	action=cancel&ref=<ref>
-//	action=toggle&ref=<ref>&value=<partner_id>
-//	action=submit_attendees&ref=<ref>
 func buildPostbackData(values map[string]string) string {
 	v := url.Values{}
 	for k, val := range values {
@@ -158,61 +161,67 @@ func buildLocationPicker(ref string) ([]byte, error) {
 	return json.Marshal(bubble)
 }
 
-// buildAttendeesPicker renders a bubble with toggleable partner buttons.
-// Selected partners are visually distinguished (✓ prefix) and remembered in
-// goclaw memory until the user taps the "完成" submit button.
+// buildAttendeesPicker renders the attendees bubble. If liffURL is set, a
+// single uri-action button opens the LIFF webview where the user multi-selects
+// and the goclaw gateway (see liff_http.go) patches the draft + advances the
+// state machine. If liffURL is empty, the bubble degrades to a configuration
+// hint — the tap-to-toggle fallback was removed in Phase 3b because having
+// two UX paths caused state-sync bugs.
 //
-// The caller is responsible for enforcing the picker size cap — this
-// builder trusts whatever slice it receives. Upstream callers use
-// maxAttendeesPerPicker as the hard limit.
-func buildAttendeesPicker(ref string, partners []partner, selected map[int]bool) ([]byte, error) {
-	body := []map[string]any{
-		line.FlexTextBox(
-			"👥 出席者（可複選）",
-			"size", "md",
-			"weight", "bold",
-		),
-		line.FlexTextBox(
-			fmt.Sprintf("已選 %d 人", line.CountSelected(selected)),
+// preselectedCount is shown in the header so users can see at a glance how
+// many attendees are already attached (e.g. when reopening an in-flight draft).
+func buildAttendeesPicker(ref, subject string, preselectedCount int, liffURL string) ([]byte, error) {
+	header := line.FlexTextBox(
+		"👥 選擇出席者",
+		"size", "md",
+		"weight", "bold",
+	)
+	sub := line.FlexTextBox(
+		line.Truncate(subject, 60),
+		"size", "sm",
+		"color", "#868e96",
+		"wrap", true,
+	)
+	count := line.FlexTextBox(
+		fmt.Sprintf("目前已選 %d 人", preselectedCount),
+		"size", "xs",
+		"color", "#868e96",
+	)
+
+	body := []map[string]any{header, sub, count, line.FlexSeparator(8)}
+
+	if liffURL == "" {
+		body = append(body, line.FlexTextBox(
+			"⚠️ LIFF 未設定，請至 Odoo 手動填入出席者。",
 			"size", "sm",
-			"color", "#868e96",
-		),
-		line.FlexSeparator(8),
-	}
-	for _, p := range partners {
-		label := line.Truncate(p.Name, 36)
-		style := "secondary"
-		if selected[p.ID] {
-			label = "✓ " + label
-			style = "primary"
+			"color", "#e03131",
+			"wrap", true,
+		))
+	} else {
+		// Carry the draft ref through the URL so the LIFF page knows
+		// which meeting to bootstrap against.
+		target := liffURL
+		if strings.Contains(target, "?") {
+			target += "&ref=" + url.QueryEscape(ref)
+		} else {
+			target += "?ref=" + url.QueryEscape(ref)
 		}
-		btn := line.FlexButton(
-			label,
-			buildPostbackData(map[string]string{
-				"action": "toggle",
-				"ref":    ref,
-				"value":  strconv.Itoa(p.ID),
-			}),
-		)
-		btn["style"] = style
+		btn := map[string]any{
+			"type":   "button",
+			"style":  "primary",
+			"height": "sm",
+			"color":  "#339af0",
+			"action": map[string]any{
+				"type":  "uri",
+				"label": "📋 選擇出席者",
+				"uri":   target,
+			},
+		}
 		body = append(body, btn)
 	}
 
-	body = append(body, line.FlexSeparator(8))
-	doneBtn := line.FlexButton(
-		"✅ 完成選擇",
-		buildPostbackData(map[string]string{
-			"action": "submit_attendees",
-			"ref":    ref,
-		}),
-	)
-	doneBtn["style"] = "primary"
-	doneBtn["color"] = "#51cf66"
-	body = append(body, doneBtn)
-
 	bubble := map[string]any{
 		"type": "bubble",
-		"size": "mega",
 		"body": map[string]any{
 			"type":     "box",
 			"layout":   "vertical",
