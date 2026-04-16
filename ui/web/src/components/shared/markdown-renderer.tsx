@@ -1,16 +1,13 @@
 import { useState, useCallback, useEffect, useRef, useMemo, memo } from "react";
-import { useTranslation } from "react-i18next";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
 import rehypeHighlight from "rehype-highlight";
-
-// Stable plugin arrays — avoids new references on every render
-const remarkPlugins = [remarkGfm];
-const rehypePlugins = [rehypeHighlight];
-import { useClipboard } from "@/hooks/use-clipboard";
+import rehypeKatex from "rehype-katex";
+import remarkWikilinks from "@/lib/remark-wikilinks";
+import remarkCallouts from "@/lib/remark-callouts";
 import { toFileUrl, toDownloadUrl } from "@/lib/file-helpers";
-import { useMediaUrl } from "@/hooks/use-media-url";
-import { Check, Copy, Download, FileText } from "lucide-react";
+import { Download, FileText } from "lucide-react";
 import { ImageLightbox } from "./image-lightbox";
 import { useChatImageGallery } from "@/components/chat/chat-image-gallery-context";
 import {
@@ -19,42 +16,20 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { CodeBlock } from "./markdown-code-block";
+import { CachedMarkdownImg } from "./markdown-cached-img";
+import { WikilinkPill } from "./markdown-wikilink";
+import { CalloutBlock } from "./markdown-callout-block";
+import { MermaidBlock } from "./markdown-mermaid-block";
 
-function CodeBlock({
-  className,
-  children,
-}: {
-  className?: string;
-  children?: React.ReactNode;
-}) {
-  const { copied, copy } = useClipboard();
-  const { t } = useTranslation("common");
-  const text = String(children).replace(/\n$/, "");
-  const lang = className?.replace("language-", "") ?? "";
-
-  return (
-    <div className="not-prose group relative my-3 overflow-hidden rounded-lg border border-border/60">
-      <div className="flex items-center justify-between border-b border-border/40 bg-muted/70 px-3 py-1.5 text-[11px] font-medium tracking-wide text-muted-foreground uppercase">
-        <span>{lang || "code"}</span>
-        <button
-          type="button"
-          onClick={() => copy(text)}
-          className="cursor-pointer opacity-0 transition-opacity group-hover:opacity-100"
-          title={t("copyCode")}
-        >
-          {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
-        </button>
-      </div>
-      <pre className="overflow-x-auto bg-muted/30 p-3 text-[13px] leading-normal text-foreground whitespace-pre">
-        <code className={className} style={{ fontFamily: "'JetBrains Mono', 'Fira Code', ui-monospace, monospace", wordWrap: "normal", overflowWrap: "normal" }}>{children}</code>
-      </pre>
-    </div>
-  );
-}
+// Stable plugin arrays — avoids new references on every render
+const remarkPlugins = [remarkGfm, remarkMath, remarkWikilinks, remarkCallouts];
+const rehypePlugins = [rehypeHighlight, rehypeKatex];
 
 interface MarkdownRendererProps {
   content: string;
   className?: string;
+  onWikilinkClick?: (target: string) => void;
 }
 
 /** Common file extensions for generated/local files */
@@ -87,44 +62,7 @@ function fileNameFromHref(href: string): string {
   return segments[segments.length - 1] ?? "file";
 }
 
-/** Extracted from useMemo components so useMediaUrl hook is valid. */
-function CachedMarkdownImg({ src, alt, openLightbox, ...props }: {
-  src?: string; alt?: string;
-  openLightbox: (src: string, alt: string) => void;
-  [key: string]: unknown;
-}) {
-  const resolvedSrc = isFileLink(src) ? toFileUrl(src!) : src;
-  const cachedSrc = useMediaUrl(resolvedSrc);
-  const displayName = alt || fileNameFromHref(src ?? "");
-  return (
-    <span className="group/img relative inline-block overflow-hidden rounded-lg border shadow-sm">
-      <img
-        src={cachedSrc}
-        alt={alt ?? "image"}
-        className="block max-w-sm cursor-pointer hover:opacity-90 transition-opacity"
-        loading="lazy"
-        onClick={(e: React.MouseEvent) => {
-          e.preventDefault();
-          if (resolvedSrc) openLightbox(resolvedSrc, alt ?? "image");
-        }}
-        {...props}
-      />
-      {resolvedSrc && (
-        <a
-          href={toDownloadUrl(resolvedSrc)}
-          download={displayName}
-          onClick={(e: React.MouseEvent) => e.stopPropagation()}
-          className="absolute top-2 right-2 flex items-center justify-center rounded-lg bg-white/90 dark:bg-neutral-800/90 p-1.5 text-neutral-700 dark:text-neutral-200 shadow-md ring-1 ring-black/10 dark:ring-white/10 opacity-0 transition-opacity group-hover/img:opacity-100 hover:bg-white dark:hover:bg-neutral-700 cursor-pointer"
-          title="Download"
-        >
-          <Download className="h-4.5 w-4.5" />
-        </a>
-      )}
-    </span>
-  );
-}
-
-export const MarkdownRenderer = memo(function MarkdownRenderer({ content, className }: MarkdownRendererProps) {
+export const MarkdownRenderer = memo(function MarkdownRenderer({ content, className, onWikilinkClick }: MarkdownRendererProps) {
   const gallery = useChatImageGallery();
   const [lightbox, setLightbox] = useState<{ src: string; alt: string } | null>(null);
   // Use conversation-wide gallery if available (has images), else fall back to local lightbox
@@ -170,21 +108,33 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, classN
   }, []);
 
   // Stable components config — only recreated when token/callbacks change.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const components = useMemo((): Components => ({
+   
+  const components = useMemo((): Components & Record<string, any> => ({
     pre({ children }) {
       return <>{children}</>;
     },
     code({ className, children, node, ...props }: any) {
+      if (className?.includes("language-mermaid")) {
+        return <MermaidBlock code={String(children).replace(/\n$/, "")} />;
+      }
       const isBlock = !!className || node?.position?.start.line !== node?.position?.end.line || String(children).includes("\n");
       if (isBlock) {
         return <CodeBlock className={className}>{children}</CodeBlock>;
       }
       return (
-        <code className="rounded bg-muted px-1.5 py-0.5 text-[0.85em] font-medium text-primary" style={{ fontFamily: "'JetBrains Mono', 'Fira Code', ui-monospace, monospace" }} {...props}>
+        <code className="rounded bg-muted px-1.5 py-0.5 text-[0.85em] font-medium text-primary font-mono-code" {...props}>
           {children}
         </code>
       );
+    },
+    wikilink({ node, ...props }: any) {
+      const target = node?.properties?.target ?? props?.target ?? "";
+      return <WikilinkPill target={target} onClick={onWikilinkClick} />;
+    },
+    callout({ node, children, ...props }: any) {
+      const calloutType = node?.properties?.calloutType ?? props?.calloutType;
+      const calloutTitle = node?.properties?.calloutTitle ?? props?.calloutTitle;
+      return <CalloutBlock calloutType={calloutType} calloutTitle={calloutTitle}>{children}</CalloutBlock>;
     },
     a({ href, children }: any) {
       if (isFileLink(href)) {
@@ -255,7 +205,7 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, classN
       }
       return <input type={type} {...props} />;
     },
-  }), [openLightbox, handleFileClick]);
+  }), [openLightbox, handleFileClick, onWikilinkClick]);
 
   return (
     <div className={`md-render prose dark:prose-invert max-w-none break-words ${className ?? ""}`}>

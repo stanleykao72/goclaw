@@ -47,11 +47,22 @@ func NewPGMemoryStore(db *sql.DB, cfg PGMemoryConfig) *PGMemoryStore {
 }
 
 func (s *PGMemoryStore) GetDocument(ctx context.Context, agentID, userID, path string) (string, error) {
-	aid := mustParseUUID(agentID)
+	aid, err := parseUUID(agentID)
+	if err != nil {
+		return "", fmt.Errorf("memory get document: %w", err)
+	}
 	var content string
 
-	var err error
-	if userID == "" {
+	if store.IsSharedMemory(ctx) {
+		// Shared: no user_id filter
+		tc, tcArgs, _, tcErr := scopeClause(ctx, 3)
+		if tcErr != nil {
+			return "", tcErr
+		}
+		err = s.db.QueryRowContext(ctx,
+			"SELECT content FROM memory_documents WHERE agent_id = $1 AND path = $2"+tc+" ORDER BY updated_at DESC LIMIT 1",
+			append([]any{aid, path}, tcArgs...)...).Scan(&content)
+	} else if userID == "" {
 		tc, tcArgs, _, tcErr := scopeClause(ctx, 3)
 		if tcErr != nil {
 			return "", tcErr
@@ -75,7 +86,10 @@ func (s *PGMemoryStore) GetDocument(ctx context.Context, agentID, userID, path s
 }
 
 func (s *PGMemoryStore) PutDocument(ctx context.Context, agentID, userID, path, content string) error {
-	aid := mustParseUUID(agentID)
+	aid, err := parseUUID(agentID)
+	if err != nil {
+		return fmt.Errorf("memory put document: %w", err)
+	}
 	hash := memory.ContentHash(content)
 	id := uuid.Must(uuid.NewV7())
 	now := time.Now()
@@ -86,7 +100,7 @@ func (s *PGMemoryStore) PutDocument(ctx context.Context, agentID, userID, path, 
 		uid = &userID
 	}
 
-	_, err := s.db.ExecContext(ctx,
+	_, err = s.db.ExecContext(ctx,
 		`INSERT INTO memory_documents (id, agent_id, user_id, path, content, hash, tenant_id, updated_at)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		 ON CONFLICT (agent_id, COALESCE(user_id, ''), path)
@@ -97,10 +111,21 @@ func (s *PGMemoryStore) PutDocument(ctx context.Context, agentID, userID, path, 
 }
 
 func (s *PGMemoryStore) DeleteDocument(ctx context.Context, agentID, userID, path string) error {
-	aid := mustParseUUID(agentID)
+	aid, err := parseUUID(agentID)
+	if err != nil {
+		return fmt.Errorf("memory delete document: %w", err)
+	}
 	var res sql.Result
-	var err error
-	if userID == "" {
+	if store.IsSharedMemory(ctx) {
+		// Shared: delete any matching doc regardless of user_id
+		tc, tcArgs, _, tcErr := scopeClause(ctx, 3)
+		if tcErr != nil {
+			return tcErr
+		}
+		res, err = s.db.ExecContext(ctx,
+			"DELETE FROM memory_documents WHERE agent_id = $1 AND path = $2"+tc,
+			append([]any{aid, path}, tcArgs...)...)
+	} else if userID == "" {
 		tc, tcArgs, _, tcErr := scopeClause(ctx, 3)
 		if tcErr != nil {
 			return tcErr
@@ -128,56 +153,54 @@ func (s *PGMemoryStore) DeleteDocument(ctx context.Context, agentID, userID, pat
 }
 
 func (s *PGMemoryStore) ListDocuments(ctx context.Context, agentID, userID string) ([]store.DocumentInfo, error) {
-	aid := mustParseUUID(agentID)
+	aid, err := parseUUID(agentID)
+	if err != nil {
+		return nil, fmt.Errorf("memory list documents: %w", err)
+	}
 
-	var rows *sql.Rows
-	var err error
-	if userID == "" {
+	var q string
+	var args []any
+	if store.IsSharedMemory(ctx) {
+		// Shared: list ALL docs for agent (global + per-user from all users)
 		tc, tcArgs, _, tcErr := scopeClause(ctx, 2)
 		if tcErr != nil {
 			return nil, tcErr
 		}
-		rows, err = s.db.QueryContext(ctx,
-			"SELECT path, hash, user_id, updated_at FROM memory_documents WHERE agent_id = $1 AND user_id IS NULL"+tc,
-			append([]any{aid}, tcArgs...)...)
+		q = "SELECT path, hash, user_id, updated_at FROM memory_documents WHERE agent_id = $1" + tc
+		args = append([]any{aid}, tcArgs...)
+	} else if userID == "" {
+		tc, tcArgs, _, tcErr := scopeClause(ctx, 2)
+		if tcErr != nil {
+			return nil, tcErr
+		}
+		q = "SELECT path, hash, user_id, updated_at FROM memory_documents WHERE agent_id = $1 AND user_id IS NULL" + tc
+		args = append([]any{aid}, tcArgs...)
 	} else {
 		tc, tcArgs, _, tcErr := scopeClause(ctx, 3)
 		if tcErr != nil {
 			return nil, tcErr
 		}
-		rows, err = s.db.QueryContext(ctx,
-			"SELECT path, hash, user_id, updated_at FROM memory_documents WHERE agent_id = $1 AND (user_id IS NULL OR user_id = $2)"+tc,
-			append([]any{aid, userID}, tcArgs...)...)
+		q = "SELECT path, hash, user_id, updated_at FROM memory_documents WHERE agent_id = $1 AND (user_id IS NULL OR user_id = $2)" + tc
+		args = append([]any{aid, userID}, tcArgs...)
 	}
-	if err != nil {
+
+	var rows []documentInfoRow
+	if err := pkgSqlxDB.SelectContext(ctx, &rows, q, args...); err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	var result []store.DocumentInfo
-	for rows.Next() {
-		var path, hash string
-		var uid *string
-		var updatedAt time.Time
-		if err := rows.Scan(&path, &hash, &uid, &updatedAt); err != nil {
-			continue
-		}
-		info := store.DocumentInfo{
-			Path:      path,
-			Hash:      hash,
-			UpdatedAt: updatedAt.UnixMilli(),
-		}
-		if uid != nil {
-			info.UserID = *uid
-		}
-		result = append(result, info)
+	result := make([]store.DocumentInfo, len(rows))
+	for i := range rows {
+		result[i] = rows[i].toDocumentInfo()
 	}
 	return result, nil
 }
 
 // IndexDocument chunks a document and stores chunks with embeddings.
 func (s *PGMemoryStore) IndexDocument(ctx context.Context, agentID, userID, path string) error {
-	aid := mustParseUUID(agentID)
+	aid, err := parseUUID(agentID)
+	if err != nil {
+		return fmt.Errorf("memory index document: %w", err)
+	}
 
 	// Get document content
 	content, err := s.GetDocument(ctx, agentID, userID, path)
@@ -187,7 +210,16 @@ func (s *PGMemoryStore) IndexDocument(ctx context.Context, agentID, userID, path
 
 	// Get document ID
 	var docID uuid.UUID
-	if userID == "" {
+	if store.IsSharedMemory(ctx) {
+		// Shared: no user_id filter
+		tc, tcArgs, _, tcErr := scopeClause(ctx, 3)
+		if tcErr != nil {
+			return tcErr
+		}
+		err = s.db.QueryRowContext(ctx,
+			"SELECT id FROM memory_documents WHERE agent_id = $1 AND path = $2"+tc+" ORDER BY updated_at DESC LIMIT 1",
+			append([]any{aid, path}, tcArgs...)...).Scan(&docID)
+	} else if userID == "" {
 		tc, tcArgs, _, tcErr := scopeClause(ctx, 3)
 		if tcErr != nil {
 			return tcErr
@@ -395,25 +427,15 @@ func (s *PGMemoryStore) BackfillEmbeddings(ctx context.Context) (int, error) {
 	total := 0
 
 	for {
-		rows, err := s.db.QueryContext(ctx,
-			"SELECT id, text FROM memory_chunks WHERE embedding IS NULL ORDER BY id ASC LIMIT $1", batchSize)
-		if err != nil {
+		type backfillRow struct {
+			ID   uuid.UUID `db:"id"`
+			Text string    `db:"text"`
+		}
+		var chunks []backfillRow
+		if err := pkgSqlxDB.SelectContext(ctx, &chunks,
+			"SELECT id, text FROM memory_chunks WHERE embedding IS NULL ORDER BY id ASC LIMIT $1", batchSize); err != nil {
 			return total, fmt.Errorf("query chunks without embeddings: %w", err)
 		}
-
-		type chunkRow struct {
-			ID   uuid.UUID
-			Text string
-		}
-		var chunks []chunkRow
-		for rows.Next() {
-			var c chunkRow
-			if err := rows.Scan(&c.ID, &c.Text); err != nil {
-				continue
-			}
-			chunks = append(chunks, c)
-		}
-		rows.Close()
 
 		if len(chunks) == 0 {
 			break
@@ -455,7 +477,27 @@ func (s *PGMemoryStore) Close() error { return nil }
 
 // --- Helpers ---
 
-func mustParseUUID(s string) uuid.UUID {
+// parseUUID returns the parsed UUID or a descriptive error. Use for every
+// INSERT/UPDATE/UPSERT/DELETE and any SELECT WHERE where silent nil would
+// either corrupt data or hide bugs as empty reads / zero-row updates. FK
+// constraints reject bad writes at the driver layer, but errors there come
+// back as cryptic PG 23503 — parseUUID catches them upstream with a clean
+// Go error. See docs/agent-identity-conventions.md.
+func parseUUID(s string) (uuid.UUID, error) {
+	id, err := uuid.Parse(s)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("parse uuid %q: %w", s, err)
+	}
+	return id, nil
+}
+
+// parseUUIDOrNil returns the parsed UUID or uuid.Nil on failure, without
+// raising an error. INTENTIONALLY silent — only acceptable on read-only
+// SELECT WHERE paths where a no-match (empty result) is the correct
+// semantics on bad input. Do NOT use for writes, updates, deletes, or any
+// SELECT where an empty result would hide a bug. Prefer parseUUID for new
+// code. See docs/agent-identity-conventions.md.
+func parseUUIDOrNil(s string) uuid.UUID {
 	id, err := uuid.Parse(s)
 	if err != nil {
 		return uuid.Nil

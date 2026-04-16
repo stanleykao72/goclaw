@@ -87,9 +87,10 @@ func (s *PGPairingStore) ApprovePairing(ctx context.Context, code, approvedBy st
 	var senderID, channel, chatID string
 	var metaJSON []byte
 	var reqTenantID uuid.UUID
-	// Code lookup is cross-tenant (random token, approver is WS/HTTP user)
+	// Code lookup is cross-tenant (random token, approver is WS/HTTP user).
+	// Also check expires_at to close race between prune DELETE and this SELECT.
 	err := s.db.QueryRowContext(ctx,
-		"SELECT id, sender_id, channel, chat_id, COALESCE(metadata, '{}'), tenant_id FROM pairing_requests WHERE code = $1", code,
+		"SELECT id, sender_id, channel, chat_id, COALESCE(metadata, '{}'), tenant_id FROM pairing_requests WHERE code = $1 AND expires_at > NOW()", code,
 	).Scan(&reqID, &senderID, &channel, &chatID, &metaJSON, &reqTenantID)
 	if err != nil {
 		return nil, fmt.Errorf("pairing code %s not found or expired", code)
@@ -164,37 +165,53 @@ func (s *PGPairingStore) IsPaired(ctx context.Context, senderID, channel string)
 	return count > 0, nil
 }
 
+// pairingRequestRow is an sqlx scan struct for pairing_requests.
+// Domain struct uses int64 (Unix ms) for timestamps, DB stores time.Time.
+type pairingRequestRow struct {
+	Code      string    `json:"code" db:"code"`
+	SenderID  string    `json:"sender_id" db:"sender_id"`
+	Channel   string    `json:"channel" db:"channel"`
+	ChatID    string    `json:"chat_id" db:"chat_id"`
+	AccountID string    `json:"account_id" db:"account_id"`
+	CreatedAt time.Time `json:"created_at" db:"created_at"`
+	ExpiresAt time.Time `json:"expires_at" db:"expires_at"`
+	Metadata  []byte    `json:"metadata" db:"metadata"`
+}
+
+// pairedDeviceRow is an sqlx scan struct for paired_devices.
+type pairedDeviceRow struct {
+	SenderID string    `json:"sender_id" db:"sender_id"`
+	Channel  string    `json:"channel" db:"channel"`
+	ChatID   string    `json:"chat_id" db:"chat_id"`
+	PairedBy string    `json:"paired_by" db:"paired_by"`
+	PairedAt time.Time `json:"paired_at" db:"paired_at"`
+	Metadata []byte    `json:"metadata" db:"metadata"`
+}
+
 func (s *PGPairingStore) ListPending(ctx context.Context) []store.PairingRequestData {
 	tid := tenantIDForInsert(ctx)
 
 	// Prune expired
 	s.db.ExecContext(ctx, "DELETE FROM pairing_requests WHERE expires_at < $1", time.Now())
 
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT code, sender_id, channel, chat_id, account_id, created_at, expires_at, COALESCE(metadata, '{}')
+	var rows []pairingRequestRow
+	err := pkgSqlxDB.SelectContext(ctx, &rows,
+		`SELECT code, sender_id, channel, chat_id, account_id, created_at, expires_at, COALESCE(metadata, '{}') AS metadata
 		 FROM pairing_requests WHERE tenant_id = $1 ORDER BY created_at DESC`, tid)
 	if err != nil {
-		return nil
-	}
-	defer rows.Close()
-
-	var result []store.PairingRequestData
-	for rows.Next() {
-		var d store.PairingRequestData
-		var createdAt, expiresAt time.Time
-		var metaJSON []byte
-		if err := rows.Scan(&d.Code, &d.SenderID, &d.Channel, &d.ChatID, &d.AccountID, &createdAt, &expiresAt, &metaJSON); err != nil {
-			continue
-		}
-		d.CreatedAt = createdAt.UnixMilli()
-		d.ExpiresAt = expiresAt.UnixMilli()
-		if len(metaJSON) > 0 {
-			json.Unmarshal(metaJSON, &d.Metadata)
-		}
-		result = append(result, d)
-	}
-	if result == nil {
 		return []store.PairingRequestData{}
+	}
+
+	result := make([]store.PairingRequestData, len(rows))
+	for i, r := range rows {
+		result[i] = store.PairingRequestData{
+			Code: r.Code, SenderID: r.SenderID, Channel: r.Channel,
+			ChatID: r.ChatID, AccountID: r.AccountID,
+			CreatedAt: r.CreatedAt.UnixMilli(), ExpiresAt: r.ExpiresAt.UnixMilli(),
+		}
+		if len(r.Metadata) > 0 {
+			json.Unmarshal(r.Metadata, &result[i].Metadata)
+		}
 	}
 	return result
 }
@@ -205,32 +222,86 @@ func (s *PGPairingStore) ListPaired(ctx context.Context) []store.PairedDeviceDat
 	// Prune expired paired devices
 	s.db.ExecContext(ctx, "DELETE FROM paired_devices WHERE expires_at IS NOT NULL AND expires_at < NOW()")
 
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT sender_id, channel, chat_id, paired_by, paired_at, COALESCE(metadata, '{}')
+	var rows []pairedDeviceRow
+	err := pkgSqlxDB.SelectContext(ctx, &rows,
+		`SELECT sender_id, channel, chat_id, paired_by, paired_at, COALESCE(metadata, '{}') AS metadata
 		 FROM paired_devices WHERE tenant_id = $1 ORDER BY paired_at DESC`, tid)
 	if err != nil {
-		return nil
-	}
-	defer rows.Close()
-
-	var result []store.PairedDeviceData
-	for rows.Next() {
-		var d store.PairedDeviceData
-		var pairedAt time.Time
-		var metaJSON []byte
-		if err := rows.Scan(&d.SenderID, &d.Channel, &d.ChatID, &d.PairedBy, &pairedAt, &metaJSON); err != nil {
-			continue
-		}
-		d.PairedAt = pairedAt.UnixMilli()
-		if len(metaJSON) > 0 {
-			json.Unmarshal(metaJSON, &d.Metadata)
-		}
-		result = append(result, d)
-	}
-	if result == nil {
 		return []store.PairedDeviceData{}
 	}
+
+	result := make([]store.PairedDeviceData, len(rows))
+	for i, r := range rows {
+		result[i] = store.PairedDeviceData{
+			SenderID: r.SenderID, Channel: r.Channel, ChatID: r.ChatID,
+			PairedBy: r.PairedBy, PairedAt: r.PairedAt.UnixMilli(),
+		}
+		if len(r.Metadata) > 0 {
+			json.Unmarshal(r.Metadata, &result[i].Metadata)
+		}
+	}
 	return result
+}
+
+func (s *PGPairingStore) MigrateGroupChatID(ctx context.Context, channel, oldChatID, newChatID string) error {
+	tid := tenantIDForInsert(ctx)
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin migrate tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// 1. paired_devices: update sender_id and chat_id
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE paired_devices
+		 SET sender_id = REPLACE(sender_id, $1, $2),
+		     chat_id = REPLACE(chat_id, $1, $2)
+		 WHERE sender_id LIKE '%' || $1 || '%'
+		   AND channel = $3
+		   AND tenant_id = $4`,
+		oldChatID, newChatID, channel, tid,
+	); err != nil {
+		return fmt.Errorf("migrate paired_devices: %w", err)
+	}
+
+	// 2. sessions: update session_key and user_id
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE sessions
+		 SET session_key = REPLACE(session_key, ':' || $1, ':' || $2),
+		     user_id = REPLACE(user_id, ':' || $1, ':' || $2)
+		 WHERE session_key LIKE '%:telegram:%:' || $1 || '%'
+		   AND tenant_id = $3`,
+		oldChatID, newChatID, tid,
+	); err != nil {
+		return fmt.Errorf("migrate sessions: %w", err)
+	}
+
+	// 3. channel_contacts: update sender_id
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE channel_contacts
+		 SET sender_id = REPLACE(sender_id, $1, $2)
+		 WHERE sender_id LIKE '%' || $1 || '%'
+		   AND channel_type = 'telegram'
+		   AND tenant_id = $3`,
+		oldChatID, newChatID, tid,
+	); err != nil {
+		return fmt.Errorf("migrate channel_contacts: %w", err)
+	}
+
+	// 4. channel_pending_messages: update history_key
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE channel_pending_messages
+		 SET history_key = REPLACE(history_key, $1, $2)
+		 WHERE history_key LIKE '%' || $1 || '%'
+		   AND channel_name = $3
+		   AND tenant_id = $4`,
+		oldChatID, newChatID, channel, tid,
+	); err != nil {
+		return fmt.Errorf("migrate channel_pending_messages: %w", err)
+	}
+
+	return tx.Commit()
 }
 
 func generatePairingCode() string {

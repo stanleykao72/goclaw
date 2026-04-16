@@ -21,8 +21,10 @@ var htmlToMdReplacers = []struct {
 	{regexp.MustCompile(`(?i)</?p\s*>`), "\n"},
 	{regexp.MustCompile(`(?i)<b>([\s\S]*?)</b>`), "**$1**"},
 	{regexp.MustCompile(`(?i)<strong>([\s\S]*?)</strong>`), "**$1**"},
-	{regexp.MustCompile(`(?i)<i>([\s\S]*?)</i>`), "_$1_"},
-	{regexp.MustCompile(`(?i)<em>([\s\S]*?)</em>`), "_$1_"},
+	// ${1}_ (not $1_) — Go regexp treats $1_ as a named group reference (identifier
+	// characters include `_`), which drops the capture. Curly braces delimit the group.
+	{regexp.MustCompile(`(?i)<i>([\s\S]*?)</i>`), "_${1}_"},
+	{regexp.MustCompile(`(?i)<em>([\s\S]*?)</em>`), "_${1}_"},
 	{regexp.MustCompile(`(?i)<s>([\s\S]*?)</s>`), "~~$1~~"},
 	{regexp.MustCompile(`(?i)<strike>([\s\S]*?)</strike>`), "~~$1~~"},
 	{regexp.MustCompile(`(?i)<del>([\s\S]*?)</del>`), "~~$1~~"},
@@ -61,6 +63,17 @@ func markdownToTelegramHTML(text string) string {
 	inlineCodes := extractInlineCodes(text)
 	text = inlineCodes.text
 
+
+	// Extract and protect bare URLs from italic parsing.
+	// URLs with underscores (e.g. syngas_dailymail_2026_ai) get broken by
+	// the italic regex which matches _text_ patterns inside URLs.
+	var urlPlaceholders []string
+	reURL := regexp.MustCompile(`https?://[^\s<>\)\]]+`)
+	text = reURL.ReplaceAllStringFunc(text, func(s string) string {
+		idx := len(urlPlaceholders)
+		urlPlaceholders = append(urlPlaceholders, s)
+		return fmt.Sprintf("\x00URL%d\x00", idx)
+	})
 	// Strip markdown headers
 	text = regexp.MustCompile(`(?m)^#{1,6}\s+(.+)$`).ReplaceAllString(text, "$1")
 
@@ -105,15 +118,21 @@ func markdownToTelegramHTML(text string) string {
 	// Strikethrough
 	text = regexp.MustCompile(`~~(.+?)~~`).ReplaceAllString(text, "<s>$1</s>")
 
-	// Restore @mentions as clickable Telegram links
+	// Restore @mentions as plain text (protected from italic conversion above).
+	// Do NOT wrap in <a href="https://t.me/..."> — LLM @mentions are not
+	// necessarily Telegram usernames and auto-linking shows unwanted profile cards.
 	for i, mention := range mentionPlaceholders {
-		username := strings.TrimPrefix(mention, "@")
-		linked := fmt.Sprintf(`<a href="https://t.me/%s">%s</a>`, username, mention)
-		text = strings.ReplaceAll(text, fmt.Sprintf("\x00MN%d\x00", i), linked)
+		text = strings.ReplaceAll(text, fmt.Sprintf("\x00MN%d\x00", i), mention)
 	}
 
 	// List items
 	text = regexp.MustCompile(`(?m)^[-*]\s+`).ReplaceAllString(text, "• ")
+
+	// Restore bare URLs (protected from italic parsing above).
+	for i, u := range urlPlaceholders {
+		escaped := escapeHTML(u)
+		text = strings.ReplaceAll(text, fmt.Sprintf("\x00URL%d\x00", i), escaped)
+	}
 
 	// Restore inline code
 	for i, code := range inlineCodes.codes {

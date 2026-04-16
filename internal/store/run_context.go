@@ -21,17 +21,19 @@ type runContextKey struct{}
 // accessor functions (which fall back to individual keys when RunContext is absent).
 type RunContext struct {
 	// Identity
-	AgentID   uuid.UUID
-	AgentKey  string
-	TenantID  uuid.UUID
-	UserID    string
-	AgentType string
-	SenderID  string
+	AgentID          uuid.UUID
+	AgentKey         string
+	TenantID         uuid.UUID
+	UserID           string
+	CredentialUserID string // resolved tenant user for credential lookups (empty = use UserID)
+	AgentType        string
+	SenderID         string
 
 	// Flags
 	SelfEvolve          bool
 	SharedMemory        bool
 	SharedKG            bool
+	SharedSessions      bool
 	RestrictToWorkspace bool
 
 	// Tool configuration
@@ -45,14 +47,16 @@ type RunContext struct {
 	ShellDenyGroups     map[string]bool
 
 	// Workspace
-	Workspace        string
-	TeamWorkspace    string
-	TeamID           string
-	WorkspaceChannel string
-	WorkspaceChatID  string
-	TeamTaskID       string
-	LeaderAgentID    string // leader's agent UUID for member memory read fallback
-	AgentToolKey     string // tool-level agent key for registry routing
+	Workspace          string
+	TeamWorkspace      string
+	TeamID             string
+	WorkspaceChannel   string
+	WorkspaceChatID    string
+	TeamTaskID         string
+	DelegationID       string   // delegation identifier for vault auto-linking (empty when not in delegation)
+	LeaderAgentID      string   // leader's agent UUID for member memory read fallback
+	AgentToolKey       string   // tool-level agent key for registry routing
+	TenantAllowedPaths []string // tenant-specific allowed paths beyond workspace (from system_configs)
 }
 
 // WithRunContext stores a RunContext on the context.

@@ -24,8 +24,9 @@ type Stores struct {
 	Contacts         ContactStore
 	Activity         ActivityStore
 	Snapshots        SnapshotStore
-	SecureCLI        SecureCLIStore
-	APIKeys           APIKeyStore
+	SecureCLI           SecureCLIStore
+	SecureCLIGrants     SecureCLIAgentGrantStore
+	APIKeys             APIKeyStore
 	Heartbeats        HeartbeatStore
 	ConfigPermissions      ConfigPermissionStore
 	Tenants                TenantStore
@@ -33,4 +34,8 @@ type Stores struct {
 	SkillTenantCfgs        SkillTenantConfigStore
 	SystemConfigs          SystemConfigStore
 	SubagentTasks          SubagentTaskStore
+	Vault                  VaultStore
+	Episodic               EpisodicStore
+	EvolutionMetrics       EvolutionMetricsStore
+	EvolutionSuggestions   EvolutionSuggestionStore
 }

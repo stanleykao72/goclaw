@@ -87,10 +87,11 @@ func scanScriptsDir(scriptsDir string) *SkillManifest {
 	for b := range binaries {
 		m.Requires = append(m.Requires, b)
 	}
-	// Store raw import names — skip local module dirs (subdirs of scriptsDir).
-	// dep_checker.go handles stdlib/pip resolution via PYTHONPATH.
+	// Store raw import names — skip local modules and Python stdlib.
+	// Stdlib is also resolved at check time via actual import, but filtering here
+	// prevents false positives when the checker fails (timeout, env issue, crash).
 	for pkg := range pyImports {
-		if !localModules[pkg] {
+		if !localModules[pkg] && !pythonStdlib[pkg] {
 			m.RequiresPython = append(m.RequiresPython, pkg)
 		}
 	}

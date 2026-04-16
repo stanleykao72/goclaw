@@ -87,7 +87,7 @@ func (s *SQLitePairingStore) ApprovePairing(ctx context.Context, code, approvedB
 	var reqTenantID uuid.UUID
 
 	err := s.db.QueryRowContext(ctx,
-		"SELECT id, sender_id, channel, chat_id, COALESCE(metadata, '{}'), tenant_id FROM pairing_requests WHERE code = ?", code,
+		"SELECT id, sender_id, channel, chat_id, COALESCE(metadata, '{}'), tenant_id FROM pairing_requests WHERE code = ? AND expires_at > ?", code, now,
 	).Scan(&reqID, &senderID, &channel, &chatID, &metaJSON, &reqTenantID)
 	if err != nil {
 		return nil, fmt.Errorf("pairing code %s not found or expired", code)
@@ -233,6 +233,67 @@ func (s *SQLitePairingStore) ListPaired(ctx context.Context) []store.PairedDevic
 		return []store.PairedDeviceData{}
 	}
 	return result
+}
+
+func (s *SQLitePairingStore) MigrateGroupChatID(ctx context.Context, channel, oldChatID, newChatID string) error {
+	tid := tenantIDForInsert(ctx)
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin migrate tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// 1. paired_devices: update sender_id and chat_id
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE paired_devices
+		 SET sender_id = REPLACE(sender_id, ?, ?),
+		     chat_id = REPLACE(chat_id, ?, ?)
+		 WHERE sender_id LIKE '%' || ? || '%'
+		   AND channel = ?
+		   AND tenant_id = ?`,
+		oldChatID, newChatID, oldChatID, newChatID, oldChatID, channel, tid,
+	); err != nil {
+		return fmt.Errorf("migrate paired_devices: %w", err)
+	}
+
+	// 2. sessions: update session_key and user_id
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE sessions
+		 SET session_key = REPLACE(session_key, ':' || ?, ':' || ?),
+		     user_id = REPLACE(user_id, ':' || ?, ':' || ?)
+		 WHERE session_key LIKE '%:telegram:%:' || ? || '%'
+		   AND tenant_id = ?`,
+		oldChatID, newChatID, oldChatID, newChatID, oldChatID, tid,
+	); err != nil {
+		return fmt.Errorf("migrate sessions: %w", err)
+	}
+
+	// 3. channel_contacts: update sender_id
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE channel_contacts
+		 SET sender_id = REPLACE(sender_id, ?, ?)
+		 WHERE sender_id LIKE '%' || ? || '%'
+		   AND channel_type = 'telegram'
+		   AND tenant_id = ?`,
+		oldChatID, newChatID, oldChatID, tid,
+	); err != nil {
+		return fmt.Errorf("migrate channel_contacts: %w", err)
+	}
+
+	// 4. channel_pending_messages: update history_key
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE channel_pending_messages
+		 SET history_key = REPLACE(history_key, ?, ?)
+		 WHERE history_key LIKE '%' || ? || '%'
+		   AND channel_name = ?
+		   AND tenant_id = ?`,
+		oldChatID, newChatID, oldChatID, channel, tid,
+	); err != nil {
+		return fmt.Errorf("migrate channel_pending_messages: %w", err)
+	}
+
+	return tx.Commit()
 }
 
 // parseTimeToMillis parses a Go time.Time string (possibly with monotonic clock suffix)

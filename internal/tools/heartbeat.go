@@ -285,7 +285,7 @@ func (t *HeartbeatTool) checkPermission(ctx context.Context, agentID uuid.UUID) 
 		}
 	}
 
-	allowed, err := t.permStore.CheckPermission(ctx, agentID, scope, "heartbeat", numericID)
+	allowed, err := t.permStore.CheckPermission(ctx, agentID, scope, store.ConfigTypeHeartbeat, numericID)
 	if err != nil {
 		return fmt.Errorf("permission check failed: %w", err)
 	}

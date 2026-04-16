@@ -1,6 +1,6 @@
-import { useState } from "react";
+import { useState, lazy, Suspense } from "react";
 import { useTranslation } from "react-i18next";
-import { KeyRound, Plus, RefreshCw, Pencil, Trash2, Users } from "lucide-react";
+import { KeyRound, Plus, RefreshCw, Pencil, Trash2, Users, Shield } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { PageHeader } from "@/components/shared/page-header";
@@ -10,9 +10,15 @@ import { ConfirmDialog } from "@/components/shared/confirm-dialog";
 import { useMinLoading } from "@/hooks/use-min-loading";
 import { useDeferredLoading } from "@/hooks/use-deferred-loading";
 import { useCliCredentials, useCliCredentialPresets } from "./hooks/use-cli-credentials";
-import { CliCredentialFormDialog } from "./cli-credential-form-dialog";
-import { CLIUserCredentialsDialog } from "./cli-user-credentials-dialog";
+import { CliCredentialGrantsDialog } from "./cli-credential-grants-dialog";
 import type { SecureCLIBinary, CLICredentialInput } from "./hooks/use-cli-credentials";
+
+const CliCredentialFormDialog = lazy(() =>
+  import("./cli-credential-form-dialog").then((m) => ({ default: m.CliCredentialFormDialog }))
+);
+const CLIUserCredentialsDialog = lazy(() =>
+  import("./cli-user-credentials-dialog").then((m) => ({ default: m.CLIUserCredentialsDialog }))
+);
 
 export function CliCredentialsPage() {
   const { t } = useTranslation("cli-credentials");
@@ -23,6 +29,7 @@ export function CliCredentialsPage() {
   const [deleteTarget, setDeleteTarget] = useState<SecureCLIBinary | null>(null);
   const [deleteLoading, setDeleteLoading] = useState(false);
   const [userCredsTarget, setUserCredsTarget] = useState<SecureCLIBinary | null>(null);
+  const [grantsTarget, setGrantsTarget] = useState<SecureCLIBinary | null>(null);
 
   const { items, loading, refresh, createCredential, updateCredential, deleteCredential } =
     useCliCredentials();
@@ -118,8 +125,8 @@ export function CliCredentialsPage() {
                       {item.description || "—"}
                     </td>
                     <td className="px-4 py-3">
-                      <Badge variant={item.agent_id ? "secondary" : "outline"}>
-                        {item.agent_id ? tc("agent") : tc("global")}
+                      <Badge variant={item.is_global ? "outline" : "secondary"}>
+                        {item.is_global ? tc("global") : t("columns.restricted")}
                       </Badge>
                     </td>
                     <td className="px-4 py-3">
@@ -130,6 +137,9 @@ export function CliCredentialsPage() {
                     <td className="px-4 py-3 text-muted-foreground">{item.timeout_seconds}s</td>
                     <td className="px-4 py-3 text-right">
                       <div className="flex items-center justify-end gap-1">
+                        <Button variant="ghost" size="sm" onClick={() => setGrantsTarget(item)} title={t("grants.title", { name: item.binary_name })}>
+                          <Shield className="h-3.5 w-3.5" />
+                        </Button>
                         <Button variant="ghost" size="sm" onClick={() => setUserCredsTarget(item)} title={t("userCredentials.title")}>
                           <Users className="h-3.5 w-3.5" />
                         </Button>
@@ -159,13 +169,15 @@ export function CliCredentialsPage() {
         )}
       </div>
 
-      <CliCredentialFormDialog
-        open={formOpen}
-        onOpenChange={setFormOpen}
-        credential={editItem}
-        presets={presets}
-        onSubmit={editItem ? handleEdit : handleCreate}
-      />
+      <Suspense fallback={null}>
+        <CliCredentialFormDialog
+          open={formOpen}
+          onOpenChange={setFormOpen}
+          credential={editItem}
+          presets={presets}
+          onSubmit={editItem ? handleEdit : handleCreate}
+        />
+      </Suspense>
 
       <ConfirmDialog
         open={!!deleteTarget}
@@ -179,10 +191,20 @@ export function CliCredentialsPage() {
       />
 
       {userCredsTarget && (
-        <CLIUserCredentialsDialog
-          open={!!userCredsTarget}
-          onOpenChange={(open: boolean) => !open && setUserCredsTarget(null)}
-          binary={userCredsTarget}
+        <Suspense fallback={null}>
+          <CLIUserCredentialsDialog
+            open={!!userCredsTarget}
+            onOpenChange={(open: boolean) => !open && setUserCredsTarget(null)}
+            binary={userCredsTarget}
+          />
+        </Suspense>
+      )}
+
+      {grantsTarget && (
+        <CliCredentialGrantsDialog
+          open={!!grantsTarget}
+          onOpenChange={(open) => !open && setGrantsTarget(null)}
+          binary={grantsTarget}
         />
       )}
     </div>

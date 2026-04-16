@@ -6,7 +6,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"strings"
 	"sync"
 	"time"
 
@@ -281,29 +280,24 @@ func (s *SQLiteHeartbeatStore) ListLogs(ctx context.Context, agentID uuid.UUID, 
 	return logs, total, nil
 }
 
-// ListDeliveryTargets returns distinct (channel, chatID, title, kind) pairs from sessions.
-// SQLite adaptation: replaces DISTINCT ON + split_part with GROUP BY + substr/instr + Go-side dedup.
-// Session key format: agent:{key}:{channel}:{kind}:{chatId}
-func (s *SQLiteHeartbeatStore) ListDeliveryTargets(ctx context.Context, agentID uuid.UUID) ([]store.DeliveryTarget, error) {
+// ListDeliveryTargets returns known delivery targets (channel, chatID, title, kind) from channel_contacts.
+// Queries contacts with contact_type IN ('group','topic','user') for the given tenant.
+// For topic contacts, chatID is built as senderID + ":topic:" + threadID.
+func (s *SQLiteHeartbeatStore) ListDeliveryTargets(ctx context.Context, tenantID uuid.UUID) ([]store.DeliveryTarget, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT
-		    s.channel,
-		    substr(s.session_key, instr(s.session_key||':', ':') + 1) AS raw_tail,
-		    json_extract(s.metadata, '$.chat_title') AS chat_title,
-		    s.session_key,
-		    cc.display_name,
-		    cc.username
-		 FROM sessions s
-		 LEFT JOIN channel_contacts cc
-		    ON cc.channel_type = s.channel
-		 WHERE s.agent_id = ?
-		   AND s.channel IS NOT NULL AND s.channel != ''
-		   AND s.session_key NOT LIKE '%:heartbeat%'
-		   AND s.session_key NOT LIKE '%:cron%'
-		   AND s.session_key NOT LIKE '%:subagent%'
-		   AND s.session_key NOT LIKE '%:team:%'
-		 GROUP BY s.channel, s.session_key`,
-		agentID,
+		`SELECT cc.sender_id,
+		        cc.thread_id,
+		        cc.thread_type,
+		        cc.channel_instance AS channel,
+		        COALESCE(cc.display_name, cc.sender_id) AS title,
+		        CASE WHEN cc.contact_type = 'topic' THEN 'topic'
+		             WHEN cc.peer_kind = 'group' THEN 'group'
+		             ELSE 'dm' END AS kind
+		 FROM channel_contacts cc
+		 WHERE cc.tenant_id = ?
+		   AND cc.contact_type IN ('group', 'topic', 'user')
+		 ORDER BY cc.channel_instance, cc.display_name`,
+		tenantID,
 	)
 	if err != nil {
 		return nil, err
@@ -313,47 +307,30 @@ func (s *SQLiteHeartbeatStore) ListDeliveryTargets(ctx context.Context, agentID 
 	seen := make(map[string]bool)
 	var targets []store.DeliveryTarget
 	for rows.Next() {
-		var channel, rawTail, sessionKey string
-		var chatTitle, displayName, username *string
-		if err := rows.Scan(&channel, &rawTail, &chatTitle, &sessionKey, &displayName, &username); err != nil {
+		var senderID, title, kind string
+		var threadID, threadType, channel *string
+		if err := rows.Scan(&senderID, &threadID, &threadType, &channel, &title, &kind); err != nil {
 			return nil, err
 		}
-
-		// Parse chatId: 5th colon-separated segment of session_key.
-		chatID := extractSessionKeyPart(sessionKey, 5)
-		if chatID == "" {
+		if channel == nil {
 			continue
 		}
-		key := channel + ":" + chatID
-		if seen[key] {
-			continue
+		chatID := senderID
+		displayTitle := title
+		if threadID != nil && *threadID != "" {
+			chatID = senderID + ":topic:" + *threadID
+			displayTitle = title + " > topic:" + *threadID
 		}
-		seen[key] = true
-
-		title := ""
-		switch {
-		case chatTitle != nil && *chatTitle != "":
-			title = *chatTitle
-		case displayName != nil && *displayName != "":
-			title = *displayName
-		case username != nil && *username != "":
-			title = "@" + *username
+		key := *channel + ":" + chatID
+		if !seen[key] {
+			seen[key] = true
+			targets = append(targets, store.DeliveryTarget{
+				Channel: *channel,
+				ChatID:  chatID,
+				Title:   displayTitle,
+				Kind:    kind,
+			})
 		}
-
-		kind := "other"
-		switch {
-		case strings.Contains(sessionKey, ":group:"):
-			kind = "group"
-		case strings.Contains(sessionKey, ":direct:"):
-			kind = "dm"
-		}
-
-		targets = append(targets, store.DeliveryTarget{
-			Channel: channel,
-			ChatID:  chatID,
-			Title:   title,
-			Kind:    kind,
-		})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -361,11 +338,3 @@ func (s *SQLiteHeartbeatStore) ListDeliveryTargets(ctx context.Context, agentID 
 	return targets, nil
 }
 
-// extractSessionKeyPart returns the n-th colon-delimited segment (1-indexed).
-func extractSessionKeyPart(key string, n int) string {
-	parts := strings.SplitN(key, ":", n+1)
-	if len(parts) < n {
-		return ""
-	}
-	return parts[n-1]
-}

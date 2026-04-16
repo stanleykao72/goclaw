@@ -3,6 +3,7 @@ package pg
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
@@ -15,7 +16,10 @@ func (s *PGMemoryStore) Search(ctx context.Context, query string, agentID, userI
 		maxResults = s.cfg.MaxResults
 	}
 
-	aid := mustParseUUID(agentID)
+	aid, err := parseUUID(agentID)
+	if err != nil {
+		return nil, fmt.Errorf("memory search: %w", err)
+	}
 
 	// FTS search using tsvector
 	ftsResults, err := s.ftsSearch(ctx, query, aid, userID, maxResults*2)
@@ -56,7 +60,7 @@ func (s *PGMemoryStore) Search(ctx context.Context, query string, agentID, userI
 		if opts.MinScore > 0 && m.Score < opts.MinScore {
 			continue
 		}
-		if opts.PathPrefix != "" && len(m.Path) < len(opts.PathPrefix) {
+		if opts.PathPrefix != "" && !strings.HasPrefix(m.Path, opts.PathPrefix) {
 			continue
 		}
 		filtered = append(filtered, m)
@@ -81,9 +85,22 @@ func (s *PGMemoryStore) ftsSearch(ctx context.Context, query string, agentID any
 	var q string
 	var args []any
 
-	if userID != "" {
+	if store.IsSharedMemory(ctx) {
+		// Shared: no user_id filter — search ALL chunks for agent
+		tc, tcArgs, _, err := scopeClause(ctx, 4)
+		if err != nil {
+			return nil, err
+		}
+		limitN := 4 + len(tcArgs)
+		q = fmt.Sprintf(`SELECT path, start_line, end_line, text, user_id,
+				ts_rank(tsv, plainto_tsquery('simple', $1)) AS score
+			FROM memory_chunks
+			WHERE agent_id = $2 AND tsv @@ plainto_tsquery('simple', $3)%s
+			ORDER BY score DESC LIMIT $%d`, tc, limitN)
+		args = append([]any{query, agentID, query}, tcArgs...)
+		args = append(args, limit)
+	} else if userID != "" {
 		// fixed params: $1=query, $2=agentID, $3=query, $4=userID
-		// tenant clause appended at $5 (if filtered), then LIMIT at $5 or $6
 		tc, tcArgs, _, err := scopeClause(ctx, 5)
 		if err != nil {
 			return nil, err
@@ -99,7 +116,6 @@ func (s *PGMemoryStore) ftsSearch(ctx context.Context, query string, agentID any
 		args = append(args, limit)
 	} else {
 		// fixed params: $1=query, $2=agentID, $3=query
-		// tenant clause at $4 (if filtered), then LIMIT at $4 or $5
 		tc, tcArgs, _, err := scopeClause(ctx, 4)
 		if err != nil {
 			return nil, err
@@ -115,17 +131,13 @@ func (s *PGMemoryStore) ftsSearch(ctx context.Context, query string, agentID any
 		args = append(args, limit)
 	}
 
-	rows, err := s.db.QueryContext(ctx, q, args...)
-	if err != nil {
+	var rows []scoredChunkRow
+	if err := pkgSqlxDB.SelectContext(ctx, &rows, q, args...); err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	var results []scoredChunk
-	for rows.Next() {
-		var r scoredChunk
-		rows.Scan(&r.Path, &r.StartLine, &r.EndLine, &r.Text, &r.UserID, &r.Score)
-		results = append(results, r)
+	results := make([]scoredChunk, len(rows))
+	for i := range rows {
+		results[i] = rows[i].toScoredChunk()
 	}
 	return results, nil
 }
@@ -136,9 +148,23 @@ func (s *PGMemoryStore) vectorSearch(ctx context.Context, embedding []float32, a
 	var q string
 	var args []any
 
-	if userID != "" {
+	if store.IsSharedMemory(ctx) {
+		// Shared: no user_id filter — search ALL chunks for agent
+		tc, tcArgs, _, err := scopeClause(ctx, 3)
+		if err != nil {
+			return nil, err
+		}
+		orderN := 3 + len(tcArgs)
+		limitN := orderN + 1
+		q = fmt.Sprintf(`SELECT path, start_line, end_line, text, user_id,
+				1 - (embedding <=> $1::vector) AS score
+			FROM memory_chunks
+			WHERE agent_id = $2 AND embedding IS NOT NULL%s
+			ORDER BY embedding <=> $%d::vector LIMIT $%d`, tc, orderN, limitN)
+		args = append([]any{vecStr, agentID}, tcArgs...)
+		args = append(args, vecStr, limit)
+	} else if userID != "" {
 		// fixed params: $1=vec, $2=agentID, $3=userID
-		// tenant clause at $4, then ORDER vec at $4+len(tcArgs), LIMIT after
 		tc, tcArgs, _, err := scopeClause(ctx, 4)
 		if err != nil {
 			return nil, err
@@ -155,7 +181,6 @@ func (s *PGMemoryStore) vectorSearch(ctx context.Context, embedding []float32, a
 		args = append(args, vecStr, limit)
 	} else {
 		// fixed params: $1=vec, $2=agentID
-		// tenant clause at $3, then ORDER vec at $3+len(tcArgs), LIMIT after
 		tc, tcArgs, _, err := scopeClause(ctx, 3)
 		if err != nil {
 			return nil, err
@@ -172,23 +197,21 @@ func (s *PGMemoryStore) vectorSearch(ctx context.Context, embedding []float32, a
 		args = append(args, vecStr, limit)
 	}
 
-	rows, err := s.db.QueryContext(ctx, q, args...)
-	if err != nil {
+	var rows []scoredChunkRow
+	if err := pkgSqlxDB.SelectContext(ctx, &rows, q, args...); err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	var results []scoredChunk
-	for rows.Next() {
-		var r scoredChunk
-		rows.Scan(&r.Path, &r.StartLine, &r.EndLine, &r.Text, &r.UserID, &r.Score)
-		results = append(results, r)
+	results := make([]scoredChunk, len(rows))
+	for i := range rows {
+		results[i] = rows[i].toScoredChunk()
 	}
 	return results, nil
 }
 
 // hybridMerge combines FTS and vector results with weighted scoring.
 // Per-user results get a 1.2x boost. Deduplication: user copy wins over global.
+// NOTE: when shared memory is active, the 1.2x personal boost still applies —
+// consider removing it in shared mode if all docs should be treated equally.
 func hybridMerge(fts, vec []scoredChunk, textWeight, vectorWeight float64, currentUserID string) []store.MemorySearchResult {
 	type key struct {
 		Path      string

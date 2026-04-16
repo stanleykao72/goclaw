@@ -117,6 +117,9 @@ func (m *mockTenantStore) GetTenantUser(context.Context, uuid.UUID) (*store.Tena
 func (m *mockTenantStore) CreateTenantUserReturning(context.Context, uuid.UUID, string, string, string) (*store.TenantUserData, error) {
 	return nil, fmt.Errorf("not implemented")
 }
+func (m *mockTenantStore) GetTenantsByIDs(context.Context, []uuid.UUID) ([]store.TenantData, error) {
+	return nil, nil
+}
 
 type mockPairingStore struct {
 	paired map[string]bool
@@ -139,6 +142,9 @@ func (m *mockPairingStore) IsPaired(_ context.Context, senderID, channel string)
 }
 func (m *mockPairingStore) ListPending(context.Context) []store.PairingRequestData { return nil }
 func (m *mockPairingStore) ListPaired(context.Context) []store.PairedDeviceData    { return nil }
+func (m *mockPairingStore) MigrateGroupChatID(context.Context, string, string, string) error {
+	return nil
+}
 
 func TestResolveAuth_GatewayToken(t *testing.T) {
 	setupTestCache(t, nil)

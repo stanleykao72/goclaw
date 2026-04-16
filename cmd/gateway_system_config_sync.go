@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 
@@ -106,6 +107,10 @@ func seedConfigForContext(ctx context.Context, sc store.SystemConfigStore, cfg *
 	setBool("gateway.tool_status", cfg.Gateway.ToolStatus)
 	setInt("gateway.task_recovery_interval_sec", cfg.Gateway.TaskRecoveryIntervalSec)
 
+	// Background workers
+	set("background.provider", cfg.Gateway.BackgroundProvider)
+	set("background.model", cfg.Gateway.BackgroundModel)
+
 	// Tools
 	set("tools.profile", cfg.Tools.Profile)
 	setInt("tools.rate_limit_per_hour", cfg.Tools.RateLimitPerHour)
@@ -128,5 +133,13 @@ func seedConfigForContext(ctx context.Context, sc store.SystemConfigStore, cfg *
 		setInt("compaction.max_tokens", pc.MaxTokens)
 		set("compaction.provider", pc.Provider)
 		set("compaction.model", pc.Model)
+	}
+
+	// Allowed paths (tenant-scoped filesystem access beyond workspace)
+	// Stored as JSON array, loaded per-tenant at request time.
+	if len(cfg.Agents.Defaults.AllowedPaths) > 0 {
+		if b, err := json.Marshal(cfg.Agents.Defaults.AllowedPaths); err == nil {
+			set("allowed_paths", string(b))
+		}
 	}
 }

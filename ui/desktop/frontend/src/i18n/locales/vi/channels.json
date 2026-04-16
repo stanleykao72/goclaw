@@ -8,7 +8,11 @@
   "status": {
     "running": "Đang chạy",
     "stopped": "Đã dừng",
-    "disabled": "Tắt"
+    "disabled": "Tắt",
+    "degraded": "Suy giảm",
+    "starting": "Đang khởi động",
+    "registered": "Đã cấu hình",
+    "failed": "Thất bại"
   },
   "channelTypes": {
     "telegram": "Telegram",
@@ -38,6 +42,7 @@
   },
   "detail": {
     "back": "Quay lại",
+    "lastChecked": "Kiểm tra gần nhất: {{value}}",
     "tabs": {
       "general": "Chung",
       "credentials": "Xác thực",

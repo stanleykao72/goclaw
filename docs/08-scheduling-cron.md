@@ -122,6 +122,7 @@ Cancel commands for Telegram and other channels.
 - **Empty outbound**: On cancel, an empty outbound message is published to trigger cleanup (stop typing indicator, clear reactions)
 - **Trace finalization**: When `ctx.Err() != nil`, trace finalization falls back to `context.Background()` for the final DB write. Status is set to `"cancelled"`
 - **Context survival**: Context values (traceID, collector) survive cancellation -- only the Done channel fires
+- **Background workers (ticker/cron) — tenant ctx injection required**: Jobs started from `context.Background()` carry no tenant. Before calling any tenant-scoped store method (e.g. `GetTeam`, `GetTask`, `GetByID`), the worker MUST inject `store.WithTenantID(ctx, tenantID)` derived from the row-level `tenant_id` (e.g. `RecoveredTaskInfo.TenantID`, `TeamTaskData.TenantID`). Callers must also nil-check returned entities — some stores (e.g. `PGTeamStore.GetTeam`) return `(nil, nil)` when tenant is missing rather than an error. See `internal/tasks/task_ticker.go` for the reference pattern
 - **Generation counter**: Each `SessionQueue` tracks a generation counter. When reset (e.g., during SIGUSR1 in-process restart), old generations are ignored, preventing stale completions from interfering with new requests
 
 ---
@@ -188,6 +189,17 @@ Example retry sequence: fail → wait 2s → retry → fail → wait 4s → retr
 
 Retries are transparent to the user; final run status (ok or error) is logged to the `cron_run_logs` table.
 
+### v3 Agent Evolution Cron Jobs
+
+Two background cron jobs manage agent evolution (v3):
+
+| Job | Frequency | Purpose |
+|-----|-----------|---------|
+| **Suggestion Analysis** | Daily (1 min after startup, then every 24h) | Analyzes agents with `evolution_metrics` enabled, generates improvement suggestions |
+| **Evaluation & Rollback** | Weekly (every 7 days) | Checks applied suggestions against quality guardrails, auto-rolls back degraded evolutions |
+
+Both jobs run with 5-minute timeout and tenant-scoped context. Failed analyses log at debug level and continue gracefully.
+
 ---
 
 ## File Reference
@@ -223,6 +235,7 @@ Retries are transparent to the user; final run status (ok or error) is logged to
 | File | Description |
 |------|-------------|
 | `cmd/gateway_cron.go` | makeCronJobHandler (routes cron execution to scheduler) |
+| `cmd/gateway_evolution_cron.go` | Evolution daily/weekly background jobs (v3 suggestion analysis + rollback evaluation) |
 | `cmd/gateway_agents.go` | Agent initialization and run loop setup |
 | `internal/gateway/methods/cron.go` | RPC method handlers (list, create, update, delete, toggle, run, runs) |
 

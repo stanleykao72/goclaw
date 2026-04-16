@@ -1,24 +1,28 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, lazy, Suspense } from "react";
 import { useTranslation } from "react-i18next";
-import { Brain, Plus, RefreshCw, Search, Database, Trash2, RotateCw } from "lucide-react";
+import { Plus, RefreshCw, Search, Database } from "lucide-react";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Label } from "@/components/ui/label";
 import { PageHeader } from "@/components/shared/page-header";
-import { EmptyState } from "@/components/shared/empty-state";
-import { TableSkeleton } from "@/components/shared/loading-skeleton";
-import { Pagination } from "@/components/shared/pagination";
 import { ConfirmDialog } from "@/components/shared/confirm-dialog";
 import { useAgents } from "@/pages/agents/hooks/use-agents";
 import { useContactResolver } from "@/hooks/use-contact-resolver";
+import { formatUserLabel } from "@/lib/format-user-label";
 import { useMemoryDocuments } from "./hooks/use-memory";
-import { MemoryDocumentDialog } from "./memory-document-dialog";
-import { MemoryCreateDialog } from "./memory-create-dialog";
-import { MemorySearchDialog } from "./memory-search-dialog";
+import { MemoryDocumentDialog } from "./documents/memory-document-dialog";
+import { MemorySearchDialog } from "./documents/memory-search-dialog";
+import { MemoryDocumentsTable } from "./documents/memory-documents-table";
 import { useMinLoading } from "@/hooks/use-min-loading";
 import { useDeferredLoading } from "@/hooks/use-deferred-loading";
 import { useEmbeddingStatus } from "@/hooks/use-embedding-status";
+import { EpisodicTab } from "./episodic/episodic-tab";
 import type { MemoryDocument } from "@/types/memory";
+
+const MemoryCreateDialog = lazy(() =>
+  import("./documents/memory-create-dialog").then((m) => ({ default: m.MemoryCreateDialog }))
+);
 
 export function MemoryPage() {
   const { t } = useTranslation("memory");
@@ -34,6 +38,7 @@ export function MemoryPage() {
   const [deleteLoading, setDeleteLoading] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [indexAllLoading, setIndexAllLoading] = useState(false);
+  const [activeTab, setActiveTab] = useState("documents");
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(20);
 
@@ -138,7 +143,7 @@ export function MemoryPage() {
         }
       />
 
-      {/* Filters */}
+      {/* Shared agent filter */}
       <div className="mt-4 flex flex-wrap items-end gap-3">
         <div className="grid gap-1.5">
           <Label htmlFor="mem-agent" className="text-xs">{t("filters.agent")}</Label>
@@ -146,7 +151,7 @@ export function MemoryPage() {
             id="mem-agent"
             value={agentId}
             onChange={(e) => { setAgentId(e.target.value); setUserIdFilter(""); setPage(1); }}
-            className="h-9 rounded-md border bg-background px-3 text-base md:text-sm"
+            className="h-9 rounded-md border bg-background px-3 text-base md:text-sm cursor-pointer"
           >
             <option value="">{t("filters.allAgents")}</option>
             {agents.map((a) => (
@@ -156,125 +161,73 @@ export function MemoryPage() {
             ))}
           </select>
         </div>
-        <div className="grid gap-1.5">
-          <Label htmlFor="mem-scope" className="text-xs">{t("filters.scope")}</Label>
-          <select
-            id="mem-scope"
-            value={userIdFilter}
-            onChange={(e) => { setUserIdFilter(e.target.value); setPage(1); }}
-            className="h-9 rounded-md border bg-background px-3 text-base md:text-sm min-w-[180px]"
-          >
-            <option value="">{t("filters.allScope")}</option>
-            {userIds.map((uid) => (
-              <option key={uid} value={uid}>
-                {formatScopeLabel(uid, resolveContact)}
-              </option>
-            ))}
-          </select>
-        </div>
-        {agentId && (
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={handleIndexAll}
-            disabled={indexAllLoading}
-            className="h-9 gap-1"
-          >
-            <Database className="h-3.5 w-3.5" />
-            {indexAllLoading ? t("indexing") : t("indexAll")}
-          </Button>
+        {activeTab === "documents" && (
+          <>
+            <div className="grid gap-1.5">
+              <Label htmlFor="mem-scope" className="text-xs">{t("filters.scope")}</Label>
+              <select
+                id="mem-scope"
+                value={userIdFilter}
+                onChange={(e) => { setUserIdFilter(e.target.value); setPage(1); }}
+                className="h-9 rounded-md border bg-background px-3 text-base md:text-sm min-w-[180px] cursor-pointer"
+              >
+                <option value="">{t("filters.allScope")}</option>
+                {userIds.map((uid) => (
+                  <option key={uid} value={uid}>
+                    {formatUserLabel(uid, resolveContact)}
+                  </option>
+                ))}
+              </select>
+            </div>
+            {agentId && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleIndexAll}
+                disabled={indexAllLoading}
+                className="h-9 gap-1"
+              >
+                <Database className="h-3.5 w-3.5" />
+                {indexAllLoading ? t("indexing") : t("indexAll")}
+              </Button>
+            )}
+          </>
         )}
       </div>
 
-      {/* Document table */}
-      <div className="mt-4">
-        {showSkeleton ? (
-          <TableSkeleton rows={5} />
-        ) : documents.length === 0 ? (
-          <EmptyState
-            icon={Brain}
-            title={t("emptyTitle")}
-            description={agentId ? t("emptyAgentDescription") : t("emptyGlobalDescription")}
+      <Tabs value={activeTab} onValueChange={setActiveTab} className="mt-4">
+        <TabsList>
+          <TabsTrigger value="documents">{t("tabs.documents")}</TabsTrigger>
+          <TabsTrigger value="episodic">{t("tabs.episodic")}</TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="documents" className="mt-4 space-y-4">
+
+          {/* Document table */}
+          <MemoryDocumentsTable
+            documents={documents}
+            paginatedDocs={paginatedDocs}
+            loading={showSkeleton}
+            agentId={agentId}
+            agentWorkspace={selectedAgent?.workspace}
+            page={page}
+            pageSize={pageSize}
+            total={total}
+            totalPages={totalPages}
+            resolveContact={resolveContact}
+            agentMap={agentMap}
+            onViewDoc={setViewDoc}
+            onDeleteTarget={setDeleteTarget}
+            onReindex={handleReindex}
+            onPageChange={setPage}
+            onPageSizeChange={(size) => { setPageSize(size); setPage(1); }}
           />
-        ) : (
-          <div className="overflow-x-auto rounded-md border">
-            <table className="w-full min-w-[600px] text-sm">
-              <thead>
-                <tr className="border-b bg-muted/50">
-                  <th className="px-4 py-3 text-left font-medium">{t("columns.path")}</th>
-                  {!agentId && <th className="px-4 py-3 text-left font-medium">{t("columns.agent")}</th>}
-                  <th className="px-4 py-3 text-left font-medium">{t("columns.scope")}</th>
-                  <th className="px-4 py-3 text-left font-medium">{t("columns.hash")}</th>
-                  <th className="px-4 py-3 text-left font-medium">{t("columns.updated")}</th>
-                  <th className="px-4 py-3 text-right font-medium">{t("columns.actions")}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {paginatedDocs.map((doc) => (
-                  <tr key={`${doc.agent_id}-${doc.path}-${doc.user_id || "global"}`} className="border-b last:border-0 hover:bg-muted/30">
-                    <td className="px-4 py-3">
-                      <button
-                        className="flex items-start gap-2 text-left hover:underline cursor-pointer"
-                        onClick={() => setViewDoc(doc)}
-                      >
-                        <Brain className="h-4 w-4 shrink-0 text-muted-foreground mt-0.5" />
-                        <div>
-                          <span className="font-mono text-xs font-medium">{doc.path}</span>
-                          {selectedAgent?.workspace && (
-                            <p className="font-mono text-[10px] text-muted-foreground">{selectedAgent.workspace}</p>
-                          )}
-                        </div>
-                      </button>
-                    </td>
-                    {!agentId && (
-                      <td className="px-4 py-3 text-xs text-muted-foreground">
-                        {doc.agent_id ? (agentMap.get(doc.agent_id) || doc.agent_id.slice(0, 8)) : "-"}
-                      </td>
-                    )}
-                    <td className="px-4 py-3">
-                      <Badge variant={doc.user_id ? "secondary" : "outline"}>
-                        {doc.user_id ? t("scopeLabel.personal") : t("scopeLabel.global")}
-                      </Badge>
-                      {doc.user_id && (
-                        <span className="ml-1 text-xs text-muted-foreground">{formatScopeLabel(doc.user_id, resolveContact)}</span>
-                      )}
-                    </td>
-                    <td className="px-4 py-3 font-mono text-xs text-muted-foreground">
-                      {doc.hash.slice(0, 8)}
-                    </td>
-                    <td className="px-4 py-3 text-xs text-muted-foreground">
-                      {new Date(doc.updated_at).toLocaleString()}
-                    </td>
-                    <td className="px-4 py-3 text-right">
-                      <div className="flex items-center justify-end gap-1">
-                        <Button variant="ghost" size="sm" onClick={() => handleReindex(doc)} className="gap-1">
-                          <RotateCw className="h-3.5 w-3.5" />
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onClick={() => setDeleteTarget(doc)}
-                          className="gap-1 text-destructive hover:text-destructive"
-                        >
-                          <Trash2 className="h-3.5 w-3.5" />
-                        </Button>
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-            <Pagination
-              page={page}
-              pageSize={pageSize}
-              total={total}
-              totalPages={totalPages}
-              onPageChange={setPage}
-              onPageSizeChange={(size) => { setPageSize(size); setPage(1); }}
-            />
-          </div>
-        )}
-      </div>
+        </TabsContent>
+
+        <TabsContent value="episodic" className="mt-4">
+          <EpisodicTab agentId={agentId} />
+        </TabsContent>
+      </Tabs>
 
       {/* Dialogs */}
       <MemoryDocumentDialog
@@ -284,12 +237,14 @@ export function MemoryPage() {
         document={viewDoc}
       />
 
-      <MemoryCreateDialog
-        open={createOpen}
-        onOpenChange={setCreateOpen}
-        agentId={agentId || undefined}
-        knownUserIds={userIds}
-      />
+      <Suspense fallback={null}>
+        <MemoryCreateDialog
+          open={createOpen}
+          onOpenChange={setCreateOpen}
+          agentId={agentId || undefined}
+          knownUserIds={userIds}
+        />
+      </Suspense>
 
       <MemorySearchDialog
         open={searchOpen}
@@ -311,21 +266,3 @@ export function MemoryPage() {
   );
 }
 
-/** Format user_id into a readable scope label, preferring contact title if available. */
-function formatScopeLabel(userId: string, resolveContact?: (id: string) => { display_name?: string; username?: string } | null): string {
-  // Try contact resolver first
-  if (resolveContact) {
-    const contact = resolveContact(userId);
-    if (contact?.display_name) return contact.display_name;
-    if (contact?.username) return `@${contact.username}`;
-  }
-  // Fallback: format group IDs nicely
-  if (userId.startsWith("group:")) {
-    const parts = userId.split(":");
-    if (parts.length >= 3) {
-      const channel = parts[1]!.charAt(0).toUpperCase() + parts[1]!.slice(1);
-      return `${channel} ${parts.slice(2).join(":")}`;
-    }
-  }
-  return userId;
-}

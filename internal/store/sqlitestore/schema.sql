@@ -116,6 +116,18 @@ CREATE TABLE IF NOT EXISTS agents (
     compaction_config     TEXT,
     context_pruning       TEXT,
     other_config          TEXT NOT NULL DEFAULT '{}',
+    emoji                 TEXT NOT NULL DEFAULT '',
+    agent_description     TEXT NOT NULL DEFAULT '',
+    thinking_level        TEXT NOT NULL DEFAULT '',
+    max_tokens            INT NOT NULL DEFAULT 0,
+    self_evolve           BOOLEAN NOT NULL DEFAULT 0,
+    skill_evolve          BOOLEAN NOT NULL DEFAULT 0,
+    skill_nudge_interval  INT NOT NULL DEFAULT 0,
+    reasoning_config      TEXT NOT NULL DEFAULT '{}',
+    workspace_sharing     TEXT NOT NULL DEFAULT '{}',
+    chatgpt_oauth_routing TEXT NOT NULL DEFAULT '{}',
+    shell_deny_groups     TEXT NOT NULL DEFAULT '{}',
+    kg_dedup_config       TEXT NOT NULL DEFAULT '{}',
     is_default            BOOLEAN NOT NULL DEFAULT 0,
     agent_type            VARCHAR(20) NOT NULL DEFAULT 'open',
     status                VARCHAR(20) DEFAULT 'active',
@@ -293,6 +305,7 @@ CREATE TABLE IF NOT EXISTS memory_documents (
     content    TEXT NOT NULL DEFAULT '',
     hash       VARCHAR(64) NOT NULL,
     team_id    TEXT REFERENCES agent_teams(id) ON DELETE SET NULL,
+    custom_scope TEXT,
     tenant_id  TEXT NOT NULL REFERENCES tenants(id),
     created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
@@ -319,6 +332,7 @@ CREATE TABLE IF NOT EXISTS memory_chunks (
     hash        VARCHAR(64) NOT NULL,
     text        TEXT NOT NULL,
     team_id     TEXT REFERENCES agent_teams(id) ON DELETE SET NULL,
+    custom_scope TEXT,
     tenant_id   TEXT NOT NULL REFERENCES tenants(id),
     created_at  TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at  TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
@@ -468,6 +482,7 @@ CREATE INDEX IF NOT EXISTS idx_cron_jobs_user_id ON cron_jobs(user_id);
 CREATE INDEX IF NOT EXISTS idx_cron_jobs_agent_user ON cron_jobs(agent_id, user_id);
 CREATE INDEX IF NOT EXISTS idx_cron_jobs_team ON cron_jobs(team_id) WHERE team_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_cron_jobs_tenant ON cron_jobs(tenant_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_cron_jobs_agent_tenant_name ON cron_jobs(agent_id, tenant_id, name);
 
 -- ============================================================
 -- Table: cron_run_logs
@@ -854,6 +869,7 @@ CREATE TABLE IF NOT EXISTS team_tasks (
     confidence_score     REAL,
     comment_count        INT NOT NULL DEFAULT 0,
     attachment_count     INT NOT NULL DEFAULT 0,
+    custom_scope         TEXT,
     tenant_id            TEXT NOT NULL REFERENCES tenants(id),
     created_at           TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at           TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
@@ -885,6 +901,7 @@ CREATE TABLE IF NOT EXISTS team_task_comments (
     metadata         TEXT DEFAULT '{}',
     comment_type     VARCHAR(20) NOT NULL DEFAULT 'note',
     confidence_score REAL,
+    custom_scope     TEXT,
     tenant_id        TEXT NOT NULL REFERENCES tenants(id),
     created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
@@ -903,6 +920,7 @@ CREATE TABLE IF NOT EXISTS team_task_events (
     actor_type VARCHAR(10) NOT NULL,
     actor_id   VARCHAR(255) NOT NULL,
     data       TEXT,
+    custom_scope TEXT,
     tenant_id  TEXT NOT NULL REFERENCES tenants(id),
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
@@ -921,11 +939,13 @@ CREATE TABLE IF NOT EXISTS team_task_attachments (
     team_id              TEXT NOT NULL REFERENCES agent_teams(id) ON DELETE CASCADE,
     chat_id              VARCHAR(255) NOT NULL DEFAULT '',
     path                 TEXT NOT NULL,
+    base_name            TEXT NOT NULL DEFAULT '',  -- app-populated lowercased basename; PG equivalent is GENERATED
     file_size            BIGINT NOT NULL DEFAULT 0,
     mime_type            VARCHAR(100) DEFAULT '',
     created_by_agent_id  TEXT REFERENCES agents(id),
     created_by_sender_id VARCHAR(255) DEFAULT '',
     metadata             TEXT NOT NULL DEFAULT '{}',
+    custom_scope         TEXT,
     tenant_id            TEXT NOT NULL REFERENCES tenants(id),
     created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     UNIQUE(task_id, path)
@@ -934,6 +954,7 @@ CREATE TABLE IF NOT EXISTS team_task_attachments (
 CREATE INDEX IF NOT EXISTS idx_tta_task ON team_task_attachments(task_id);
 CREATE INDEX IF NOT EXISTS idx_tta_team ON team_task_attachments(team_id);
 CREATE INDEX IF NOT EXISTS idx_team_task_attachments_tenant ON team_task_attachments(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_tta_tenant_basename ON team_task_attachments(tenant_id, base_name);
 
 -- ============================================================
 -- Table: team_user_grants
@@ -974,11 +995,14 @@ CREATE TABLE IF NOT EXISTS kg_entities (
     tenant_id   TEXT NOT NULL REFERENCES tenants(id),
     created_at  TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at  TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    valid_from  TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    valid_until TEXT,
     UNIQUE(agent_id, user_id, external_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_kg_entities_scope ON kg_entities(agent_id, user_id);
 CREATE INDEX IF NOT EXISTS idx_kg_entities_type ON kg_entities(agent_id, user_id, entity_type);
+CREATE INDEX IF NOT EXISTS idx_kg_entities_current ON kg_entities(agent_id, user_id) WHERE valid_until IS NULL;
 CREATE INDEX IF NOT EXISTS idx_kg_entities_team ON kg_entities(team_id) WHERE team_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_kg_entities_tenant ON kg_entities(tenant_id);
 
@@ -998,11 +1022,14 @@ CREATE TABLE IF NOT EXISTS kg_relations (
     team_id          TEXT REFERENCES agent_teams(id) ON DELETE SET NULL,
     tenant_id        TEXT NOT NULL REFERENCES tenants(id),
     created_at       TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    valid_from  TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    valid_until TEXT,
     UNIQUE(agent_id, user_id, source_entity_id, relation_type, target_entity_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_kg_relations_source ON kg_relations(source_entity_id, relation_type);
 CREATE INDEX IF NOT EXISTS idx_kg_relations_target ON kg_relations(target_entity_id);
+CREATE INDEX IF NOT EXISTS idx_kg_relations_current ON kg_relations(agent_id, user_id) WHERE valid_until IS NULL;
 CREATE INDEX IF NOT EXISTS idx_kg_relations_team ON kg_relations(team_id) WHERE team_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_kg_relations_tenant ON kg_relations(tenant_id);
 
@@ -1042,6 +1069,8 @@ CREATE TABLE IF NOT EXISTS channel_contacts (
     avatar_url       TEXT,
     peer_kind        VARCHAR(20),
     contact_type     VARCHAR(20) NOT NULL DEFAULT 'user',
+    thread_id        VARCHAR(100),
+    thread_type      VARCHAR(20),
     metadata         TEXT DEFAULT '{}',
     merged_id        TEXT,
     tenant_id        TEXT NOT NULL REFERENCES tenants(id),
@@ -1049,8 +1078,8 @@ CREATE TABLE IF NOT EXISTS channel_contacts (
     last_seen_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
--- tenant-scoped unique (migration 27 Phase I)
-CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_contacts_tenant_type_sender ON channel_contacts(tenant_id, channel_type, sender_id);
+-- tenant-scoped unique including thread_id for topic contacts (migration 35)
+CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_contacts_tenant_type_sender ON channel_contacts(tenant_id, channel_type, sender_id, COALESCE(thread_id, ''));
 CREATE INDEX IF NOT EXISTS idx_channel_contacts_instance ON channel_contacts(channel_instance) WHERE channel_instance IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_channel_contacts_merged ON channel_contacts(merged_id) WHERE merged_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_channel_contacts_search ON channel_contacts(display_name, username);
@@ -1173,7 +1202,7 @@ CREATE TABLE IF NOT EXISTS secure_cli_binaries (
     deny_verbose    TEXT NOT NULL DEFAULT '[]',
     timeout_seconds INTEGER NOT NULL DEFAULT 30,
     tips            TEXT NOT NULL DEFAULT '',
-    agent_id        TEXT REFERENCES agents(id) ON DELETE CASCADE,
+    is_global       BOOLEAN NOT NULL DEFAULT 1,
     enabled         BOOLEAN NOT NULL DEFAULT 1,
     created_by      TEXT NOT NULL DEFAULT '',
     tenant_id       TEXT NOT NULL REFERENCES tenants(id),
@@ -1182,10 +1211,31 @@ CREATE TABLE IF NOT EXISTS secure_cli_binaries (
 );
 
 CREATE INDEX IF NOT EXISTS idx_secure_cli_binary_name ON secure_cli_binaries(binary_name);
-CREATE INDEX IF NOT EXISTS idx_secure_cli_agent_id ON secure_cli_binaries(agent_id) WHERE agent_id IS NOT NULL;
--- COALESCE(agent_id, '') simulates the PG COALESCE(agent_id, null-sentinel) unique constraint
-CREATE UNIQUE INDEX IF NOT EXISTS idx_secure_cli_unique_binary_agent ON secure_cli_binaries(binary_name, COALESCE(agent_id, ''));
+CREATE UNIQUE INDEX IF NOT EXISTS idx_secure_cli_unique_binary_tenant ON secure_cli_binaries(binary_name, tenant_id);
 CREATE INDEX IF NOT EXISTS idx_secure_cli_binaries_tenant ON secure_cli_binaries(tenant_id);
+
+-- ============================================================
+-- Table: secure_cli_agent_grants
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS secure_cli_agent_grants (
+    id              TEXT NOT NULL PRIMARY KEY,
+    binary_id       TEXT NOT NULL REFERENCES secure_cli_binaries(id) ON DELETE CASCADE,
+    agent_id        TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    deny_args       TEXT,
+    deny_verbose    TEXT,
+    timeout_seconds INTEGER,
+    tips            TEXT,
+    enabled         BOOLEAN NOT NULL DEFAULT 1,
+    tenant_id       TEXT NOT NULL REFERENCES tenants(id),
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE(binary_id, agent_id, tenant_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_scag_binary ON secure_cli_agent_grants(binary_id);
+CREATE INDEX IF NOT EXISTS idx_scag_agent ON secure_cli_agent_grants(agent_id);
+CREATE INDEX IF NOT EXISTS idx_scag_tenant ON secure_cli_agent_grants(tenant_id);
 
 -- ============================================================
 -- Table: api_keys
@@ -1339,6 +1389,7 @@ CREATE TABLE IF NOT EXISTS subagent_tasks (
     completed_at      TEXT,
     archived_at       TEXT,
     metadata          TEXT NOT NULL DEFAULT '{}',
+    custom_scope      TEXT,
     created_at        TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at        TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
@@ -1346,3 +1397,174 @@ CREATE TABLE IF NOT EXISTS subagent_tasks (
 CREATE INDEX IF NOT EXISTS idx_subagent_tasks_parent_status ON subagent_tasks(tenant_id, parent_agent_key, status);
 CREATE INDEX IF NOT EXISTS idx_subagent_tasks_session ON subagent_tasks(session_key);
 CREATE INDEX IF NOT EXISTS idx_subagent_tasks_created ON subagent_tasks(tenant_id, created_at);
+
+-- ============================================================
+-- Table: episodic_summaries (V3 Tier 2 memory)
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS episodic_summaries (
+    id          TEXT NOT NULL PRIMARY KEY,
+    tenant_id   TEXT NOT NULL REFERENCES tenants(id),
+    agent_id    TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    user_id     VARCHAR(255) NOT NULL DEFAULT '',
+    session_key TEXT NOT NULL,
+    summary     TEXT NOT NULL,
+    l0_abstract TEXT NOT NULL DEFAULT '',
+    key_topics  TEXT NOT NULL DEFAULT '[]',
+    source_type TEXT NOT NULL DEFAULT 'session',
+    source_id   TEXT,
+    turn_count  INTEGER NOT NULL DEFAULT 0,
+    token_count INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    expires_at  TEXT,
+    promoted_at TEXT,
+    -- Phase 10: dreaming weighted scoring signals (running avg of memory_search
+    -- hit scores). See internal/consolidation/scoring.go::ComputeRecallScore.
+    recall_count     INTEGER NOT NULL DEFAULT 0,
+    recall_score     REAL    NOT NULL DEFAULT 0,
+    last_recalled_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_episodic_agent_user ON episodic_summaries(agent_id, user_id);
+CREATE INDEX IF NOT EXISTS idx_episodic_tenant ON episodic_summaries(tenant_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_episodic_source_dedup ON episodic_summaries(agent_id, user_id, source_id)
+    WHERE source_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_episodic_unpromoted ON episodic_summaries(agent_id, user_id, created_at)
+    WHERE promoted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_episodic_recall_unpromoted ON episodic_summaries(agent_id, user_id, recall_score DESC)
+    WHERE promoted_at IS NULL;
+
+-- ============================================================
+-- Table: agent_evolution_metrics (V3 self-evolution Stage 1)
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS agent_evolution_metrics (
+    id          TEXT NOT NULL PRIMARY KEY,
+    tenant_id   TEXT NOT NULL REFERENCES tenants(id),
+    agent_id    TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    session_key TEXT NOT NULL,
+    metric_type TEXT NOT NULL,
+    metric_key  TEXT NOT NULL,
+    value       TEXT NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_evo_metrics_agent_type ON agent_evolution_metrics(agent_id, metric_type);
+CREATE INDEX IF NOT EXISTS idx_evo_metrics_created ON agent_evolution_metrics(created_at);
+CREATE INDEX IF NOT EXISTS idx_evo_metrics_tenant ON agent_evolution_metrics(tenant_id);
+
+-- ============================================================
+-- Table: agent_evolution_suggestions (V3 self-evolution Stage 2)
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS agent_evolution_suggestions (
+    id              TEXT NOT NULL PRIMARY KEY,
+    tenant_id       TEXT NOT NULL REFERENCES tenants(id),
+    agent_id        TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    suggestion_type TEXT NOT NULL,
+    suggestion      TEXT NOT NULL,
+    rationale       TEXT NOT NULL,
+    parameters      TEXT,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    reviewed_by     TEXT,
+    reviewed_at     TEXT,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_evo_suggestions_agent ON agent_evolution_suggestions(agent_id, status);
+CREATE INDEX IF NOT EXISTS idx_evo_suggestions_tenant ON agent_evolution_suggestions(tenant_id);
+
+-- ============================================================
+-- Table: kg_dedup_candidates (V3 dedup review queue)
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS kg_dedup_candidates (
+    id          TEXT NOT NULL PRIMARY KEY,
+    tenant_id   TEXT REFERENCES tenants(id) ON DELETE CASCADE,
+    agent_id    TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    user_id     VARCHAR(255) NOT NULL DEFAULT '',
+    entity_a_id TEXT NOT NULL REFERENCES kg_entities(id) ON DELETE CASCADE,
+    entity_b_id TEXT NOT NULL REFERENCES kg_entities(id) ON DELETE CASCADE,
+    similarity  REAL NOT NULL,
+    status      VARCHAR(20) NOT NULL DEFAULT 'pending',
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE(entity_a_id, entity_b_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_kg_dedup_agent ON kg_dedup_candidates(agent_id, status);
+
+-- ============================================================
+-- Table: secure_cli_user_credentials (per-user encrypted env)
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS secure_cli_user_credentials (
+    id            TEXT NOT NULL PRIMARY KEY,
+    binary_id     TEXT NOT NULL REFERENCES secure_cli_binaries(id) ON DELETE CASCADE,
+    user_id       VARCHAR(255) NOT NULL,
+    encrypted_env BLOB NOT NULL,
+    metadata      TEXT NOT NULL DEFAULT '{}',
+    tenant_id     TEXT NOT NULL REFERENCES tenants(id),
+    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE(binary_id, user_id, tenant_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_scuc_tenant ON secure_cli_user_credentials(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_scuc_binary ON secure_cli_user_credentials(binary_id);
+
+-- ============================================================
+-- Table: vault_documents (V3 Knowledge Vault registry)
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS vault_documents (
+    id            TEXT NOT NULL PRIMARY KEY,
+    tenant_id     TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    agent_id      TEXT REFERENCES agents(id) ON DELETE SET NULL,
+    team_id       TEXT REFERENCES agent_teams(id) ON DELETE SET NULL,
+    scope         TEXT NOT NULL DEFAULT 'personal',
+    custom_scope  TEXT,
+    path          TEXT NOT NULL,
+    path_basename TEXT NOT NULL DEFAULT '',  -- app-populated lowercased basename; PG equivalent is GENERATED
+    title         TEXT NOT NULL DEFAULT '',
+    doc_type      TEXT NOT NULL DEFAULT 'note',
+    content_hash  TEXT NOT NULL DEFAULT '',
+    summary       TEXT NOT NULL DEFAULT '',
+    metadata      TEXT DEFAULT '{}',
+    created_at    TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at    TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+-- SQLite prohibits expressions in inline UNIQUE constraints; use a unique index instead.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vault_docs_unique_path
+    ON vault_documents(tenant_id, COALESCE(agent_id, ''), COALESCE(team_id, ''), scope, path);
+CREATE INDEX IF NOT EXISTS idx_vault_docs_tenant ON vault_documents(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_vault_docs_agent_scope ON vault_documents(agent_id, scope);
+CREATE INDEX IF NOT EXISTS idx_vault_docs_type ON vault_documents(agent_id, doc_type);
+CREATE INDEX IF NOT EXISTS idx_vault_docs_hash ON vault_documents(content_hash);
+CREATE INDEX IF NOT EXISTS idx_vault_docs_team ON vault_documents(team_id);
+CREATE INDEX IF NOT EXISTS idx_vault_docs_basename ON vault_documents(tenant_id, path_basename);
+CREATE INDEX IF NOT EXISTS idx_vault_docs_path_prefix ON vault_documents(tenant_id, path);
+CREATE INDEX IF NOT EXISTS idx_vault_docs_delegation
+    ON vault_documents(json_extract(metadata, '$.delegation_id'))
+    WHERE json_extract(metadata, '$.delegation_id') IS NOT NULL;
+
+-- ============================================================
+-- Table: vault_links (V3 wikilink edges)
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS vault_links (
+    id          TEXT NOT NULL PRIMARY KEY,
+    from_doc_id TEXT NOT NULL REFERENCES vault_documents(id) ON DELETE CASCADE,
+    to_doc_id   TEXT NOT NULL REFERENCES vault_documents(id) ON DELETE CASCADE,
+    link_type   TEXT NOT NULL DEFAULT 'wikilink',
+    context     TEXT NOT NULL DEFAULT '',
+    metadata    TEXT NOT NULL DEFAULT '{}',
+    custom_scope TEXT,
+    created_at  TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE(from_doc_id, to_doc_id, link_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vault_links_from ON vault_links(from_doc_id);
+CREATE INDEX IF NOT EXISTS idx_vault_links_to ON vault_links(to_doc_id);
+CREATE INDEX IF NOT EXISTS idx_vault_links_source
+    ON vault_links(json_extract(metadata, '$.source'))
+    WHERE json_extract(metadata, '$.source') IS NOT NULL;

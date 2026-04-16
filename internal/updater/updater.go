@@ -7,6 +7,7 @@ import (
 	"archive/zip"
 	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -16,6 +17,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/nextlevelbuilder/goclaw/internal/version"
 )
 
 const (
@@ -180,7 +183,7 @@ func applyMacOS(r io.Reader, tmpDir, appPath string) error {
 	tr := tar.NewReader(gz)
 	for {
 		hdr, err := tr.Next()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
@@ -336,36 +339,9 @@ func removeQuarantine(appPath string) {
 	}
 }
 
-// isNewer returns true if version a is newer than b (simple semver compare).
-// Pre-release suffixes (e.g. "0.2.0-rc1") are stripped — only major.minor.patch compared.
+// isNewer returns true if version a is newer than b.
 func isNewer(a, b string) bool {
-	pa := parseSemver(a)
-	pb := parseSemver(b)
-	for i := range 3 {
-		if pa[i] > pb[i] {
-			return true
-		}
-		if pa[i] < pb[i] {
-			return false
-		}
-	}
-	return false
-}
-
-func parseSemver(s string) [3]int {
-	s = strings.TrimPrefix(s, "v")
-	// Strip pre-release suffix: "0.2.0-rc1" → "0.2.0"
-	if idx := strings.IndexByte(s, '-'); idx >= 0 {
-		s = s[:idx]
-	}
-	var parts [3]int
-	for i, p := range strings.SplitN(s, ".", 3) {
-		if i >= 3 {
-			break
-		}
-		fmt.Sscanf(p, "%d", &parts[i])
-	}
-	return parts
+	return version.IsNewer(a, b)
 }
 
 // ResolveAppPath returns the path to the current .app bundle (macOS) or .exe (Windows)

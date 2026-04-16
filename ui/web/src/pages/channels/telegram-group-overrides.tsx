@@ -8,7 +8,7 @@ import { TelegramGroupFields, type TelegramGroupConfigValues } from "./telegram-
 import { TelegramTopicOverrides, type TelegramTopicConfigValues } from "./telegram-topic-overrides";
 import type { GroupManagerGroupInfo } from "./hooks/use-channel-detail";
 
-interface GroupConfigWithTopics extends TelegramGroupConfigValues {
+export interface GroupConfigWithTopics extends TelegramGroupConfigValues {
   topics?: Record<string, TelegramTopicConfigValues>;
 }
 
@@ -129,7 +129,7 @@ export function TelegramGroupOverrides({ groups, onChange, knownGroups }: Props)
                 >
                   <Plus className="h-3 w-3" />
                   <span className="font-mono">{rawId}</span>
-                  <Badge variant="secondary" className="text-[10px] px-1 py-0">
+                  <Badge variant="secondary" className="text-2xs px-1 py-0">
                     {g.writer_count}
                   </Badge>
                 </button>

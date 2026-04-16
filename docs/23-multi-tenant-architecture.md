@@ -304,7 +304,7 @@ Tenants can customize their environment without affecting other tenants:
 | Feature | Scope | How |
 |---------|-------|-----|
 | **LLM Providers** | Per-tenant provider configs | Each tenant registers own API keys + models |
-| **Builtin Tools** | Enable/disable per tenant | `builtin_tool_tenant_configs` table |
+| **Builtin Tools** | Enable/disable + settings override per tenant | `builtin_tool_tenant_configs` (`enabled` + `settings` JSONB). 4-tier overlay (per-agent > tenant > global > hardcoded) resolved at Execute time — see `docs/03-tools-system.md` § 14 |
 | **Skills** | Enable/disable per tenant | `skill_tenant_configs` table |
 | **MCP Servers** | Per-tenant + per-user credentials | Server-level shared, user-level overrides |
 | **MCP Require User Credentials** | Per-server setting | `settings.require_user_credentials` — forces per-user API keys |
@@ -327,6 +327,7 @@ When `require_user_credentials` is enabled, users without personal credentials c
 | Missing tenant context | Fail-closed: returns error, never unfiltered data |
 | API key storage | Keys hashed with SHA-256 at rest; only prefix shown in UI |
 | Tenant impersonation | Tenant resolved from API key binding, not client headers |
+| Cross-tenant privilege escalation on global writes | `store.IsMasterScope(ctx)` + `http.requireMasterScope(w, r)` guard every admin-gated write to global tables (`builtin_tools`, package management, config.*). Symmetric `requireTenantAdmin` guards tenant-scoped writes. Predicate shared between HTTP + WS layers. See commits `b419f352` (Phase 1 WS) + `6d7473b5` (Phase 0b HTTP) |
 | Privilege escalation | Role derived from key scopes, not client claims |
 | Gateway token abuse | Only configured owner IDs get cross-tenant; others are tenant-scoped |
 | System config access | Config page restricted to cross-tenant owners only |
@@ -373,6 +374,20 @@ erDiagram
 ```
 
 40+ tables carry `tenant_id` with NOT NULL constraint. Exception: `api_keys.tenant_id` is nullable — NULL means system-level cross-tenant key.
+
+### v3 Tenant-Scoped Stores
+
+New v3 stores (`evolution`, `vault`, `episodic`, `agent_links`) all enforce tenant isolation:
+
+| Store | Purpose | Tenant Scoping |
+|-------|---------|----------------|
+| `EvolutionMetrics` | Track agent improvement suggestions | `WHERE tenant_id = $N` |
+| `EvolutionSuggestions` | Store LLM-generated optimizations | `WHERE tenant_id = $N` |
+| `Vault` | Persistent data storage for agents | `WHERE tenant_id = $N` |
+| `Episodic` | Episodic memory for agents | `WHERE tenant_id = $N` |
+| `AgentLink` | Delegation links between agents | `WHERE tenant_id = $N` |
+
+All v3 stores follow the same tenant isolation pattern — all queries include `WHERE tenant_id = $N` at the SQL level.
 
 **Master tenant** (UUID `0193a5b0-7000-7000-8000-000000000001`): All legacy/default data. Single-tenant deployments use this exclusively.
 

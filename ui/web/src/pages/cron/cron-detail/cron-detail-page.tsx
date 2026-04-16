@@ -6,7 +6,6 @@ import type { CronJob, CronJobPatch, CronRunLogEntry } from "../hooks/use-cron";
 import { CronHeader } from "./cron-header";
 import { CronOverviewTab } from "./cron-overview-tab";
 import { CronRunHistoryTab } from "./cron-run-history-tab";
-import { CronAdvancedDialog } from "./cron-advanced-dialog";
 
 interface CronDetailPageProps {
   job: CronJob;
@@ -31,7 +30,6 @@ export function CronDetailPage({
 }: CronDetailPageProps) {
   const { t } = useTranslation("cron");
   const [activeTab, setActiveTab] = useState("overview");
-  const [advancedOpen, setAdvancedOpen] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [confirmToggle, setConfirmToggle] = useState(false);
   const [running, setRunning] = useState(false);
@@ -64,7 +62,6 @@ export function CronDetailPage({
         isRunning={isRunning}
         onBack={onBack}
         onRun={handleRun}
-        onAdvanced={() => setAdvancedOpen(true)}
         onToggle={() => setConfirmToggle(true)}
         onDelete={() => setConfirmDelete(true)}
       />
@@ -87,14 +84,6 @@ export function CronDetailPage({
           </Tabs>
         </div>
       </div>
-
-      <CronAdvancedDialog
-        key={job.id}
-        open={advancedOpen}
-        onOpenChange={setAdvancedOpen}
-        job={job}
-        onUpdate={onUpdate}
-      />
 
       <ConfirmDialog
         open={confirmDelete}

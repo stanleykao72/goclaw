@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/nextlevelbuilder/goclaw/internal/bootstrap"
@@ -29,7 +30,8 @@ type ReadFileTool struct {
 	sandboxMgr       sandbox.Manager         // nil = direct host access
 	contextFileIntc  *ContextFileInterceptor // nil = no virtual FS routing
 	memIntc          *MemoryInterceptor      // nil = no memory routing
-	permStore store.ConfigPermissionStore // nil = no group read restriction
+	permStore        store.ConfigPermissionStore // nil = no group read restriction
+	vaultIntc        *VaultInterceptor           // nil = no vault lazy sync
 }
 
 // SetContextFileInterceptor enables virtual FS routing for context files.
@@ -45,6 +47,11 @@ func (t *ReadFileTool) SetMemoryInterceptor(intc *MemoryInterceptor) {
 // SetConfigPermStore enables group read restriction for SOUL.md/AGENTS.md.
 func (t *ReadFileTool) SetConfigPermStore(s store.ConfigPermissionStore) {
 	t.permStore = s
+}
+
+// SetVaultInterceptor enables lazy vault hash sync on file reads.
+func (t *ReadFileTool) SetVaultInterceptor(v *VaultInterceptor) {
+	t.vaultIntc = v
 }
 
 func NewReadFileTool(workspace string, restrict bool) *ReadFileTool {
@@ -139,7 +146,7 @@ func (t *ReadFileTool) Execute(ctx context.Context, args map[string]any) *Result
 			if content == "" {
 				return SilentResult(fmt.Sprintf("(memory file %s does not exist yet — it will be created when memory is saved)", path))
 			}
-			return SilentResult(content)
+			return SilentResult(content + "\n\n[Source: database, not filesystem]")
 		}
 	}
 
@@ -167,6 +174,11 @@ func (t *ReadFileTool) Execute(ctx context.Context, args map[string]any) *Result
 	if isBinaryFileExt(resolved) {
 		ext := strings.ToLower(filepath.Ext(resolved))
 		return ErrorResult(fmt.Sprintf("cannot read binary file (%s). Use the appropriate tool: read_image for images, read_document for documents, read_audio for audio, read_video for video.", ext))
+	}
+
+	// Vault lazy sync: update hash if file was modified outside the agent.
+	if t.vaultIntc != nil {
+		go t.vaultIntc.BeforeRead(context.WithoutCancel(ctx), resolved)
 	}
 
 	data, err := os.ReadFile(resolved)
@@ -292,16 +304,29 @@ func (t *ReadFileTool) paginateOutput(content string, args map[string]any) *Resu
 	return SilentResult(output)
 }
 
-// allowedWithTeamWorkspace returns the allowed prefixes with team workspace appended
-// if present in context. Thread-safe: creates a new slice per request.
+// allowedWithTeamWorkspace returns the allowed prefixes with team workspace and
+// tenant-specific paths appended if present in context. Thread-safe: creates a
+// new slice per request. Merge order: base (global) → tenant paths → team workspace.
 func allowedWithTeamWorkspace(ctx context.Context, base []string) []string {
+	tenantPaths := TenantAllowedPathsFromCtx(ctx)
 	teamWs := ToolTeamWorkspaceFromCtx(ctx)
-	if teamWs == "" {
+
+	if len(tenantPaths) == 0 && teamWs == "" {
 		return base
 	}
-	out := make([]string, len(base)+1)
-	copy(out, base)
-	out[len(base)] = teamWs
+
+	// Pre-allocate capacity for all sources
+	capacity := len(base) + len(tenantPaths)
+	if teamWs != "" {
+		capacity++
+	}
+
+	out := make([]string, 0, capacity)
+	out = append(out, base...)
+	out = append(out, tenantPaths...)
+	if teamWs != "" {
+		out = append(out, teamWs)
+	}
 	return out
 }
 
@@ -477,7 +502,13 @@ func resolvePath(path, workspace string, restrict bool) (string, error) {
 }
 
 // isPathInside checks whether child is inside or equal to parent directory.
+// On Windows, comparison is case-insensitive since NTFS paths are case-insensitive.
 func isPathInside(child, parent string) bool {
+	// Windows paths are case-insensitive; normalize to lowercase for comparison.
+	if runtime.GOOS == "windows" {
+		child = strings.ToLower(child)
+		parent = strings.ToLower(parent)
+	}
 	if child == parent {
 		return true
 	}

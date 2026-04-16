@@ -3,6 +3,7 @@ package skills
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -87,5 +88,52 @@ TEMPLATE = """
 	}
 	if pyImports["lodash"] {
 		t.Error("FALSE POSITIVE: lodash detected as Python import")
+	}
+}
+
+func TestScanScriptsDir_FiltersStdlib(t *testing.T) {
+	scriptsDir := filepath.Join(t.TempDir(), "scripts")
+	if err := os.MkdirAll(scriptsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Script imports stdlib modules + one real pip dep
+	content := `import sys
+import os
+import json
+import argparse
+import subprocess
+from pathlib import Path
+from datetime import datetime
+
+import requests
+from PIL import Image
+`
+	if err := os.WriteFile(filepath.Join(scriptsDir, "main.py"), []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m := scanScriptsDir(scriptsDir)
+
+	// Only real pip deps should appear in RequiresPython — NOT stdlib.
+	for _, pkg := range m.RequiresPython {
+		if pythonStdlib[pkg] {
+			t.Errorf("stdlib module %q should have been filtered from RequiresPython", pkg)
+		}
+	}
+
+	// Real deps must be present.
+	if !slices.Contains(m.RequiresPython, "requests") {
+		t.Error("expected 'requests' in RequiresPython")
+	}
+	if !slices.Contains(m.RequiresPython, "PIL") {
+		t.Error("expected 'PIL' in RequiresPython")
+	}
+
+	// Stdlib must NOT be present.
+	for _, stdlib := range []string{"sys", "os", "json", "argparse", "subprocess", "pathlib", "datetime"} {
+		if slices.Contains(m.RequiresPython, stdlib) {
+			t.Errorf("stdlib %q should NOT be in RequiresPython", stdlib)
+		}
 	}
 }

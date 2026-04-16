@@ -1,4 +1,4 @@
-import { useState, useRef } from "react";
+import { useState, useRef, lazy, Suspense } from "react";
 import { useParams, useNavigate } from "react-router";
 import { Radio, Plus, RefreshCw } from "lucide-react";
 import { useTranslation } from "react-i18next";
@@ -11,7 +11,10 @@ import { Pagination } from "@/components/shared/pagination";
 import { ConfirmDeleteDialog } from "@/components/shared/confirm-delete-dialog";
 import { useChannels } from "./hooks/use-channels";
 import { useChannelInstances, type ChannelInstanceData, type ChannelInstanceInput } from "./hooks/use-channel-instances";
-import { ChannelInstanceFormDialog } from "./channel-instance-form-dialog";
+
+const ChannelInstanceFormDialog = lazy(() =>
+  import("./channel-instance-form-dialog").then((m) => ({ default: m.ChannelInstanceFormDialog }))
+);
 import { channelsWithAuth, reauthDialogs } from "./channel-wizard-registry";
 import { ChannelDetailPage } from "./channel-detail/channel-detail-page";
 import { ChannelListRow } from "./channel-list-row";
@@ -19,6 +22,10 @@ import { useAgents } from "@/pages/agents/hooks/use-agents";
 import { useMinLoading } from "@/hooks/use-min-loading";
 import { useDeferredLoading } from "@/hooks/use-deferred-loading";
 import { useDebouncedCallback } from "@/hooks/use-debounced-callback";
+import {
+  getChannelAttentionPriority,
+  getRenderableChannelStatus,
+} from "./channels-status-view";
 
 export function ChannelsPage() {
   const { t } = useTranslation("channels");
@@ -112,9 +119,16 @@ export function ChannelsPage() {
     return agent?.display_name || agent?.agent_key || agentId.slice(0, 8);
   };
 
-  const getStatus = (instanceName: string) => {
-    return channels[instanceName] ?? null;
-  };
+  const getStatus = (instance: ChannelInstanceData) =>
+    getRenderableChannelStatus(channels[instance.name] ?? null, instance);
+
+  const sortedInstances = [...instances].sort((a, b) => {
+    const priorityDiff =
+      getChannelAttentionPriority(getStatus(b), b.enabled) -
+      getChannelAttentionPriority(getStatus(a), a.enabled);
+    if (priorityDiff !== 0) return priorityDiff;
+    return (a.display_name || a.name).localeCompare(b.display_name || b.name);
+  });
 
   return (
     <div className="p-4 sm:p-6 pb-10">
@@ -154,11 +168,11 @@ export function ChannelsPage() {
         ) : (
           <>
             <div className="mt-4 flex flex-col gap-2">
-              {instances.map((inst) => (
+              {sortedInstances.map((inst) => (
                 <ChannelListRow
                   key={inst.id}
                   instance={inst}
-                  status={getStatus(inst.name)}
+                  status={getStatus(inst)}
                   agentName={getAgentName(inst.agent_id)}
                   onClick={() => navigate(`/channels/${inst.id}`)}
                   onAuth={channelsWithAuth.has(inst.channel_type) ? () => setQrTarget(inst) : undefined}
@@ -178,20 +192,22 @@ export function ChannelsPage() {
         )}
       </div>
 
-      <ChannelInstanceFormDialog
-        open={formOpen}
-        onOpenChange={(open) => {
-          setFormOpen(open);
-          if (!open) {
-            setEditInstance(null);
-            setTimeout(() => refresh(), 1500);
-          }
-        }}
-        instance={editInstance}
-        agents={agents}
-        onSubmit={editInstance ? handleEdit : handleCreate}
-        onUpdate={handleUpdate}
-      />
+      <Suspense fallback={null}>
+        <ChannelInstanceFormDialog
+          open={formOpen}
+          onOpenChange={(open) => {
+            setFormOpen(open);
+            if (!open) {
+              setEditInstance(null);
+              setTimeout(() => refresh(), 1500);
+            }
+          }}
+          instance={editInstance}
+          agents={agents}
+          onSubmit={editInstance ? handleEdit : handleCreate}
+          onUpdate={handleUpdate}
+        />
+      </Suspense>
 
       <ConfirmDeleteDialog
         open={!!deleteTarget}

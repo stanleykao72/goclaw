@@ -15,6 +15,14 @@
     "spans": "Spans",
     "time": "Time"
   },
+  "source": {
+    "direct": "Direct",
+    "group": "Group",
+    "cron": "Cron",
+    "team": "Team",
+    "ws": "Web",
+    "unknown": "Other"
+  },
   "unnamed": "Unnamed",
   "stopRun": "Stop run",
   "cached": "cached",

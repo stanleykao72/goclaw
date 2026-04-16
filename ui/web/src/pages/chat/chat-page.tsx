@@ -10,6 +10,7 @@ import { ChatThread } from "./chat-thread";
 import { ChatInput, type AttachedFile } from "@/components/chat/chat-input";
 import { ChatTopBar } from "@/components/chat/chat-top-bar";
 import { DropZone } from "@/components/chat/drop-zone";
+import { AgentPickerPrompt } from "@/components/chat/agent-picker-prompt";
 import { useChatSessions } from "./hooks/use-chat-sessions";
 import { useChatMessages } from "./hooks/use-chat-messages";
 import { useChatSend } from "./hooks/use-chat-send";
@@ -31,7 +32,10 @@ export function ChatPage() {
   const sessionKey = urlSessionKey ?? "";
 
   // Fallback agent ID used only when URL has no session key
-  const [agentIdFallback, setAgentIdFallback] = useState("default");
+  const [agentIdFallback, setAgentIdFallback] = useState("");
+
+  // Agent is confirmed when URL has a session (agentId parsed) or user explicitly picked one
+  const agentConfirmed = !!urlSessionKey || !!agentIdFallback;
 
   // Derive agentId from URL (source of truth), fallback to state when no session
   const agentId = useMemo(() => {
@@ -77,8 +81,8 @@ export function ChatPage() {
   const isOwn = !sessionKey || isOwnSession(sessionKey, userId);
 
   const handleMessageAdded = useCallback(
-    (msg: { role: "user" | "assistant" | "tool"; content: string; timestamp?: number }) => {
-      addLocalMessage(msg);
+    (msg: { role: "user" | "assistant" | "tool"; content: string; timestamp?: number }, key?: string) => {
+      addLocalMessage(msg, key);
     },
     [addLocalMessage],
   );
@@ -121,7 +125,7 @@ export function ChatPage() {
         navigate("/chat");
       }
     },
-    [navigate, sessionKey],
+    [navigate],
   );
 
   const handleSend = useCallback(
@@ -230,7 +234,16 @@ export function ChatPage() {
         )}
 
         <div className="shrink-0">
-          <ChatTopBar agentId={agentId} isRunning={isRunning} isBusy={isBusy} activity={activity} teamTasks={teamTasks} onToggleTaskPanel={() => setTaskPanelOpen((v) => !v)} taskPanelOpen={taskPanelOpen} />
+          <ChatTopBar
+            agentId={agentId}
+            isRunning={isRunning}
+            isBusy={isBusy}
+            activity={activity}
+            teamTasks={teamTasks}
+            onToggleTaskPanel={() => setTaskPanelOpen((v) => !v)}
+            taskPanelOpen={taskPanelOpen}
+            session={sessions.find((s) => s.key === sessionKey) ?? null}
+          />
         </div>
 
         {sendError && (
@@ -255,7 +268,14 @@ export function ChatPage() {
             onToggleTaskPanel={() => setTaskPanelOpen((v) => !v)}
           />
 
-          {isOwn ? (
+          {!isOwn ? (
+            <div className="mx-3 mb-3 flex items-center gap-2 rounded-xl border bg-muted/50 px-4 py-3 text-sm text-muted-foreground shadow-sm">
+              <Eye className="h-4 w-4" />
+              {t("readOnly")}
+            </div>
+          ) : !agentConfirmed ? (
+            <AgentPickerPrompt onSelect={handleAgentChange} />
+          ) : (
             <ChatInput
               onSend={handleSend}
               onAbort={handleAbort}
@@ -264,11 +284,6 @@ export function ChatPage() {
               files={files}
               onFilesChange={setFiles}
             />
-          ) : (
-            <div className="mx-3 mb-3 flex items-center gap-2 rounded-xl border bg-muted/50 px-4 py-3 text-sm text-muted-foreground shadow-sm">
-              <Eye className="h-4 w-4" />
-              {t("readOnly")}
-            </div>
           )}
         </DropZone>
       </div>

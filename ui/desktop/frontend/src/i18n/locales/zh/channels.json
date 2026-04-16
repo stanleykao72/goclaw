@@ -8,7 +8,11 @@
   "status": {
     "running": "运行中",
     "stopped": "已停止",
-    "disabled": "已禁用"
+    "disabled": "已禁用",
+    "degraded": "降级",
+    "starting": "启动中",
+    "registered": "已配置",
+    "failed": "失败"
   },
   "channelTypes": {
     "telegram": "Telegram",
@@ -38,6 +42,7 @@
   },
   "detail": {
     "back": "返回",
+    "lastChecked": "最近检查：{{value}}",
     "tabs": {
       "general": "常规",
       "credentials": "凭据",

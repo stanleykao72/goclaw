@@ -23,7 +23,7 @@ func (c *Channel) handleAppMention(ev *slackevents.AppMentionEvent) {
 
 	// If requireMention is false, message handler already processes all channel messages.
 	// Return BEFORE storing dedup key so we don't block the message handler.
-	if !c.requireMention {
+	if !c.RequireMention() {
 		return
 	}
 
@@ -39,8 +39,7 @@ func (c *Channel) handleAppMention(ev *slackevents.AppMentionEvent) {
 	channelID := ev.Channel
 	content := ev.Text
 
-	displayName := strings.ReplaceAll(c.resolveDisplayName(senderID), "|", "_")
-	compoundSenderID := fmt.Sprintf("%s|%s", senderID, displayName)
+	displayName := c.resolveDisplayName(senderID)
 
 	if !c.checkGroupPolicy(ctx, senderID, channelID) {
 		return
@@ -82,8 +81,8 @@ func (c *Channel) handleAppMention(ev *slackevents.AppMentionEvent) {
 
 	annotated := fmt.Sprintf("[From: %s]\n%s", displayName, content)
 	finalContent := annotated
-	if c.historyLimit > 0 {
-		finalContent = c.groupHistory.BuildContext(localKey, annotated, c.historyLimit)
+	if c.HistoryLimit() > 0 {
+		finalContent = c.GroupHistory().BuildContext(localKey, annotated, c.HistoryLimit())
 	}
 
 	metadata := map[string]string{
@@ -99,7 +98,7 @@ func (c *Channel) handleAppMention(ev *slackevents.AppMentionEvent) {
 		metadata["message_thread_id"] = replyThreadTS
 	}
 
-	c.HandleMessage(compoundSenderID, channelID, finalContent, nil, metadata, "group")
+	c.HandleMessage(senderID, channelID, finalContent, nil, metadata, "group")
 
 	// Record thread participation
 	if replyThreadTS != "" {
@@ -107,7 +106,7 @@ func (c *Channel) handleAppMention(ev *slackevents.AppMentionEvent) {
 		c.threadParticip.Store(participKey, time.Now())
 	}
 
-	c.groupHistory.Clear(localKey)
+	c.GroupHistory().Clear(localKey)
 }
 
 // isBotMentioned checks if the message text contains <@botUserID>.
@@ -123,34 +122,14 @@ func (c *Channel) stripBotMention(text string) string {
 // --- Policy checks ---
 
 func (c *Channel) checkDMPolicy(ctx context.Context, senderID, channelID string) bool {
-	dmPolicy := c.config.DMPolicy
-	if dmPolicy == "" {
-		dmPolicy = "pairing"
-	}
-
-	switch dmPolicy {
-	case "disabled":
-		return false
-	case "open":
+	result := c.CheckDMPolicy(ctx, senderID, c.config.DMPolicy)
+	switch result {
+	case channels.PolicyAllow:
 		return true
-	case "allowlist":
-		return c.HasAllowList() && c.IsAllowed(senderID)
-	default: // "pairing"
-		if c.pairingService != nil {
-			paired, err := c.pairingService.IsPaired(ctx, senderID, c.Name())
-			if err != nil {
-				slog.Warn("security.pairing_check_failed, assuming paired (fail-open)",
-					"sender_id", senderID, "channel", c.Name(), "error", err)
-				return true
-			}
-			if paired {
-				return true
-			}
-		}
-		if c.HasAllowList() && c.IsAllowed(senderID) {
-			return true
-		}
+	case channels.PolicyNeedsPairing:
 		c.sendPairingReply(ctx, senderID, channelID)
+		return false
+	default:
 		return false
 	}
 }
@@ -161,54 +140,38 @@ func (c *Channel) checkGroupPolicy(ctx context.Context, senderID, channelID stri
 		groupPolicy = "open"
 	}
 
-	switch groupPolicy {
-	case "disabled":
-		return false
-	case "allowlist":
+	// Slack "allowlist" checks both sender and channel ID.
+	if groupPolicy == "allowlist" {
 		if !c.HasAllowList() {
 			return false
 		}
-		// Allow if user ID or channel ID is in the allowlist
 		return c.IsAllowed(senderID) || c.IsAllowed(channelID)
-	case "pairing":
-		if c.HasAllowList() && c.IsAllowed(senderID) {
-			return true
-		}
-		if _, cached := c.approvedGroups.Load(channelID); cached {
-			return true
-		}
+	}
+
+	result := c.CheckGroupPolicy(ctx, senderID, channelID, groupPolicy)
+	switch result {
+	case channels.PolicyAllow:
+		return true
+	case channels.PolicyNeedsPairing:
 		groupSenderID := fmt.Sprintf("group:%s", channelID)
-		if c.pairingService != nil {
-			paired, err := c.pairingService.IsPaired(ctx, groupSenderID, c.Name())
-			if err != nil {
-				slog.Warn("security.pairing_check_failed, assuming paired (fail-open)",
-					"group_sender", groupSenderID, "channel", c.Name(), "error", err)
-				paired = true
-			}
-			if paired {
-				c.approvedGroups.Store(channelID, true)
-				return true
-			}
-		}
 		c.sendPairingReply(ctx, groupSenderID, channelID)
 		return false
-	default: // "open"
-		return true
+	default:
+		return false
 	}
 }
 
 func (c *Channel) sendPairingReply(ctx context.Context, senderID, channelID string) {
-	if c.pairingService == nil {
+	ps := c.PairingService()
+	if ps == nil {
 		return
 	}
 
-	if lastSent, ok := c.pairingDebounce.Load(senderID); ok {
-		if time.Since(lastSent.(time.Time)) < pairingDebounceTime {
-			return
-		}
+	if !c.CanSendPairingNotif(senderID, pairingDebounceTime) {
+		return
 	}
 
-	code, err := c.pairingService.RequestPairing(ctx, senderID, c.Name(), channelID, "default", nil)
+	code, err := ps.RequestPairing(ctx, senderID, c.Name(), channelID, "default", nil)
 	if err != nil {
 		slog.Warn("slack: failed to request pairing code", "error", err)
 		return
@@ -229,5 +192,5 @@ func (c *Channel) sendPairingReply(ctx context.Context, senderID, channelID stri
 		slog.Warn("slack: failed to send pairing reply",
 			"channel_id", channelID, "error", err)
 	}
-	c.pairingDebounce.Store(senderID, time.Now())
+	c.MarkPairingNotifSent(senderID)
 }

@@ -2,6 +2,8 @@ package tools
 
 import (
 	"context"
+	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -469,6 +471,63 @@ func TestSelfSendGuard(t *testing.T) {
 			t.Fatal("expected embedded MEDIA self-send to be blocked when file already delivered")
 		}
 	})
+}
+
+func TestMessageToolNumericTargetUsesSendPath(t *testing.T) {
+	// JSON tool args use float64 for integers; target must not be ignored (was only .(string)).
+	var gotChat string
+	tool := NewMessageTool("", true)
+	tool.SetChannelSender(func(_ context.Context, ch, chatID, content string) error {
+		if ch != "telegram" {
+			t.Errorf("channel = %q", ch)
+		}
+		gotChat = chatID
+		return nil
+	})
+	ctx := context.Background()
+	r := tool.Execute(ctx, map[string]any{
+		"action":  "send",
+		"channel": "telegram",
+		"target":  float64(-1001847298537),
+		"message": "hello",
+	})
+	if r.IsError {
+		t.Fatalf("unexpected error: %s", r.ForLLM)
+	}
+	if gotChat != "-1001847298537" {
+		t.Errorf("sender saw chatID %q, want -1001847298537", gotChat)
+	}
+}
+
+func TestArgString(t *testing.T) {
+	tests := []struct {
+		name string
+		args map[string]any
+		key  string
+		want string
+	}{
+		{"string value", map[string]any{"k": "hello"}, "k", "hello"},
+		{"string with spaces", map[string]any{"k": "  hi  "}, "k", "hi"},
+		{"empty string", map[string]any{"k": ""}, "k", ""},
+		{"missing key", map[string]any{}, "k", ""},
+		{"nil value", map[string]any{"k": nil}, "k", ""},
+		{"float64 integer", map[string]any{"k": float64(-1001847298537)}, "k", "-1001847298537"},
+		{"float64 positive", map[string]any{"k": float64(42)}, "k", "42"},
+		{"float64 zero", map[string]any{"k": float64(0)}, "k", "0"},
+		{"float64 NaN", map[string]any{"k": math.NaN()}, "k", ""},
+		{"int", map[string]any{"k": 123}, "k", "123"},
+		{"int64", map[string]any{"k": int64(-999)}, "k", "-999"},
+		{"json.Number", map[string]any{"k": json.Number("7654321")}, "k", "7654321"},
+		{"bool fallback", map[string]any{"k": true}, "k", "true"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := argString(tt.args, tt.key)
+			if got != tt.want {
+				t.Errorf("argString(%v, %q) = %q, want %q", tt.args, tt.key, got, tt.want)
+			}
+		})
+	}
 }
 
 func TestDeliveredMedia(t *testing.T) {

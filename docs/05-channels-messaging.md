@@ -88,9 +88,9 @@ Every channel must implement the base interface:
 | Interface | Purpose | Implemented By |
 |-----------|---------|----------------|
 | `StreamingChannel` | Real-time streaming updates | Telegram, Slack |
-| `WebhookChannel` | Webhook HTTP handler mounting | Feishu |
+| `WebhookChannel` | Webhook HTTP handler mounting | Facebook, Feishu/Lark, Pancake |
 | `ReactionChannel` | Status reactions on messages | Telegram, Slack, Feishu |
-| `BlockReplyChannel` | Override gateway block_reply setting | Slack |
+| `BlockReplyChannel` | Override gateway block_reply setting | Discord, Feishu/Lark, Pancake, Slack, Zalo OA, Zalo Personal |
 
 `BaseChannel` provides a shared implementation that all channels embed: allowlist matching, `HandleMessage()`, `CheckPolicy()`, and user ID extraction.
 
@@ -156,13 +156,13 @@ flowchart TD
 
 | Feature | Telegram | Feishu/Lark | Discord | Slack | WhatsApp | Zalo OA | Zalo Personal |
 |---------|----------|-------------|---------|-------|----------|---------|---------------|
-| Connection | Long polling | WS (default) / Webhook | Gateway events | Socket Mode | External WS bridge | Long polling | Internal protocol |
+| Connection | Long polling | WS (default) / Webhook | Gateway events | Socket Mode | Direct protocol (in-process) | Long polling | Internal protocol |
 | DM support | Yes | Yes | Yes | Yes | Yes | Yes (DM only) | Yes |
 | Group support | Yes (mention gating) | Yes | Yes | Yes (mention gating + thread cache) | Yes | No | Yes |
 | Forum/Topics | Yes (per-topic config) | Yes (topic session mode) | -- | -- | -- | -- | -- |
-| Message limit | 4,096 chars | Configurable (default 4,000) | 2,000 chars | 4,000 chars | N/A (bridge) | 2,000 chars | 2,000 chars |
+| Message limit | 4,096 chars | Configurable (default 4,000) | 2,000 chars | 4,000 chars | WhatsApp native limit | 2,000 chars | 2,000 chars |
 | Streaming | Typing indicator | Streaming message cards | Edit "Thinking..." | Edit "Thinking..." (throttled 1s) | No | No | No |
-| Media | Photos, voice, files | Images, files (30 MB) | Files, embeds | Files (download w/ SSRF protection) | JSON messages | Images (5 MB) | -- |
+| Media | Photos, voice, files | Images, files (30 MB) | Files, embeds | Files (download w/ SSRF protection) | Images, audio, video, documents | Images (5 MB) | -- |
 | Speech-to-text | Yes (STT proxy) | -- | -- | -- | -- | -- | -- |
 | Voice routing | Yes (VoiceAgentID) | -- | -- | -- | -- | -- | -- |
 | Rich formatting | Markdown → HTML | Card messages | Markdown | Markdown → mrkdwn | Plain text | Plain text | Plain text |
@@ -367,6 +367,59 @@ When enabled, each thread gets an isolated session:
 - Different threads within the same group maintain separate conversation histories
 - Disabled by default
 
+### Thread Reply Routing
+
+When a message is sent inside a Lark thread (detected via the `thread_id` field in the inbound event), the inbound handler stamps `metadata["feishu_reply_target_id"]` with the triggering message ID. During outbound delivery, the channel routes responses back to the same thread using `LarkClient.ReplyMessage()` which POSTs to `/open-apis/im/v1/messages/{message_id}/reply` with `reply_in_thread: true`.
+
+- **Automatic thread detection**: No configuration needed; replies are routed based on inbound `thread_id`
+- **Metadata propagation**: The `feishu_reply_target_id` key is included in the `routingMetaKeys` allowlist so replies, block replies, and placeholder updates all land in the correct thread
+- **Graceful fallback**: If the reply endpoint fails (e.g., thread root deleted), the channel falls back to `SendMessage()` for the regular chat
+- **Applies to**: Text, card, image, and file messages
+
+### Document URL Auto-Fetch
+
+When a user pastes a Lark docx (document) URL in a message, the channel automatically fetches the document raw text and injects it into the agent prompt for context.
+
+**URL detection**: Regex pattern matches `https://*.larksuite.com/docx/<id>` and `*.feishu.cn/docx/<id>` URLs.
+
+**Auto-fetch behavior**:
+- Document content fetched via Lark API `GET /open-apis/docx/v1/documents/{id}/raw_content`
+- Content injected as `[Lark Doc: <url>] ... [End of Lark Doc]` markers around the raw text
+- Rune-safe truncation at 8000 runes per document to respect token budgets
+- Results cached per channel instance with LRU eviction (128 entries, 5-minute TTL)
+
+**Access control**: Requires bot app to have `docx:document:readonly` permission **and** document owner must explicitly grant the bot access to each document. If access is denied or document not found, a visible inline marker appears: `[Lark Doc X: access denied — grant the bot app read permission on this document]`
+
+**Safeguards**:
+- Limited to docx documents only (sheets, base, wiki deferred)
+- Maximum 10 document fetches per inbound message (spam protection)
+- Soft-fail on API errors (no outbound message blocks)
+
+**Configuration**: No new config flags. Supported document type and cache tunables (8000 rune limit, 10-URL cap, 5-min TTL, 128-entry cache) are hardcoded.
+
+### Writer Management Commands
+
+Group chats support file-write permission management via slash commands. Permissions are scoped to the group via `group:feishu:<chatID>`. DM users who attempt these commands receive a hint that they only work in groups.
+
+**Commands** (group-only):
+
+| Command | Description | Requires Target | Permission |
+|---------|-------------|:---:|:---:|
+| `/addwriter <@user or reply>` | Grant file_writer permission to target user | Yes | Writers only |
+| `/removewriter <@user or reply>` | Revoke file_writer permission from target user | Yes | Writers only |
+| `/writers` | List current group writers with displayName | No | -- |
+
+**Target specification**: Commands require explicit identification via reply-to or @mention. Bare `/addwriter` without a target is rejected — prevents accidental privilege capture.
+
+**Bootstrap behavior**: Groups with no writers allow the first writer to grant themselves via `/addwriter @self` (explicit self-mention). This enables initial configuration without external admin intervention.
+
+**Authorization**:
+- Only existing writers can manage the writer list (enforce via `IsGroupFileWriter` check)
+- Last-writer guard: If removing a writer would leave zero writers, operation is rejected with user-facing message
+- Database errors are fail-open; security issues are logged as `security.writer_check_failed`
+
+**Implementation**: Timeout of 10 seconds bounds Feishu API calls. Requires `AgentStore` and `ConfigPermissionStore` wired to the Feishu channel via constructor options.
+
 ---
 
 ## 7. Discord
@@ -430,15 +483,18 @@ Auto-enables when both bot_token and app_token are set.
 
 ## 9. WhatsApp
 
-The WhatsApp channel communicates through an external WebSocket bridge (e.g., whatsapp-web.js based). GoClaw does not implement the WhatsApp protocol directly.
+The WhatsApp channel connects directly to the WhatsApp network via the multi-device protocol. Authentication state is stored in the database (PostgreSQL standard, SQLite for desktop edition).
 
 ### Key Behaviors
 
-- **Bridge connection**: Connects to configurable `bridge_url` via WebSocket
-- **JSON format**: Messages sent/received as JSON objects
-- **Auto-reconnect**: Exponential backoff (1s → 30s max)
-- **DM and group support**: Group detection via `@g.us` suffix in chat ID
-- **Media handling**: Array of file paths from bridge protocol
+- **Direct connection**: In-process WhatsApp client (direct to WhatsApp servers, no external bridge)
+- **Database auth store**: Persists auth state, keys, and device info in the database
+- **QR code authentication**: Interactive QR code for initial pairing, served via WebSocket API
+- **Auto-reconnect**: Built-in reconnection with exponential backoff
+- **DM and group support**: Full group messaging with mention detection via JID format
+- **Media handling**: Direct media download/upload to WhatsApp servers with type detection
+- **Typing indicators**: Typing state managed per chat with auto-refresh
+- **Group mention gating**: Detects when bot is mentioned via LID (Local ID) and JID (standard format)
 
 ---
 
@@ -590,7 +646,10 @@ flowchart TD
 | `internal/channels/slack/format.go` | Markdown → Slack mrkdwn pipeline |
 | `internal/channels/slack/reactions.go` | Status emoji reactions on messages |
 | `internal/channels/slack/stream.go` | Streaming message updates via placeholder editing |
-| `internal/channels/whatsapp/whatsapp.go` | WhatsApp: external WS bridge |
+| `internal/channels/whatsapp/whatsapp.go` | WhatsApp: direct protocol client, QR auth, database persistence |
+| `internal/channels/whatsapp/factory.go` | Channel factory, database dialect detection |
+| `internal/channels/whatsapp/qr_methods.go` | QR code generation and authentication flow |
+| `internal/channels/whatsapp/format.go` | Message formatting (HTML-to-WhatsApp) |
 | `internal/channels/zalo/zalo.go` | Zalo OA: Bot API, long polling |
 | `internal/channels/zalo/personal/channel.go` | Zalo Personal: reverse-engineered protocol |
 | `internal/store/pg/pairing.go` | Pairing: code generation, approval, persistence (database-backed) |

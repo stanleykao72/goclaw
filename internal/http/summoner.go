@@ -33,6 +33,7 @@ var summoningFiles = []string{
 	bootstrap.SoulFile,
 	bootstrap.IdentityFile,
 	bootstrap.UserPredefinedFile,
+	bootstrap.CapabilitiesFile,
 }
 
 // fileTagRe parses <file name="SOUL.md">content</file> from LLM output.
@@ -73,7 +74,7 @@ func (s *AgentSummoner) SummonAgent(agentID uuid.UUID, tenantID uuid.UUID, provi
 	ctx, cancel := context.WithTimeout(store.WithTenantID(context.Background(), tenantID), 600*time.Second)
 	defer cancel()
 
-	s.ensureUserPredefined(ctx, agentID)
+	s.ensureBackfillFiles(ctx, agentID)
 	s.emitEvent(agentID, tenantID, SummonEventStarted, "", "")
 
 	// Check which files already exist (from a previous partial run)
@@ -104,7 +105,7 @@ func (s *AgentSummoner) SummonAgent(agentID uuid.UUID, tenantID uuid.UUID, provi
 	if !isRetryableError(err) {
 		slog.Warn("summoning: single-call failed (non-retryable)", "agent", agentID, "error", err)
 		s.emitEvent(agentID, tenantID, SummonEventFailed, "", err.Error())
-		s.setAgentStatus(context.Background(), agentID, store.AgentStatusSummonFailed)
+		s.setAgentStatus(context.Background(), tenantID, agentID, store.AgentStatusSummonFailed)
 		return
 	}
 
@@ -127,7 +128,7 @@ func (s *AgentSummoner) SummonAgent(agentID uuid.UUID, tenantID uuid.UUID, provi
 		if soulErr != nil {
 			slog.Warn("summoning: SOUL.md generation failed", "agent", agentID, "error", soulErr)
 			s.emitEvent(agentID, tenantID, SummonEventFailed, "", soulErr.Error())
-			s.setAgentStatus(context.Background(), agentID, store.AgentStatusSummonFailed)
+			s.setAgentStatus(context.Background(), tenantID, agentID, store.AgentStatusSummonFailed)
 			return
 		}
 		soulContent = soulFiles[bootstrap.SoulFile]
@@ -137,6 +138,14 @@ func (s *AgentSummoner) SummonAgent(agentID uuid.UUID, tenantID uuid.UUID, provi
 				slog.Warn("summoning: failed to store SOUL.md", "agent", agentID, "error", storeErr)
 			} else {
 				s.emitEvent(agentID, tenantID, SummonEventFileGenerated, bootstrap.SoulFile, "")
+			}
+		}
+		// CAPABILITIES.md is generated alongside SOUL.md in the first call
+		if capContent := soulFiles[bootstrap.CapabilitiesFile]; capContent != "" {
+			if storeErr := s.agents.SetAgentContextFile(ctx, agentID, bootstrap.CapabilitiesFile, capContent); storeErr != nil {
+				slog.Warn("summoning: failed to store CAPABILITIES.md", "agent", agentID, "error", storeErr)
+			} else {
+				s.emitEvent(agentID, tenantID, SummonEventFileGenerated, bootstrap.CapabilitiesFile, "")
 			}
 		}
 	}
@@ -155,7 +164,7 @@ func (s *AgentSummoner) SummonAgent(agentID uuid.UUID, tenantID uuid.UUID, provi
 		if idErr != nil {
 			slog.Warn("summoning: IDENTITY.md generation failed", "agent", agentID, "error", idErr)
 			s.emitEvent(agentID, tenantID, SummonEventFailed, "", idErr.Error())
-			s.setAgentStatus(context.Background(), agentID, store.AgentStatusSummonFailed)
+			s.setAgentStatus(context.Background(), tenantID, agentID, store.AgentStatusSummonFailed)
 			return
 		}
 		identityContent = idFiles[bootstrap.IdentityFile]
@@ -191,14 +200,26 @@ func (s *AgentSummoner) finishSummon(ctx context.Context, agentID, tenantID uuid
 		updates["frontmatter"] = frontmatter
 	}
 	if name := extractIdentityName(identityContent); name != "" {
-		updates["display_name"] = name
+		agent, _ := s.agents.GetByID(ctx, agentID)
+		if agent != nil && agent.DisplayName != "" {
+			// User already set a custom name — preserve it, sync IDENTITY.md to match
+			if name != agent.DisplayName {
+				updated := bootstrap.UpdateIdentityField(identityContent, "Name", agent.DisplayName)
+				if updated != identityContent {
+					_ = s.agents.SetAgentContextFile(ctx, agentID, bootstrap.IdentityFile, updated)
+				}
+			}
+		} else {
+			// No custom name — use LLM-generated name
+			updates["display_name"] = name
+		}
 	}
 	if len(updates) > 0 {
 		if err := s.agents.Update(ctx, agentID, updates); err != nil {
 			slog.Warn("summoning: failed to save agent metadata", "agent", agentID, "error", err)
 		}
 	}
-	s.setAgentStatus(ctx, agentID, store.AgentStatusActive)
+	s.setAgentStatus(ctx, tenantID, agentID, store.AgentStatusActive)
 	s.emitEvent(agentID, tenantID, SummonEventCompleted, "", "")
 	slog.Info("summoning: completed", "agent", agentID)
 }

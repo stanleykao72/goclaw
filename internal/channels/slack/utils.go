@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
-	"strings"
 	"time"
 
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
@@ -22,9 +21,6 @@ func (c *Channel) HandleMessage(senderID, chatID, content string, mediaPaths []s
 	}
 
 	userID := senderID
-	if idx := strings.IndexByte(senderID, '|'); idx > 0 {
-		userID = senderID[:idx]
-	}
 
 	var mediaFiles []bus.MediaFile
 	for _, p := range mediaPaths {
@@ -34,7 +30,7 @@ func (c *Channel) HandleMessage(senderID, chatID, content string, mediaPaths []s
 	// Collect contact for processed messages (DM + group-mentioned).
 	if cc := c.ContactCollector(); cc != nil {
 		ctx := store.WithTenantID(context.Background(), c.TenantID())
-		cc.EnsureContact(ctx, c.Type(), c.Name(), userID, userID, metadata["username"], "", peerKind, "user")
+		cc.EnsureContact(ctx, c.Type(), c.Name(), userID, userID, metadata["username"], "", peerKind, "user", "", "")
 	}
 
 	c.Bus().PublishInbound(bus.InboundMessage{

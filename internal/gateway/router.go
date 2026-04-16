@@ -78,14 +78,20 @@ func (r *MethodRouter) Handle(ctx context.Context, client *Client, req *protocol
 		}
 	}
 
-	// Inject locale + tenant into context.
+	// Inject locale + tenant + role into context.
 	// All connect paths guarantee client.tenantID is set (owner defaults to MasterTenantID).
+	// Role injection is required so store.IsOwnerRole / store.IsMasterScope work
+	// from WS handlers — without it, ctx-based permission helpers silently
+	// evaluate as non-owner. HTTP layer does the same via enrichContext.
 	ctx = store.WithLocale(ctx, i18n.Normalize(client.locale))
 	if client.TenantID() != uuid.Nil {
 		ctx = store.WithTenantID(ctx, client.TenantID())
 	}
 	if slug := client.TenantSlug(); slug != "" {
 		ctx = store.WithTenantSlug(ctx, slug)
+	}
+	if role := client.Role(); role != "" {
+		ctx = store.WithRole(ctx, string(role))
 	}
 
 	slog.Debug("handling method", "method", req.Method, "client", client.id, "req_id", req.ID)
@@ -464,6 +470,7 @@ func (r *MethodRouter) handleHealth(ctx context.Context, client *Client, req *pr
 			resp["latestVersion"] = info.LatestVersion
 			resp["updateAvailable"] = info.UpdateAvailable
 			resp["updateUrl"] = info.UpdateURL
+			resp["releaseNotes"] = info.ReleaseNotes
 		}
 	}
 	client.SendResponse(protocol.NewOKResponse(req.ID, resp))

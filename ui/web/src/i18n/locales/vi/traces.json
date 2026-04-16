@@ -15,6 +15,14 @@
     "spans": "Khoảng",
     "time": "Thời gian"
   },
+  "source": {
+    "direct": "Trực tiếp",
+    "group": "Nhóm",
+    "cron": "Cron",
+    "team": "Team",
+    "ws": "Web",
+    "unknown": "Khác"
+  },
   "unnamed": "Không tên",
   "stopRun": "Dừng chạy",
   "cached": "đã cache",

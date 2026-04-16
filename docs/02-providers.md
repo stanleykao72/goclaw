@@ -1,6 +1,6 @@
 # 02 - LLM Providers
 
-GoClaw abstracts LLM communication behind a single `Provider` interface, allowing the agent loop to work with any backend without knowing the wire format. Six concrete implementations exist: Anthropic (native HTTP+SSE), OpenAI-compatible (covering 10+ API endpoints), Claude CLI (local binary), Codex (OAuth-based), ACP (subagent orchestration), and DashScope (Alibaba Qwen with thinking).
+GoClaw abstracts LLM communication behind a single `Provider` interface, allowing the agent loop to work with any backend without knowing the wire format. Six concrete implementations exist: Anthropic (native HTTP+SSE), OpenAI-compatible (covering 10+ API endpoints), Claude CLI (local binary), Codex (OAuth-based), ACP (subagent orchestration), and DashScope (Alibaba Qwen with thinking). The OpenAI-compatible provider also supports BytePlus ModelArk (Seed 2.0 models with image/video generation).
 
 ---
 
@@ -75,6 +75,8 @@ All HTTP-based providers (Anthropic, OpenAI-compatible, Codex) use 300-second ti
 | bailian | `https://coding-intl.dashscope.aliyuncs.com/v1` | `qwen3.5-plus` | Alibaba Coding API |
 | zai | `https://api.z.ai/api/paas/v4` | `glm-5` | |
 | zai-coding | `https://api.z.ai/api/coding/paas/v4` | `glm-5` | |
+| byteplus | `https://ark.ap-southeast.bytepluses.com/api/v3` | `seed-2-0-lite-260228` | Seed 2.0 models |
+| byteplus_coding | `https://ark.ap-southeast.bytepluses.com/api/coding/v3` | `seed-2-0-lite-260228` | Seed 2.0 Coding Plan |
 
 ---
 
@@ -700,10 +702,37 @@ Reasoning behavior:
 
 ---
 
+## 13. Wave 2: Provider Resilience (v3)
+
+GoClaw v3 Wave 2 adds composable request middleware, error classification, per-model cooldown, and 2-tier failover for production resilience.
+
+**Request Middleware** — Transforms provider requests in composable pipeline. Built-in: `CacheMiddleware` (prompt caching), `ServiceTierMiddleware` (routing hints), `RateLimitMiddleware` (quota management). Zero-alloc fast path: `ComposeMiddlewares` returns nil if all inputs nil.
+
+**Error Classification** — Maps provider errors to 9 canonical reasons: `FailoverAuth`, `FailoverAuthPermanent`, `FailoverRateLimit`, `FailoverOverloaded`, `FailoverBilling`, `FailoverFormat`, `FailoverModelNotFound`, `FailoverTimeout`, `FailoverUnknown`. `DefaultClassifier` pattern-matches body strings (OpenAI, Anthropic pre-registered). Detects context overflow (triggers auto-compaction).
+
+**Cooldown Tracking** — `CooldownTracker` in-memory state machine. Per-reason durations: 30s (rate limit), 60s→120s escalated (overloaded), 10m (auth), 1h (permanent auth/model not found), 15s (timeout), 5m (billing). Auto-decay 24h TTL; probe interval ≥30s.
+
+**2-Tier Failover** — `RunWithFailover[T]`: Tier 1 rotates API profiles for transient errors (≤5 rotations); Tier 2 falls back to next model for permanent errors. Returns all attempts with classifications. Exhausted → `FailoverSummaryError`.
+
+**Model Registry** — Thread-safe forward-compat resolver. Seeds Claude, GPT, Qwen models. Each spec: context window, max tokens, reasoning/vision flags, per-1M cost. Unknown models → provider's `ForwardCompatResolver` (caches hit). Template cloning with patch overrides.
+
+**Embedding Providers** — OpenAI (text-embedding-3-small, 1536 dims, batch 2048) and Voyage AI (1024 dims, batch 1024) via `store.EmbeddingProvider`. Used by vault and episodic memory. All vectors normalized to 1536 for pgvector column.
+
+---
+
 ## 14. File Reference
 
 | File | Purpose |
 |------|---------|
+| `internal/providers/middleware.go` | RequestMiddleware type, ComposeMiddlewares, ApplyMiddlewares (zero-alloc fast path) |
+| `internal/providers/middleware_cache.go` | CacheMiddleware for prompt caching |
+| `internal/providers/middleware_service_tier.go` | ServiceTierMiddleware for routing hints |
+| `internal/providers/error_classify.go` | ErrorClassifier, DefaultClassifier, 9 failover reasons, context overflow detection |
+| `internal/providers/cooldown.go` | CooldownTracker: per-model:provider failure state, reason-dependent durations, probe intervals |
+| `internal/providers/failover.go` | RunWithFailover[T]: 2-tier logic, profile rotation, model fallback, candidate exhaustion |
+| `internal/providers/model_registry.go` | ModelRegistry, ModelSpec, InMemoryRegistry, forward-compat resolver, seeded defaults |
+| `internal/providers/embedding_openai.go` | OpenAI embedding provider (text-embedding-3-small, 1536 dims, batch 2048) |
+| `internal/providers/embedding_voyage.go` | Voyage AI embedding provider |
 | `internal/providers/types.go` | Provider interface, ChatRequest, ChatResponse, Message, ToolCall, Usage types |
 | `internal/providers/anthropic.go` | Anthropic provider: native HTTP + SSE, request/response marshaling |
 | `internal/providers/anthropic_request.go` | Anthropic request builder: message formatting, tool schemas, system blocks |
@@ -715,23 +744,10 @@ Reasoning behavior:
 | `internal/providers/claude_cli_chat.go` | Chat/ChatStream implementation for CLI provider |
 | `internal/providers/claude_cli_session.go` | Session management: per-session state, history, workspace |
 | `internal/providers/claude_cli_mcp.go` | MCP configuration and server bridge for CLI provider |
-| `internal/providers/claude_cli_auth.go` | Authentication and token handling for CLI |
-| `internal/providers/claude_cli_parse.go` | Response parsing and message extraction from CLI output |
-| `internal/providers/claude_cli_deny_patterns.go` | Path validation and deny pattern enforcement |
-| `internal/providers/claude_cli_hooks.go` | Security hooks configuration for CLI tool execution |
-| `internal/providers/claude_cli_types.go` | Internal types for CLI provider (session, config, options) |
 | `internal/providers/codex.go` | CodexProvider: OAuth-based ChatGPT Responses API |
 | `internal/providers/codex_build.go` | Codex request builder: message formatting, phase handling |
-| `internal/providers/codex_types.go` | Codex request/response types and OAuth token management |
-| `internal/providers/chatgpt_oauth_router.go` | Agent-side routing across multiple authenticated OpenAI Codex OAuth providers |
 | `internal/providers/dashscope.go` | DashScope provider: OpenAI-compat wrapper with thinking budget, tools+streaming fallback |
 | `internal/providers/acp_provider.go` | ACPProvider: orchestrates ACP-compatible agent subprocesses |
-| `internal/providers/acp/types.go` | ACP protocol types: InitializeRequest, SessionUpdate, ContentBlock, etc. |
-| `internal/providers/acp/process.go` | ProcessPool: subprocess lifecycle, idle TTL reaping, crash recovery |
-| `internal/providers/acp/jsonrpc.go` | JSON-RPC 2.0 request/response marshaling over stdio |
-| `internal/providers/acp/tool_bridge.go` | ToolBridge: handles fs and terminal requests, workspace sandboxing |
-| `internal/providers/acp/terminal.go` | Terminal lifecycle: create, output, exit, release, kill |
-| `internal/providers/acp/session.go` | Session state tracking per ACP agent |
 | `internal/providers/retry.go` | RetryDo[T] generic function, RetryConfig, IsRetryableError, backoff computation |
 | `internal/providers/schema_cleaner.go` | CleanSchemaForProvider, CleanToolSchemas, recursive schema field removal |
 | `internal/providers/registry.go` | Provider registry: registration, lookup, lifecycle management |

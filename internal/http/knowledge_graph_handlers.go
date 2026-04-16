@@ -1,7 +1,6 @@
 package http
 
 import (
-	"encoding/json"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -67,6 +66,7 @@ func (h *KnowledgeGraphHandler) handleGetEntity(w http.ResponseWriter, r *http.R
 
 	relations, err := h.store.ListRelations(r.Context(), agentID, userID, entityID)
 	if err != nil {
+		slog.Warn("kg.list_relations failed", "agent_id", agentID, "entity_id", entityID, "user_id", userID, "error", err)
 		relations = []store.Relation{}
 	}
 	if relations == nil {
@@ -84,8 +84,7 @@ func (h *KnowledgeGraphHandler) handleUpsertEntity(w http.ResponseWriter, r *htt
 	agentID := r.PathValue("agentID")
 
 	var entity store.Entity
-	if err := json.NewDecoder(r.Body).Decode(&entity); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidJSON)})
+	if !bindJSON(w, r, locale, &entity) {
 		return
 	}
 	entity.AgentID = agentID
@@ -128,8 +127,7 @@ func (h *KnowledgeGraphHandler) handleTraverse(w http.ResponseWriter, r *http.Re
 		UserID   string `json:"user_id"`
 		MaxDepth int    `json:"max_depth"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidJSON)})
+	if !bindJSON(w, r, locale, &body) {
 		return
 	}
 	if body.EntityID == "" {
@@ -139,8 +137,8 @@ func (h *KnowledgeGraphHandler) handleTraverse(w http.ResponseWriter, r *http.Re
 	if body.MaxDepth <= 0 {
 		body.MaxDepth = 2
 	}
-	if body.MaxDepth > 3 {
-		body.MaxDepth = 3
+	if body.MaxDepth > 5 {
+		body.MaxDepth = 5
 	}
 
 	results, err := h.store.Traverse(r.Context(), agentID, body.UserID, body.EntityID, body.MaxDepth)
@@ -166,8 +164,7 @@ func (h *KnowledgeGraphHandler) handleExtract(w http.ResponseWriter, r *http.Req
 		Model    string  `json:"model"`
 		MinConf  float64 `json:"min_confidence"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidJSON)})
+	if !bindJSON(w, r, locale, &body) {
 		return
 	}
 	if body.Text == "" {
@@ -245,8 +242,7 @@ func (h *KnowledgeGraphHandler) handleScanDuplicates(w http.ResponseWriter, r *h
 		Threshold float64 `json:"threshold"`
 		Limit     int     `json:"limit"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidJSON)})
+	if !bindJSON(w, r, locale, &body) {
 		return
 	}
 	if body.Threshold <= 0 {
@@ -294,8 +290,7 @@ func (h *KnowledgeGraphHandler) handleMergeEntities(w http.ResponseWriter, r *ht
 		TargetID string `json:"target_id"`
 		SourceID string `json:"source_id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidJSON)})
+	if !bindJSON(w, r, locale, &body) {
 		return
 	}
 	if body.TargetID == "" || body.SourceID == "" {
@@ -318,8 +313,7 @@ func (h *KnowledgeGraphHandler) handleDismissCandidate(w http.ResponseWriter, r 
 	var body struct {
 		CandidateID string `json:"candidate_id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidJSON)})
+	if !bindJSON(w, r, locale, &body) {
 		return
 	}
 	if body.CandidateID == "" {
@@ -343,6 +337,9 @@ func (h *KnowledgeGraphHandler) handleGraph(w http.ResponseWriter, r *http.Reque
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	if limit <= 0 {
 		limit = 200
+	}
+	if limit > 500 {
+		limit = 500
 	}
 
 	entities, err := h.store.ListEntities(r.Context(), agentID, userID, store.EntityListOptions{Limit: limit})

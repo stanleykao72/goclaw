@@ -70,6 +70,14 @@
     "abortFailed": "停止运行失败",
     "abortNotFound": "运行已完成或未找到"
   },
+  "source": {
+    "direct": "私聊",
+    "group": "群组",
+    "cron": "定时",
+    "team": "团队",
+    "ws": "网页",
+    "unknown": "其他"
+  },
   "unnamed": "未命名",
   "stopRun": "停止运行"
 }

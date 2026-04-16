@@ -2,9 +2,6 @@ package cmd
 
 import (
 	"context"
-	"encoding/json"
-	"log/slog"
-	"strings"
 
 	"github.com/google/uuid"
 
@@ -17,36 +14,11 @@ import (
 // buildEnsureUserProfile creates the user profile resolution callback.
 // Creates/resolves user profile and returns effective workspace.
 // Separated from seeding to allow independent lifecycle management.
-func buildEnsureUserProfile(as store.AgentStore, configPermStore store.ConfigPermissionStore) agent.EnsureUserProfileFunc {
+func buildEnsureUserProfile(as store.AgentStore) agent.EnsureUserProfileFunc {
 	return func(ctx context.Context, agentID uuid.UUID, userID, workspace, channel string) (string, bool, error) {
 		isNew, effectiveWs, err := as.GetOrCreateUserProfile(ctx, agentID, userID, workspace, channel)
 		if err != nil {
 			return effectiveWs, false, err
-		}
-
-		// Auto-add first group member as a file writer (bootstrap the allowlist).
-		// Only needed for truly new profiles — existing groups already have their writers.
-		if isNew && configPermStore != nil && (strings.HasPrefix(userID, "group:") || strings.HasPrefix(userID, "guild:")) {
-			senderID := store.SenderIDFromContext(ctx)
-			if senderID != "" {
-				parts := strings.SplitN(senderID, "|", 2)
-				numericID := parts[0]
-				senderUsername := ""
-				if len(parts) > 1 {
-					senderUsername = parts[1]
-				}
-				meta, _ := json.Marshal(map[string]string{"displayName": "", "username": senderUsername})
-				if addErr := configPermStore.Grant(ctx, &store.ConfigPermission{
-					AgentID:    agentID,
-					Scope:      userID,
-					ConfigType: "file_writer",
-					UserID:     numericID,
-					Permission: "allow",
-					Metadata:   meta,
-				}); addErr != nil {
-					slog.Warn("failed to auto-add group file writer", "error", addErr, "sender", numericID, "group", userID)
-				}
-			}
 		}
 
 		return effectiveWs, isNew, nil
@@ -58,8 +30,8 @@ func buildEnsureUserProfile(as store.AgentStore, configPermStore store.ConfigPer
 // isNew=true seeds all files; isNew=false only seeds if user has zero files
 // (avoids re-seeding BOOTSTRAP.md after auto-cleanup on server restart).
 func buildSeedUserFiles(as store.AgentStore) agent.SeedUserFilesFunc {
-	return func(ctx context.Context, agentID uuid.UUID, userID, agentType string, isNew bool) error {
-		_, err := bootstrap.SeedUserFiles(ctx, as, agentID, userID, agentType, !isNew)
+	return func(ctx context.Context, agentID uuid.UUID, userID, agentType string, isNew bool, channelMeta *bootstrap.ChannelMeta) error {
+		_, err := bootstrap.SeedUserFiles(ctx, as, agentID, userID, agentType, !isNew, channelMeta)
 		return err
 	}
 }

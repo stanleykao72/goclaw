@@ -1,4 +1,8 @@
 {
+  "contextUsage": {
+    "tooltip": "{{used}} / {{max}} token ({{percent}}%) · {{compactions}} lần compact · gần nhất: {{lastCompact}}",
+    "never": "chưa có"
+  },
   "empty": {
     "description": "Gửi tin nhắn để bắt đầu trò chuyện với agent.",
     "title": "Bắt đầu cuộc trò chuyện"
@@ -21,5 +25,9 @@
   "replyingTo": "Đang trả lời",
   "error": {
     "notConnected": "Chưa kết nối. Vui lòng chờ kết nối được thiết lập."
+  },
+  "selectAgent": {
+    "title": "Chọn agent",
+    "description": "Chọn agent để bắt đầu trò chuyện"
   }
 }

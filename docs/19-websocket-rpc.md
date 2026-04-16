@@ -127,6 +127,13 @@ Inject a message into the session transcript without triggering the agent.
 **Request:** `{sessionKey, message, label}`
 **Response:** `{ok: true, messageId: "..."}`
 
+### `chat.session.status`
+
+Check if a session has a running agent invocation.
+
+**Request:** `{sessionKey}`
+**Response:** `{running: true, runId: "..."}`
+
 ---
 
 ## 3. Agents
@@ -202,6 +209,15 @@ Delete an agent (admin only).
 | `agents.files.set` | Save file content |
 
 **Request:** `{agentId, name?, content?}`
+
+### Agent Links
+
+| Method | Description |
+|--------|-------------|
+| `agents.links.list` | List agent links |
+| `agents.links.create` | Create agent link |
+| `agents.links.update` | Update agent link |
+| `agents.links.delete` | Delete agent link |
 
 ---
 
@@ -295,6 +311,7 @@ Get JSON schema for config form generation.
 |--------|-------------|
 | `channels.list` | List enabled channels |
 | `channels.status` | Get channel connection status |
+| `channels.toggle` | Toggle channel enabled/disabled |
 
 ### Channel Instances
 
@@ -357,6 +374,8 @@ sequenceDiagram
 |--------|-------------|
 | `teams.tasks.list` | List team tasks (filterable) |
 | `teams.tasks.get` | Get task with comments/events |
+| `teams.tasks.get-light` | Get task without comments/events (lightweight) |
+| `teams.tasks.active-by-session` | Get active task for a session |
 | `teams.tasks.create` | Create task |
 | `teams.tasks.approve` | Approve task |
 | `teams.tasks.reject` | Reject task |
@@ -365,6 +384,7 @@ sequenceDiagram
 | `teams.tasks.events` | List task events |
 | `teams.tasks.assign` | Assign to member |
 | `teams.tasks.delete` | Delete task |
+| `teams.tasks.delete-bulk` | Bulk delete tasks |
 
 ### Team Context
 
@@ -403,18 +423,7 @@ sequenceDiagram
 
 ---
 
-## 12. Delegations
-
-| Method | Description |
-|--------|-------------|
-| `delegations.list` | List delegation history (filterable) |
-| `delegations.get` | Get delegation record |
-
-**Filters:** `source_agent_id`, `target_agent_id`, `team_id`, `user_id`, `status`
-
----
-
-## 13. Usage & Quotas
+## 12. Usage & Quotas
 
 | Method | Description |
 |--------|-------------|
@@ -424,7 +433,7 @@ sequenceDiagram
 
 ---
 
-## 14. API Keys
+## 13. API Keys
 
 Admin-only methods.
 
@@ -438,7 +447,7 @@ See [20 — API Keys & Auth](20-api-keys-auth.md) for the full authentication mo
 
 ---
 
-## 15. Messaging
+## 14. Messaging
 
 ### `send`
 
@@ -449,7 +458,7 @@ Route an outbound message to a channel.
 
 ---
 
-## 16. Logs
+## 15. Logs
 
 ### `logs.tail`
 
@@ -462,7 +471,228 @@ Log entries are delivered as events while tailing is active.
 
 ---
 
-## 17. Permission Matrix
+## 16. Tenants
+
+Multi-tenant management (admin only).
+
+| Method | Description |
+|--------|-------------|
+| `tenants.list` | List tenants |
+| `tenants.get` | Get tenant details |
+| `tenants.create` | Create tenant |
+| `tenants.update` | Update tenant |
+| `tenants.users.list` | List tenant users |
+| `tenants.users.add` | Add user to tenant |
+| `tenants.users.remove` | Remove user from tenant |
+| `tenants.mine` | Get current user's tenant |
+
+---
+
+## 17. TTS (Text-to-Speech)
+
+| Method | Description |
+|--------|-------------|
+| `tts.status` | Get TTS status and current provider |
+| `tts.enable` | Enable TTS |
+| `tts.disable` | Disable TTS |
+| `tts.convert` | Convert text to speech audio |
+| `tts.setProvider` | Set TTS provider |
+| `tts.providers` | List available TTS providers |
+
+---
+
+## 18. Browser Automation
+
+| Method | Description |
+|--------|-------------|
+| `browser.act` | Execute browser action (click, type, navigate) |
+| `browser.snapshot` | Get accessibility snapshot of current page |
+| `browser.screenshot` | Take screenshot of current page |
+
+---
+
+## 19. Zalo Personal
+
+| Method | Description |
+|--------|-------------|
+| `zalo.personal.qr.start` | Start Zalo QR code authentication |
+| `zalo.personal.contacts` | List Zalo personal contacts |
+
+---
+
+## 19. V3 Methods (Evolution, Episodic, Vault, Orchestration)
+
+### Evolution Metrics
+
+| Method | Description |
+|--------|-------------|
+| `agent.evolution.metrics` | Get aggregated or raw metrics for agent |
+| `agent.evolution.suggestions` | List evolution suggestions with filtering |
+| `agent.evolution.apply` | Apply an approved suggestion (auto-adapt) |
+| `agent.evolution.rollback` | Rollback a previously applied suggestion |
+
+**`agent.evolution.metrics` request:**
+
+```json
+{
+  "agentId": "uuid",
+  "type": "tool|retrieval|feedback",
+  "aggregate": true,
+  "since": "2026-03-30T00:00:00Z"
+}
+```
+
+**Response:** Same as HTTP `GET /v1/agents/{agentID}/evolution/metrics`.
+
+**`agent.evolution.suggestions` request:**
+
+```json
+{
+  "agentId": "uuid",
+  "status": "pending|approved|applied|rejected|rolled_back",
+  "limit": 50
+}
+```
+
+**`agent.evolution.apply` request:**
+
+```json
+{
+  "agentId": "uuid",
+  "suggestionId": "uuid"
+}
+```
+
+### Episodic Memory
+
+| Method | Description |
+|--------|-------------|
+| `agent.episodic.list` | List episodic summaries for agent |
+| `agent.episodic.search` | Hybrid search episodic summaries |
+
+**`agent.episodic.list` request:**
+
+```json
+{
+  "agentId": "uuid",
+  "userId": "optional-user-id",
+  "limit": 20,
+  "offset": 0
+}
+```
+
+**`agent.episodic.search` request:**
+
+```json
+{
+  "agentId": "uuid",
+  "query": "search terms",
+  "userId": "optional",
+  "maxResults": 10,
+  "minScore": 0.5
+}
+```
+
+### Knowledge Vault
+
+| Method | Description |
+|--------|-------------|
+| `agent.vault.documents` | List vault documents for agent |
+| `agent.vault.get` | Get single vault document |
+| `agent.vault.search` | Hybrid search vault documents |
+| `agent.vault.links` | Get outgoing + backlinks for document |
+
+**`agent.vault.documents` request:**
+
+```json
+{
+  "agentId": "uuid",
+  "scope": "team|user|global",
+  "docTypes": ["guide", "reference"],
+  "limit": 20,
+  "offset": 0
+}
+```
+
+**`agent.vault.search` request:**
+
+```json
+{
+  "agentId": "uuid",
+  "query": "search terms",
+  "scope": "team",
+  "docTypes": ["guide"],
+  "maxResults": 10
+}
+```
+
+### Orchestration
+
+| Method | Description |
+|--------|-------------|
+| `agent.orchestration.mode` | Get agent's orchestration mode + delegation targets |
+
+**`agent.orchestration.mode` request:**
+
+```json
+{
+  "agentId": "uuid"
+}
+```
+
+**Response:**
+
+```json
+{
+  "mode": "standalone|delegate|team",
+  "delegateTargets": [
+    {"agentKey": "research-agent", "displayName": "Research Specialist"}
+  ],
+  "team": null
+}
+```
+
+### V3 Feature Flags
+
+| Method | Description |
+|--------|-------------|
+| `agent.v3flags.get` | Get v3 feature flags for agent |
+| `agent.v3flags.update` | Update v3 feature flags |
+
+**`agent.v3flags.get` request:**
+
+```json
+{
+  "agentId": "uuid"
+}
+```
+
+**Response:**
+
+```json
+{
+  "evolutionEnabled": true,
+  "episodicEnabled": true,
+  "vaultEnabled": true,
+  "orchestrationEnabled": false
+}
+```
+
+**`agent.v3flags.update` request:**
+
+```json
+{
+  "agentId": "uuid",
+  "flags": {
+    "evolutionEnabled": true,
+    "episodicEnabled": false
+  }
+}
+```
+
+---
+
+## 20. Permission Matrix
 
 Methods are gated by role. The role is determined at `connect` time from the token type and scopes.
 
@@ -474,7 +704,7 @@ Methods are gated by role. The role is determined at `connect` time from the tok
 
 ### Admin-Only Methods
 
-`config.apply`, `config.patch`, `agents.create`, `agents.update`, `agents.delete`, `channels.toggle`, `device.pair.approve`, `device.pair.deny`, `device.pair.revoke`, `teams.*`, `api_keys.*`
+`config.apply`, `config.patch`, `agents.create`, `agents.update`, `agents.delete`, `channels.toggle`, `device.pair.approve`, `device.pair.deny`, `device.pair.revoke`, `teams.*`, `api_keys.*`, `tenants.*`
 
 ### Write Methods (Operator+)
 
@@ -486,7 +716,7 @@ All other methods: list, get, preview, status, history, etc.
 
 ---
 
-## 18. Events
+## 21. Events
 
 The server pushes events to connected clients via event frames. Key event types:
 
@@ -502,6 +732,18 @@ The server pushes events to connected clients via event frames. Key event types:
 | `cron.fired` | Cron job triggered |
 | `team.task.*` | Team task lifecycle events |
 | `exec.approval.pending` | Command awaiting approval |
+
+### V3 Events
+
+| Event | Description | Payload |
+|-------|-------------|---------|
+| `evolution.metrics.updated` | New evolution metrics recorded | `{agentId, metricType, toolName, value}` |
+| `evolution.suggestion` | New evolution suggestion generated | `{agentId, suggestionId, type, title}` |
+| `episodic.summary` | New episodic summary created/updated | `{agentId, summaryId, userId}` |
+| `vault.document.created` | New vault document created | `{agentId, docId, title, docType}` |
+| `vault.document.updated` | Vault document updated | `{agentId, docId, title}` |
+| `orchestration.mode.changed` | Agent orchestration mode changed | `{agentId, newMode}` |
+| `v3flags.changed` | V3 feature flags updated | `{agentId, flags}` |
 
 ---
 
@@ -532,11 +774,18 @@ The server pushes events to connected clients via event frames. Key event types:
 | `internal/gateway/methods/teams_tasks.go` | Team task management |
 | `internal/gateway/methods/teams_workspace.go` | Team workspace |
 | `internal/gateway/methods/exec_approval.go` | Exec approval flow |
-| `internal/gateway/methods/delegations.go` | Delegation history |
+| `internal/gateway/methods/agent_links.go` | Agent links management |
+| `internal/gateway/methods/tenants.go` | Tenant management |
 | `internal/gateway/methods/usage.go` | Usage records |
 | `internal/gateway/methods/quota_methods.go` | Quota consumption |
 | `internal/gateway/methods/api_keys.go` | API key management |
 | `internal/gateway/methods/send.go` | Outbound messaging |
 | `internal/gateway/methods/logs.go` | Log tailing |
+| `internal/gateway/methods/agent_evolution.go` | Evolution metrics + suggestions + apply + rollback |
+| `internal/gateway/methods/agent_episodic.go` | Episodic memory list + search |
+| `internal/gateway/methods/agent_vault.go` | Knowledge vault documents + search + links |
+| `internal/gateway/methods/agent_orchestration.go` | Orchestration mode info |
+| `internal/gateway/methods/agent_v3flags.go` | V3 feature flags get/update |
 | `internal/permissions/policy.go` | RBAC policy engine |
 | `pkg/protocol/methods.go` | Method name constants |
+| `pkg/protocol/events.go` | Event type constants (incl. v3 events) |

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Wrench, AlertTriangle, Loader2, ChevronDown, ChevronRight, Zap } from "lucide-react";
+import { Wrench, AlertTriangle, ChevronRight, Zap } from "lucide-react";
 import type { ToolStreamEntry } from "@/types/chat";
 
 const isSkillTool = (name: string) => name === "use_skill";
@@ -44,9 +44,7 @@ export function ToolCallCard({ entry, compact }: ToolCallCardProps) {
         <span className="ml-auto flex items-center gap-1 shrink-0">
           <PhaseLabel phase={entry.phase} isSkill={skill} />
           {canExpand && (
-            expanded
-              ? <ChevronDown className="h-3 w-3 text-muted-foreground" />
-              : <ChevronRight className="h-3 w-3 text-muted-foreground" />
+            <ChevronRight className={`h-3 w-3 text-muted-foreground transition-transform ${expanded ? "rotate-90" : ""}`} />
           )}
         </span>
       </button>
@@ -57,16 +55,16 @@ export function ToolCallCard({ entry, compact }: ToolCallCardProps) {
           )}
           {entry.arguments && Object.keys(entry.arguments).length > 0 && (
             <div>
-              <div className="text-[10px] font-semibold uppercase text-muted-foreground mb-0.5">{t("toolArguments")}</div>
-              <pre className="whitespace-pre-wrap text-[11px] font-mono bg-background rounded p-1.5 max-h-40 overflow-y-auto">
+              <div className="text-2xs font-semibold uppercase text-muted-foreground mb-0.5">{t("toolArguments")}</div>
+              <pre className="whitespace-pre-wrap text-xs-plus font-mono bg-background rounded p-1.5 max-h-40 overflow-y-auto">
                 {JSON.stringify(entry.arguments, null, 2)}
               </pre>
             </div>
           )}
           {entry.result && (
             <div>
-              <div className="text-[10px] font-semibold uppercase text-muted-foreground mb-0.5">{t("toolResult")}</div>
-              <pre className="whitespace-pre-wrap text-[11px] font-mono bg-background rounded p-1.5 max-h-40 overflow-y-auto">
+              <div className="text-2xs font-semibold uppercase text-muted-foreground mb-0.5">{t("toolResult")}</div>
+              <pre className="whitespace-pre-wrap text-xs-plus font-mono bg-background rounded p-1.5 max-h-40 overflow-y-auto">
                 {entry.result}
               </pre>
             </div>
@@ -88,7 +86,7 @@ function ToolIcon({ phase, isSkill }: { phase: ToolStreamEntry["phase"]; isSkill
     }
   }
   switch (phase) {
-    case "calling": return <Loader2 className={`${cls} animate-spin text-blue-500`} />;
+    case "calling": return <Wrench className={`${cls} animate-wobble text-blue-500`} />;
     case "completed": return <Wrench className={`${cls} text-blue-500`} />;
     case "error": return <AlertTriangle className={`${cls} text-red-500`} />;
     default: return <Wrench className={`${cls} text-muted-foreground`} />;
@@ -105,5 +103,5 @@ function PhaseLabel({ phase, isSkill }: { phase: ToolStreamEntry["phase"]; isSki
     completed: "text-blue-500",
     error: "text-red-500",
   };
-  return <span className={`text-[11px] ${colors[phase] ?? "text-muted-foreground"}`}>{labels[phase] ?? phase}</span>;
+  return <span className={`text-xs-plus ${colors[phase] ?? "text-muted-foreground"}`}>{labels[phase] ?? phase}</span>;
 }

@@ -116,6 +116,11 @@ func clientCanReceiveEvent(c *Client, event bus.Event) bool {
 		return false
 	}
 
+	// WhatsApp QR events: delivered directly to the requesting client, not broadcast.
+	if strings.HasPrefix(event.Name, "whatsapp.") {
+		return false
+	}
+
 	// Skill dep events → broadcast (non-sensitive, skill names only).
 	if strings.HasPrefix(event.Name, "skill.") {
 		return true
@@ -142,7 +147,8 @@ func isAdminOnlyEvent(name string) bool {
 	case protocol.EventNodePairRequested, protocol.EventNodePairResolved,
 		protocol.EventDevicePairReq, protocol.EventDevicePairRes,
 		protocol.EventAgentLinkCreated, protocol.EventAgentLinkUpdated, protocol.EventAgentLinkDeleted,
-		protocol.EventWorkspaceFileChanged:
+		protocol.EventWorkspaceFileChanged,
+		protocol.EventBackgroundError:
 		return true
 	}
 	return false

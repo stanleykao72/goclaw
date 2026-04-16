@@ -4,6 +4,8 @@ package providers
 // Union flattening + key stripping live in schema_transforms.go.
 // Shared helpers live in schema_helpers.go.
 
+import "maps"
+
 // maxSchemaDepth prevents stack overflow from malicious deeply-nested schemas.
 const maxSchemaDepth = 64
 
@@ -11,10 +13,15 @@ const maxSchemaDepth = 64
 // This is the single entry point — all providers should call this (directly or
 // via CleanToolSchemas / CleanSchemaForProvider wrappers).
 func NormalizeSchema(providerName string, schema map[string]any) map[string]any {
+	return normalizeWithProfile(profileForProvider(providerName), schema)
+}
+
+// normalizeWithProfile applies normalization using a pre-resolved profile.
+// Used by CleanToolSchemas to pass per-tool profile overrides.
+func normalizeWithProfile(profile SchemaProfile, schema map[string]any) map[string]any {
 	if schema == nil {
 		return nil
 	}
-	profile := profileForProvider(providerName)
 	result := copySchema(schema)
 
 	if profile.ResolveRefs {
@@ -54,9 +61,7 @@ func collectDefs(schema map[string]any) map[string]any {
 	defs := make(map[string]any)
 	for _, key := range []string{"$defs", "definitions"} {
 		if block, ok := schema[key].(map[string]any); ok {
-			for name, def := range block {
-				defs[name] = def
-			}
+			maps.Copy(defs, block)
 		}
 	}
 	return defs
@@ -145,5 +150,3 @@ func stripNullVariants(schema map[string]any, depth int) map[string]any {
 		return stripNullVariants(child, depth+1)
 	})
 }
-
-

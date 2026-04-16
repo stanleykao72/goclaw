@@ -13,11 +13,25 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
+)
+
+// PolicyResult is returned by BaseChannel policy checks.
+type PolicyResult int
+
+const (
+	// PolicyAllow means the message should be processed.
+	PolicyAllow PolicyResult = iota
+	// PolicyDeny means the message should be silently dropped.
+	PolicyDeny
+	// PolicyNeedsPairing means the sender is unpaired; caller should send its platform-specific pairing reply.
+	PolicyNeedsPairing
 )
 
 // InternalChannels are system channels excluded from outbound dispatch.
@@ -40,9 +54,9 @@ type DMPolicy string
 
 const (
 	DMPolicyPairing   DMPolicy = "pairing"   // Require pairing code
-	DMPolicyAllowlist DMPolicy = "allowlist"  // Only whitelisted senders
-	DMPolicyOpen      DMPolicy = "open"       // Accept all
-	DMPolicyDisabled  DMPolicy = "disabled"   // Reject all DMs
+	DMPolicyAllowlist DMPolicy = "allowlist" // Only whitelisted senders
+	DMPolicyOpen      DMPolicy = "open"      // Accept all
+	DMPolicyDisabled  DMPolicy = "disabled"  // Reject all DMs
 )
 
 // GroupPolicy controls how group messages are handled.
@@ -50,16 +64,18 @@ type GroupPolicy string
 
 const (
 	GroupPolicyOpen      GroupPolicy = "open"      // Accept all groups
-	GroupPolicyAllowlist GroupPolicy = "allowlist"  // Only whitelisted groups
-	GroupPolicyDisabled  GroupPolicy = "disabled"   // No group messages
+	GroupPolicyAllowlist GroupPolicy = "allowlist" // Only whitelisted groups
+	GroupPolicyDisabled  GroupPolicy = "disabled"  // No group messages
 )
 
 // Channel type constants used across channel packages and gateway wiring.
 const (
-	TypeTelegram     = "telegram"
 	TypeDiscord      = "discord"
-	TypeSlack        = "slack"
+	TypeFacebook     = "facebook"
 	TypeFeishu       = "feishu"
+	TypePancake      = "pancake"
+	TypeSlack        = "slack"
+	TypeTelegram     = "telegram"
 	TypeWhatsApp     = "whatsapp"
 	TypeZaloOA       = "zalo_oa"
 	TypeZaloPersonal = "zalo_personal"
@@ -157,10 +173,20 @@ type BaseChannel struct {
 	channelType      string // platform type; defaults to name if unset
 	bus              *bus.MessageBus
 	running          bool
+	stateMu          sync.RWMutex
+	health           ChannelHealth
 	allowList        []string
-	agentID          string                 // for DB instances: routes to specific agent (empty = use resolveAgentRoute)
-	tenantID         uuid.UUID              // for DB instances: tenant scope (zero = master tenant fallback)
+	agentID          string                  // for DB instances: routes to specific agent (empty = use resolveAgentRoute)
+	tenantID         uuid.UUID               // for DB instances: tenant scope (zero = master tenant fallback)
 	contactCollector *store.ContactCollector // optional: auto-collect contacts from channel messages
+
+	// Shared policy + pairing fields (set via setters after construction).
+	pairingService  store.PairingStore
+	groupHistory    *PendingHistory
+	historyLimit    int
+	approvedGroups  sync.Map // chatID → true (in-memory cache for paired group approval)
+	pairingDebounce sync.Map // senderID → time.Time (debounce pairing reply sends)
+	requireMention  bool
 }
 
 // NewBaseChannel creates a new BaseChannel with the given parameters.
@@ -168,6 +194,7 @@ func NewBaseChannel(name string, msgBus *bus.MessageBus, allowList []string) *Ba
 	return &BaseChannel{
 		name:      name,
 		bus:       msgBus,
+		health:    NewChannelHealthForType(name, ChannelHealthStateRegistered, "Configured", "", ChannelFailureKindUnknown, false),
 		allowList: allowList,
 	}
 }
@@ -207,11 +234,267 @@ func (c *BaseChannel) SetContactCollector(cc *store.ContactCollector) { c.contac
 // ContactCollector returns the contact collector (may be nil).
 func (c *BaseChannel) ContactCollector() *store.ContactCollector { return c.contactCollector }
 
+// SetPairingService sets the pairing store used for policy checks and code generation.
+func (c *BaseChannel) SetPairingService(ps store.PairingStore) { c.pairingService = ps }
+
+// PairingService returns the configured pairing store (may be nil).
+func (c *BaseChannel) PairingService() store.PairingStore { return c.pairingService }
+
+// SetGroupHistory sets the pending group history tracker.
+func (c *BaseChannel) SetGroupHistory(gh *PendingHistory) { c.groupHistory = gh }
+
+// GroupHistory returns the pending group history tracker (may be nil).
+func (c *BaseChannel) GroupHistory() *PendingHistory { return c.groupHistory }
+
+// SetHistoryLimit sets the per-group message accumulation limit.
+func (c *BaseChannel) SetHistoryLimit(n int) { c.historyLimit = n }
+
+// HistoryLimit returns the per-group message accumulation limit.
+func (c *BaseChannel) HistoryLimit() int { return c.historyLimit }
+
+// SetRequireMention sets whether @mention is required in group chats.
+func (c *BaseChannel) SetRequireMention(b bool) { c.requireMention = b }
+
+// RequireMention returns whether @mention is required in group chats.
+func (c *BaseChannel) RequireMention() bool { return c.requireMention }
+
+// IsGroupApproved returns true if the group was already approved via pairing.
+func (c *BaseChannel) IsGroupApproved(chatID string) bool {
+	_, ok := c.approvedGroups.Load(chatID)
+	return ok
+}
+
+// MarkGroupApproved caches a group as approved so future messages skip DB lookups.
+func (c *BaseChannel) MarkGroupApproved(chatID string) {
+	c.approvedGroups.Store(chatID, true)
+}
+
+// ClearGroupApproval removes a group from the approval cache.
+func (c *BaseChannel) ClearGroupApproval(chatID string) {
+	c.approvedGroups.Delete(chatID)
+}
+
+// CanSendPairingNotif returns true if debounce period has elapsed for senderID.
+// debounce is the minimum interval between pairing replies to the same sender.
+func (c *BaseChannel) CanSendPairingNotif(senderID string, debounce time.Duration) bool {
+	if lastSent, ok := c.pairingDebounce.Load(senderID); ok {
+		if time.Since(lastSent.(time.Time)) < debounce {
+			return false
+		}
+	}
+	return true
+}
+
+// MarkPairingNotifSent records the current time for senderID debounce tracking.
+func (c *BaseChannel) MarkPairingNotifSent(senderID string) {
+	c.pairingDebounce.Store(senderID, time.Now())
+}
+
+// ClearPairingDebounce removes the debounce entry for a sender, allowing immediate pairing reply.
+func (c *BaseChannel) ClearPairingDebounce(senderID string) {
+	c.pairingDebounce.Delete(senderID)
+}
+
+// CheckDMPolicy evaluates the DM policy for senderID.
+// dmPolicy is one of: "pairing" (default), "open", "allowlist", "disabled".
+// Returns PolicyAllow, PolicyDeny, or PolicyNeedsPairing.
+// When PolicyNeedsPairing is returned, the caller should use its platform-specific
+// pairing reply mechanism (BaseChannel has no knowledge of transport).
+func (c *BaseChannel) CheckDMPolicy(ctx context.Context, senderID, dmPolicy string) PolicyResult {
+	if dmPolicy == "" {
+		dmPolicy = "pairing"
+	}
+	switch dmPolicy {
+	case "disabled":
+		return PolicyDeny
+	case "open":
+		return PolicyAllow
+	case "allowlist":
+		if c.IsAllowed(senderID) {
+			return PolicyAllow
+		}
+		return PolicyDeny
+	default: // "pairing"
+		if c.HasAllowList() && c.IsAllowed(senderID) {
+			return PolicyAllow
+		}
+		if c.pairingService != nil {
+			paired, err := c.pairingService.IsPaired(ctx, senderID, c.name)
+			if err != nil {
+				slog.Warn("security.pairing_check_failed, assuming paired (fail-open)",
+					"sender_id", senderID, "channel", c.name, "error", err)
+				return PolicyAllow
+			}
+			if paired {
+				return PolicyAllow
+			}
+		}
+		return PolicyNeedsPairing
+	}
+}
+
+// CheckGroupPolicy evaluates the group policy for a message.
+// groupPolicy is one of: "open" (default), "allowlist", "disabled", "pairing".
+// chatID is the group chat identifier used for approval caching.
+// Returns PolicyAllow, PolicyDeny, or PolicyNeedsPairing.
+func (c *BaseChannel) CheckGroupPolicy(ctx context.Context, senderID, chatID, groupPolicy string) PolicyResult {
+	if groupPolicy == "" {
+		groupPolicy = "open"
+	}
+	switch groupPolicy {
+	case "disabled":
+		return PolicyDeny
+	case "allowlist":
+		if c.IsAllowed(senderID) {
+			return PolicyAllow
+		}
+		return PolicyDeny
+	case "pairing":
+		if c.HasAllowList() && c.IsAllowed(senderID) {
+			return PolicyAllow
+		}
+		if c.IsGroupApproved(chatID) {
+			return PolicyAllow
+		}
+		groupSenderID := "group:" + chatID
+		if c.pairingService != nil {
+			paired, err := c.pairingService.IsPaired(ctx, groupSenderID, c.name)
+			if err != nil {
+				slog.Warn("security.pairing_check_failed, assuming paired (fail-open)",
+					"group_sender", groupSenderID, "channel", c.name, "error", err)
+				return PolicyAllow
+			}
+			if paired {
+				c.MarkGroupApproved(chatID)
+				return PolicyAllow
+			}
+		}
+		return PolicyNeedsPairing
+	default: // "open"
+		return PolicyAllow
+	}
+}
+
 // IsRunning returns whether the channel is running.
-func (c *BaseChannel) IsRunning() bool { return c.running }
+func (c *BaseChannel) IsRunning() bool {
+	c.stateMu.RLock()
+	defer c.stateMu.RUnlock()
+	return c.running
+}
 
 // SetRunning updates the running state.
-func (c *BaseChannel) SetRunning(running bool) { c.running = running }
+func (c *BaseChannel) SetRunning(running bool) {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+
+	next := c.health
+	next.ChannelType = c.Type()
+	next.Running = running
+	switch {
+	case running && (next.State == "" ||
+		next.State == ChannelHealthStateRegistered ||
+		next.State == ChannelHealthStateStarting ||
+		next.State == ChannelHealthStateStopped):
+		next.State = ChannelHealthStateHealthy
+		if next.Summary == "" ||
+			next.Summary == "Configured" ||
+			next.Summary == "Starting" ||
+			next.Summary == "Stopped" {
+			next.Summary = "Connected"
+		}
+		next.Detail = ""
+		next.FailureKind = ChannelFailureKindUnknown
+		next.Retryable = false
+		next.CheckedAt = time.Now().UTC()
+	case !running && next.State == ChannelHealthStateHealthy:
+		next.State = ChannelHealthStateStopped
+		next.Summary = "Stopped"
+		next.Detail = ""
+		next.FailureKind = ChannelFailureKindUnknown
+		next.Retryable = false
+		next.CheckedAt = time.Now().UTC()
+	default:
+		c.running = running
+		c.health.Running = running
+		return
+	}
+
+	next = mergeChannelHealth(c.health, next)
+	next.Running = running
+	c.running = running
+	c.health = next
+}
+
+// HealthSnapshot returns the current runtime health snapshot for the channel.
+func (c *BaseChannel) HealthSnapshot() ChannelHealth {
+	c.stateMu.RLock()
+	defer c.stateMu.RUnlock()
+
+	snapshot := c.health
+	snapshot.ChannelType = c.Type()
+	snapshot.Enabled = true
+	snapshot.Running = c.running
+	return snapshot
+}
+
+// MarkRegistered records that the channel was configured and registered successfully.
+func (c *BaseChannel) MarkRegistered(summary string) {
+	if summary == "" {
+		summary = "Configured"
+	}
+	c.setHealth(NewChannelHealth(ChannelHealthStateRegistered, summary, "", ChannelFailureKindUnknown, false))
+}
+
+// MarkStarting records that the channel is in startup validation / connection setup.
+func (c *BaseChannel) MarkStarting(summary string) {
+	if summary == "" {
+		summary = "Starting"
+	}
+	c.setHealth(NewChannelHealth(ChannelHealthStateStarting, summary, "", ChannelFailureKindUnknown, true))
+}
+
+// MarkHealthy records a healthy connected state.
+func (c *BaseChannel) MarkHealthy(summary string) {
+	if summary == "" {
+		summary = "Connected"
+	}
+	c.setHealth(NewChannelHealth(ChannelHealthStateHealthy, summary, "", ChannelFailureKindUnknown, false))
+}
+
+// MarkDegraded records a non-fatal warning state.
+func (c *BaseChannel) MarkDegraded(summary, detail string, kind ChannelFailureKind, retryable bool) {
+	if summary == "" {
+		summary = "Running with warnings"
+	}
+	c.setHealth(NewChannelHealth(ChannelHealthStateDegraded, summary, detail, kind, retryable))
+}
+
+// MarkFailed records a startup or runtime failure.
+func (c *BaseChannel) MarkFailed(summary, detail string, kind ChannelFailureKind, retryable bool) {
+	if summary == "" {
+		summary = "Channel failed"
+	}
+	c.setHealth(NewChannelHealth(ChannelHealthStateFailed, summary, detail, kind, retryable))
+}
+
+// MarkStopped records a cleanly stopped state.
+func (c *BaseChannel) MarkStopped(summary string) {
+	if summary == "" {
+		summary = "Stopped"
+	}
+	c.setHealth(NewChannelHealth(ChannelHealthStateStopped, summary, "", ChannelFailureKindUnknown, false))
+}
+
+func (c *BaseChannel) setHealth(snapshot ChannelHealth) {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+
+	snapshot.ChannelType = c.Type()
+	snapshot = mergeChannelHealth(c.health, snapshot)
+	snapshot.Running = snapshot.State == ChannelHealthStateHealthy || snapshot.State == ChannelHealthStateDegraded
+	c.running = snapshot.Running
+	c.health = snapshot
+}
 
 // Bus returns the message bus reference.
 func (c *BaseChannel) Bus() *bus.MessageBus { return c.bus }
@@ -313,8 +596,8 @@ func (c *BaseChannel) HandleMessage(senderID, chatID, content string, media []st
 		return
 	}
 
-	// Derive userID from senderID: strip "|username" suffix if present (Telegram format).
-	// For most channels, senderID == userID (platform user ID).
+	// Derive userID from senderID: strip "|username" suffix if present (legacy Slack compound format).
+	// All channels now pass plain senderID; kept for backward compat with stored compound IDs.
 	userID := senderID
 	if idx := strings.IndexByte(senderID, '|'); idx > 0 {
 		userID = senderID[:idx]

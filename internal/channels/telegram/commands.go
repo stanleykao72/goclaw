@@ -85,6 +85,7 @@ func (c *Channel) handleBotCommand(ctx context.Context, message *telego.Message,
 			"/stopall — Stop all running tasks\n" +
 			"/reset — Reset conversation history\n" +
 			"/status — Show bot status\n" +
+			"/reactions — Show reaction emoji legend\n" +
 			"/tasks — List team tasks\n" +
 			"/task_detail <id> — View task detail\n" +
 			"/subagents — List subagent tasks\n" +
@@ -105,7 +106,7 @@ func (c *Channel) handleBotCommand(ctx context.Context, message *telego.Message,
 			if err == nil {
 				groupID := fmt.Sprintf("group:%s:%s", c.Name(), chatIDStr)
 				senderNumericID := strings.SplitN(senderID, "|", 2)[0]
-				isWriter, err := c.configPermStore.CheckPermission(ctx, agentID, groupID, "file_writer", senderNumericID)
+				isWriter, err := c.configPermStore.CheckPermission(ctx, agentID, groupID, store.ConfigTypeFileWriter, senderNumericID)
 				if err != nil {
 					slog.Warn("security.reset_writer_check_failed", "error", err, "sender", senderNumericID)
 					// fail-open: allow reset if DB check fails
@@ -226,8 +227,19 @@ func (c *Channel) handleBotCommand(ctx context.Context, message *telego.Message,
 	case "/writers":
 		c.handleListWriters(ctx, chatID, chatIDStr, isGroup, setThread)
 		return true
+
+	case "/reactions":
+		var lines strings.Builder
+		for _, r := range reactionLegend {
+			lines.WriteString(fmt.Sprintf("%s  %s\n", r.Emoji, r.Desc))
+		}
+		reactText := fmt.Sprintf("<b>Reaction Emoji Legend</b>\n\n<pre>%s</pre>\nReaction level: <b>%s</b>", lines.String(), c.config.ReactionLevel)
+		msg := tu.Message(chatIDObj, reactText)
+		msg.ParseMode = telego.ModeHTML
+		setThread(msg)
+		c.bot.SendMessage(ctx, msg)
+		return true
 	}
 
 	return false
 }
-

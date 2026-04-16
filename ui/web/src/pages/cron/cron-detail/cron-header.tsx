@@ -1,5 +1,5 @@
 import { useTranslation } from "react-i18next";
-import { ArrowLeft, Clock, Loader2, Play, Power, Settings, Trash2 } from "lucide-react";
+import { ArrowLeft, Clock, Loader2, Play, Power, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
@@ -13,13 +13,12 @@ interface CronHeaderProps {
   isRunning: boolean;
   onBack: () => void;
   onRun: () => void;
-  onAdvanced: () => void;
   onToggle: () => void;
   onDelete: () => void;
 }
 
 
-export function CronHeader({ job, isRunning, onBack, onRun, onAdvanced, onToggle, onDelete }: CronHeaderProps) {
+export function CronHeader({ job, isRunning, onBack, onRun, onToggle, onDelete }: CronHeaderProps) {
   const { t } = useTranslation("cron");
   const { agents } = useAgents();
   const agent = job.agentId ? agents.find((a) => a.id === job.agentId) : null;
@@ -41,7 +40,7 @@ export function CronHeader({ job, isRunning, onBack, onRun, onAdvanced, onToggle
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-1.5 flex-wrap">
             <h2 className="truncate text-base font-semibold">{job.name}</h2>
-            <Badge variant={job.enabled ? "success" : "secondary"} className="text-[10px]">
+            <Badge variant={job.enabled ? "success" : "secondary"} className="text-2xs">
               {job.enabled ? t("detail.enabled") : t("detail.disabled")}
             </Badge>
             <Tooltip>
@@ -59,13 +58,13 @@ export function CronHeader({ job, isRunning, onBack, onRun, onAdvanced, onToggle
             </Tooltip>
           </div>
           <div className="flex items-center gap-1.5 text-xs text-muted-foreground mt-0.5">
-            <Badge variant="outline" className="text-[10px]">{job.schedule.kind}</Badge>
+            <Badge variant="outline" className="text-2xs">{job.schedule.kind}</Badge>
             <span className="text-border">·</span>
             <span>{formatSchedule(job)}</span>
             {job.agentId && (
               <>
                 <span className="text-border">·</span>
-                <span className="text-[11px]">{agentLabel}</span>
+                <span className="text-xs-plus">{agentLabel}</span>
               </>
             )}
           </div>
@@ -98,17 +97,6 @@ export function CronHeader({ job, isRunning, onBack, onRun, onAdvanced, onToggle
             {job.enabled ? t("detail.disable") : t("detail.enable")}
           </span>
           <Power className="h-4 w-4 sm:hidden" />
-        </Button>
-
-        {/* Advanced */}
-        <Button
-          variant="ghost"
-          size="sm"
-          onClick={onAdvanced}
-          className="shrink-0 gap-1.5 size-9 sm:w-auto sm:px-3"
-        >
-          <Settings className="h-4 w-4" />
-          <span className="hidden sm:inline">{t("detail.advanced")}</span>
         </Button>
 
         {/* Delete */}

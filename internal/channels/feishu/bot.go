@@ -20,8 +20,9 @@ type messageContext struct {
 	Content     string
 	ContentType string // "text", "post", "image", etc.
 	MentionedBot bool
-	RootID      string // thread root message ID
-	ParentID    string // parent message ID
+	RootID      string // reply-chain root (populated on ANY reply, incl. plain quote reply)
+	ParentID    string // direct parent in reply chain
+	ThreadID    string // set ONLY when message is inside an actual topic thread
 	Mentions    []mentionInfo
 }
 
@@ -57,6 +58,15 @@ func (c *Channel) handleMessageEvent(ctx context.Context, event *MessageEvent) {
 		return
 	}
 
+	// 2a. Slash commands in DMs are rejected early with a clear hint so
+	// they never reach the agent pipeline (otherwise users typing
+	// "/addwriter" in a DM would waste an LLM turn). The full writer
+	// command router is gated behind group policy below at step 5a.
+	if mc.ChatType != "group" && c.isWriterSlashCommand(mc) {
+		c.sendCommandReply(ctx, mc, "This command only works in group chats.")
+		return
+	}
+
 	// 3. Resolve sender name (cached)
 	senderName := c.resolveSenderName(ctx, mc.SenderID)
 
@@ -85,6 +95,13 @@ func (c *Channel) handleMessageEvent(ctx context.Context, event *MessageEvent) {
 			return
 		}
 
+		// 5a. Writer management slash commands run AFTER the group policy
+		// gate so commands cannot bypass allowlists or pairing. Commands
+		// short-circuit the agent pipeline to avoid consuming LLM tokens.
+		if c.maybeHandleWriterCommand(ctx, mc) {
+			return
+		}
+
 		// 6. RequireMention check — record to history if not mentioned
 		requireMention := true
 		if c.cfg.RequireMention != nil {
@@ -95,18 +112,18 @@ func (c *Channel) handleMessageEvent(ctx context.Context, event *MessageEvent) {
 			if mc.RootID != "" && c.cfg.TopicSessionMode == "enabled" {
 				historyKey = fmt.Sprintf("%s:topic:%s", mc.ChatID, mc.RootID)
 			}
-			c.groupHistory.Record(historyKey, channels.HistoryEntry{
+			c.GroupHistory().Record(historyKey, channels.HistoryEntry{
 				Sender:    senderName,
 				SenderID:  mc.SenderID,
 				Body:      mc.Content,
 				Media:     earlyMediaPaths,
 				Timestamp: time.Now(),
 				MessageID: messageID,
-			}, c.historyLimit)
+			}, c.HistoryLimit())
 
 			// Collect contact even when bot is not mentioned (cache prevents DB spam).
 			if cc := c.ContactCollector(); cc != nil {
-				cc.EnsureContact(ctx, c.Type(), c.Name(), mc.SenderID, mc.SenderID, senderName, "", "group", "user")
+				cc.EnsureContact(ctx, c.Type(), c.Name(), mc.SenderID, mc.SenderID, senderName, "", "group", "user", "", "")
 			}
 
 			slog.Debug("feishu group message recorded (no mention)",
@@ -129,7 +146,18 @@ func (c *Channel) handleMessageEvent(ctx context.Context, event *MessageEvent) {
 		content = "[empty message]"
 	}
 
-	// 7b. Fetch reply context + media if this is a reply to another message
+	// 7a. Lark doc auto-fetch: expand any docx URLs in the message body into
+	// inline context blocks so the agent can read linked docs without a tool
+	// call. Cached per channel for the TTL window. Missing permission / dead
+	// links fail soft with a marker string.
+	content = c.resolveLarkDocs(ctx, content)
+
+	// 7b. Fetch reply context + media if this is a reply to another message.
+	// We intentionally do NOT recurse into resolveLarkDocs for the parent
+	// message body — expanding doc URLs in older messages would bloat the
+	// prompt unpredictably (one quote reply could drag in multiple docs the
+	// user never intended to reference). Users must include the doc URL in
+	// their own new message to get auto-fetch behavior.
 	var replyMediaList []media.MediaInfo
 	if mc.ParentID != "" {
 		replyCtx, replyMedia := c.fetchReplyContext(ctx, mc.ParentID)
@@ -162,16 +190,32 @@ func (c *Channel) handleMessageEvent(ctx context.Context, event *MessageEvent) {
 
 	// Collect contact for processed messages (DM + group-mentioned).
 	if cc := c.ContactCollector(); cc != nil {
-		cc.EnsureContact(ctx, c.Type(), c.Name(), mc.SenderID, mc.SenderID, senderName, "", peerKind, "user")
+		cc.EnsureContact(ctx, c.Type(), c.Name(), mc.SenderID, mc.SenderID, senderName, "", peerKind, "user", "", "")
 	}
 
 	metadata := map[string]string{
 		"message_id":    messageID,
 		"chat_type":     mc.ChatType,
 		"sender_name":   senderName,
-		"display_name":  senderName,
+		"display_name":  channels.SanitizeDisplayName(senderName),
 		"mentioned_bot": fmt.Sprintf("%t", mc.MentionedBot),
 		"platform":      channels.TypeFeishu,
+	}
+
+	// Thread routing: stamp the triggering message ID ONLY when the inbound
+	// message is inside an actual topic thread (thread_id present per Lark
+	// docs). We deliberately do NOT fire on mc.RootID — Lark populates root_id
+	// on every reply including plain quote replies outside any thread, and
+	// routing those through the reply endpoint would silently promote them to
+	// new threads. thread_id is the definitive signal.
+	//
+	// Outbound Send() reads this key and, when non-empty, routes to the Lark
+	// reply endpoint with reply_in_thread=true so the bot response lands
+	// inside the same thread. Absent on non-thread messages — preserves
+	// existing new-message endpoint behavior for DMs, plain groups, and quote
+	// replies.
+	if mc.ThreadID != "" {
+		metadata["feishu_reply_target_id"] = messageID
 	}
 
 	if sender != nil {
@@ -182,8 +226,8 @@ func (c *Channel) handleMessageEvent(ctx context.Context, event *MessageEvent) {
 	if senderName != "" {
 		if mc.ChatType == "group" {
 			annotated := fmt.Sprintf("[From: %s]\n%s", senderName, content)
-			if c.historyLimit > 0 {
-				content = c.groupHistory.BuildContext(chatID, annotated, c.historyLimit)
+			if c.HistoryLimit() > 0 {
+				content = c.GroupHistory().BuildContext(chatID, annotated, c.HistoryLimit())
 			} else {
 				content = annotated
 			}
@@ -204,8 +248,8 @@ func (c *Channel) handleMessageEvent(ctx context.Context, event *MessageEvent) {
 
 	// 10b. Collect media from pending history (files downloaded by earlier non-mentioned messages).
 	var mediaFiles []bus.MediaFile
-	if mc.ChatType == "group" && c.historyLimit > 0 {
-		if histMediaPaths := c.groupHistory.CollectMedia(chatID); len(histMediaPaths) > 0 {
+	if mc.ChatType == "group" && c.HistoryLimit() > 0 {
+		if histMediaPaths := c.GroupHistory().CollectMedia(chatID); len(histMediaPaths) > 0 {
 			for _, p := range histMediaPaths {
 				mediaFiles = append(mediaFiles, bus.MediaFile{Path: p}) // cannot use append(slice, other...) — different types
 			}
@@ -290,14 +334,14 @@ func (c *Channel) handleMessageEvent(ctx context.Context, event *MessageEvent) {
 		PeerKind:     peerKind,
 		UserID:       userID,
 		AgentID:      targetAgentID,
-		HistoryLimit: c.historyLimit,
+		HistoryLimit: c.HistoryLimit(),
 		TenantID:     c.TenantID(),
 		Metadata:     metadata,
 	})
 
 	// Clear pending history after sending to agent.
 	if mc.ChatType == "group" {
-		c.groupHistory.Clear(chatID)
+		c.GroupHistory().Clear(chatID)
 	}
 }
 

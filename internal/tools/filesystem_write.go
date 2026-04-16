@@ -13,14 +13,22 @@ import (
 
 // WriteFileTool writes content to a file, optionally through a sandbox container.
 type WriteFileTool struct {
-	workspace        string
-	restrict         bool
-	deniedPrefixes   []string // path prefixes to deny access to (e.g. .goclaw)
-	sandboxMgr       sandbox.Manager
-	contextFileIntc  *ContextFileInterceptor // nil = no virtual FS routing
-	memIntc          *MemoryInterceptor      // nil = no memory routing
-	permStore     store.ConfigPermissionStore // nil = no group write restriction
-	workspaceIntc *WorkspaceInterceptor      // nil = no team workspace validation
+	workspace       string
+	restrict        bool
+	allowedPrefixes []string                    // extra allowed path prefixes (cross-drive on Windows)
+	deniedPrefixes  []string                    // path prefixes to deny access to (e.g. .goclaw)
+	sandboxMgr      sandbox.Manager
+	contextFileIntc *ContextFileInterceptor     // nil = no virtual FS routing
+	memIntc         *MemoryInterceptor          // nil = no memory routing
+	permStore       store.ConfigPermissionStore // nil = no group write restriction
+	workspaceIntc   *WorkspaceInterceptor       // nil = no team workspace validation
+	vaultIntc       *VaultInterceptor           // nil = no vault registration
+}
+
+// AllowPaths adds extra path prefixes that write_file is allowed to access
+// even when restrict_to_workspace is true (e.g. cross-drive on Windows).
+func (t *WriteFileTool) AllowPaths(prefixes ...string) {
+	t.allowedPrefixes = append(t.allowedPrefixes, prefixes...)
 }
 
 // DenyPaths adds path prefixes that write_file must reject.
@@ -46,6 +54,11 @@ func (t *WriteFileTool) SetConfigPermStore(s store.ConfigPermissionStore) {
 // SetWorkspaceInterceptor enables team workspace validation and event broadcasting.
 func (t *WriteFileTool) SetWorkspaceInterceptor(intc *WorkspaceInterceptor) {
 	t.workspaceIntc = intc
+}
+
+// SetVaultInterceptor enables vault document registration on file writes.
+func (t *WriteFileTool) SetVaultInterceptor(v *VaultInterceptor) {
+	t.vaultIntc = v
 }
 
 func NewWriteFileTool(workspace string, restrict bool) *WriteFileTool {
@@ -148,7 +161,7 @@ func (t *WriteFileTool) Execute(ctx context.Context, args map[string]any) *Resul
 	// Sandbox routing (sandboxKey from ctx — thread-safe)
 	sandboxKey := ToolSandboxKeyFromCtx(ctx)
 	if t.sandboxMgr != nil && sandboxKey != "" {
-		return t.executeInSandbox(ctx, path, content, sandboxKey, deliver)
+		return t.executeInSandbox(ctx, path, content, sandboxKey, deliver, appendMode)
 	}
 
 	// Host execution — use per-user workspace from context if available
@@ -156,7 +169,7 @@ func (t *WriteFileTool) Execute(ctx context.Context, args map[string]any) *Resul
 	if workspace == "" {
 		workspace = t.workspace
 	}
-	allowed := allowedWithTeamWorkspace(ctx, nil)
+	allowed := allowedWithTeamWorkspace(ctx, t.allowedPrefixes)
 	resolved, err := resolvePathWithAllowed(path, workspace, effectiveRestrict(ctx, t.restrict), allowed)
 	if err != nil {
 		return ErrorResult(err.Error())
@@ -202,6 +215,10 @@ func (t *WriteFileTool) Execute(ctx context.Context, args map[string]any) *Resul
 		t.workspaceIntc.AfterWrite(ctx, resolved, "write")
 	}
 
+	if t.vaultIntc != nil {
+		go t.vaultIntc.AfterWrite(context.WithoutCancel(ctx), resolved, content)
+	}
+
 	verb := "written"
 	if appendMode {
 		verb = "appended"
@@ -222,7 +239,7 @@ func (t *WriteFileTool) Execute(ctx context.Context, args map[string]any) *Resul
 	return result
 }
 
-func (t *WriteFileTool) executeInSandbox(ctx context.Context, path, content, sandboxKey string, deliver bool) *Result {
+func (t *WriteFileTool) executeInSandbox(ctx context.Context, path, content, sandboxKey string, deliver, appendMode bool) *Result {
 	bridge, err := t.getFsBridge(ctx, sandboxKey)
 	if err != nil {
 		return ErrorResult(fmt.Sprintf("sandbox error: %v", err))
@@ -234,11 +251,19 @@ func (t *WriteFileTool) executeInSandbox(ctx context.Context, path, content, san
 	}
 	containerPath := ResolveSandboxPath(path, containerCwd)
 
-	if err := bridge.WriteFile(ctx, containerPath, content); err != nil {
-		return ErrorResult(fmt.Sprintf("failed to write file: %v", err) + MaybeFsBridgeHint(err))
+	if err := bridge.WriteFile(ctx, containerPath, content, appendMode); err != nil {
+		verb := "write"
+		if appendMode {
+			verb = "append to"
+		}
+		return ErrorResult(fmt.Sprintf("failed to %s file: %v", verb, err) + MaybeFsBridgeHint(err))
 	}
 
-	msg := fmt.Sprintf("File written: %s (%d bytes)", path, len(content))
+	verb := "written"
+	if appendMode {
+		verb = "appended"
+	}
+	msg := fmt.Sprintf("File %s: %s (%d bytes)", verb, path, len(content))
 	if deliver {
 		msg += ". File will be automatically delivered to the user — do NOT send it again via message tool."
 	}

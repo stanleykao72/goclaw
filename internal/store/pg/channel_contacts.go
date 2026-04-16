@@ -23,23 +23,24 @@ func NewPGContactStore(db *sql.DB) *PGContactStore {
 	return &PGContactStore{db: db, resolveCache: newContactResolveCache()}
 }
 
-func (s *PGContactStore) UpsertContact(ctx context.Context, channelType, channelInstance, senderID, userID, displayName, username, peerKind, contactType string) error {
+func (s *PGContactStore) UpsertContact(ctx context.Context, channelType, channelInstance, senderID, userID, displayName, username, peerKind, contactType, threadID, threadType string) error {
 	tenantID := store.TenantIDFromContext(ctx)
 	if tenantID == uuid.Nil {
 		tenantID = store.MasterTenantID
 	}
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO channel_contacts (channel_type, channel_instance, sender_id, user_id, display_name, username, peer_kind, contact_type, tenant_id)
-		VALUES ($1, NULLIF($2,''), $3, NULLIF($4,''), NULLIF($5,''), NULLIF($6,''), NULLIF($7,''), $8, $9)
-		ON CONFLICT (tenant_id, channel_type, sender_id) DO UPDATE SET
+		INSERT INTO channel_contacts (channel_type, channel_instance, sender_id, user_id, display_name, username, peer_kind, contact_type, thread_id, thread_type, tenant_id)
+		VALUES ($1, NULLIF($2,''), $3, NULLIF($4,''), NULLIF($5,''), NULLIF($6,''), NULLIF($7,''), $8, NULLIF($9,''), NULLIF($10,''), $11)
+		ON CONFLICT (tenant_id, channel_type, sender_id, COALESCE(thread_id, '')) DO UPDATE SET
 			display_name     = COALESCE(NULLIF($5,''), channel_contacts.display_name),
 			username         = COALESCE(NULLIF($6,''), channel_contacts.username),
 			user_id          = COALESCE(NULLIF($4,''), channel_contacts.user_id),
 			channel_instance = COALESCE(NULLIF($2,''), channel_contacts.channel_instance),
 			peer_kind        = COALESCE(NULLIF($7,''), channel_contacts.peer_kind),
 			contact_type     = $8,
+			thread_type      = COALESCE(NULLIF($10,''), channel_contacts.thread_type),
 			last_seen_at     = NOW()`,
-		channelType, channelInstance, senderID, userID, displayName, username, peerKind, contactType, tenantID,
+		channelType, channelInstance, senderID, userID, displayName, username, peerKind, contactType, threadID, threadType, tenantID,
 	)
 	return err
 }
@@ -95,7 +96,7 @@ func (s *PGContactStore) ListContacts(ctx context.Context, opts store.ContactLis
 	where, args, argIdx := contactWhereClause(ctx, opts)
 
 	query := `SELECT id, channel_type, channel_instance, sender_id, user_id,
-		display_name, username, avatar_url, peer_kind, contact_type, merged_id,
+		display_name, username, avatar_url, peer_kind, contact_type, thread_id, thread_type, merged_id,
 		first_seen_at, last_seen_at
 		FROM channel_contacts` + where + " ORDER BY last_seen_at DESC"
 
@@ -123,7 +124,7 @@ func (s *PGContactStore) ListContacts(ctx context.Context, opts store.ContactLis
 		var c store.ChannelContact
 		if err := rows.Scan(
 			&c.ID, &c.ChannelType, &c.ChannelInstance, &c.SenderID, &c.UserID,
-			&c.DisplayName, &c.Username, &c.AvatarURL, &c.PeerKind, &c.ContactType, &c.MergedID,
+			&c.DisplayName, &c.Username, &c.AvatarURL, &c.PeerKind, &c.ContactType, &c.ThreadID, &c.ThreadType, &c.MergedID,
 			&c.FirstSeenAt, &c.LastSeenAt,
 		); err != nil {
 			return nil, err
@@ -154,7 +155,7 @@ func (s *PGContactStore) GetContactsBySenderIDs(ctx context.Context, senderIDs [
 
 	query := fmt.Sprintf(`SELECT DISTINCT ON (sender_id)
 		id, channel_type, channel_instance, sender_id, user_id,
-		display_name, username, avatar_url, peer_kind, contact_type, merged_id,
+		display_name, username, avatar_url, peer_kind, contact_type, thread_id, thread_type, merged_id,
 		first_seen_at, last_seen_at
 		FROM channel_contacts
 		WHERE sender_id IN (%s)
@@ -171,7 +172,7 @@ func (s *PGContactStore) GetContactsBySenderIDs(ctx context.Context, senderIDs [
 		var c store.ChannelContact
 		if err := rows.Scan(
 			&c.ID, &c.ChannelType, &c.ChannelInstance, &c.SenderID, &c.UserID,
-			&c.DisplayName, &c.Username, &c.AvatarURL, &c.PeerKind, &c.ContactType, &c.MergedID,
+			&c.DisplayName, &c.Username, &c.AvatarURL, &c.PeerKind, &c.ContactType, &c.ThreadID, &c.ThreadType, &c.MergedID,
 			&c.FirstSeenAt, &c.LastSeenAt,
 		); err != nil {
 			return nil, err
@@ -185,13 +186,15 @@ func (s *PGContactStore) GetContactByID(ctx context.Context, id uuid.UUID) (*sto
 	tid := store.TenantIDFromContext(ctx)
 	row := s.db.QueryRowContext(ctx,
 		`SELECT id, channel_type, channel_instance, sender_id, user_id,
-			display_name, username, avatar_url, peer_kind, merged_id,
+			display_name, username, avatar_url, peer_kind, contact_type,
+			thread_id, thread_type, merged_id,
 			first_seen_at, last_seen_at
 		FROM channel_contacts WHERE id = $1 AND tenant_id = $2`, id, tid)
 	var c store.ChannelContact
 	if err := row.Scan(
 		&c.ID, &c.ChannelType, &c.ChannelInstance, &c.SenderID, &c.UserID,
-		&c.DisplayName, &c.Username, &c.AvatarURL, &c.PeerKind, &c.MergedID,
+		&c.DisplayName, &c.Username, &c.AvatarURL, &c.PeerKind, &c.ContactType,
+		&c.ThreadID, &c.ThreadType, &c.MergedID,
 		&c.FirstSeenAt, &c.LastSeenAt,
 	); err != nil {
 		return nil, err
@@ -286,7 +289,7 @@ func (s *PGContactStore) GetContactsByMergedID(ctx context.Context, mergedID uui
 	tid := store.TenantIDFromContext(ctx)
 
 	q := `SELECT id, channel_type, channel_instance, sender_id, user_id,
-		display_name, username, avatar_url, peer_kind, contact_type, merged_id,
+		display_name, username, avatar_url, peer_kind, contact_type, thread_id, thread_type, merged_id,
 		first_seen_at, last_seen_at
 		FROM channel_contacts WHERE merged_id = $1 AND tenant_id = $2
 		ORDER BY last_seen_at DESC`
@@ -302,7 +305,7 @@ func (s *PGContactStore) GetContactsByMergedID(ctx context.Context, mergedID uui
 		var c store.ChannelContact
 		if err := rows.Scan(
 			&c.ID, &c.ChannelType, &c.ChannelInstance, &c.SenderID, &c.UserID,
-			&c.DisplayName, &c.Username, &c.AvatarURL, &c.PeerKind, &c.ContactType, &c.MergedID,
+			&c.DisplayName, &c.Username, &c.AvatarURL, &c.PeerKind, &c.ContactType, &c.ThreadID, &c.ThreadType, &c.MergedID,
 			&c.FirstSeenAt, &c.LastSeenAt,
 		); err != nil {
 			return nil, err

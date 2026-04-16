@@ -19,8 +19,6 @@ interface SummoningModalProps {
   onResummon: (agentId: string) => Promise<void>;
   hideClose?: boolean;
   onContinue?: () => void;
-  /** "summon" (default) shows summoning language; "regenerate" shows edit-with-AI language */
-  mode?: "summon" | "regenerate";
 }
 
 const SUMMONING_FILES = [
@@ -37,9 +35,7 @@ export function SummoningModal({
   onResummon,
   hideClose = false,
   onContinue,
-  mode = "summon",
 }: SummoningModalProps) {
-  const isRegenerate = mode === "regenerate";
   const { t } = useTranslation("agents");
   const [generatedFiles, setGeneratedFiles] = useState<string[]>([]);
   const [status, setStatus] = useState<"summoning" | "completed" | "failed">("summoning");
@@ -124,10 +120,10 @@ export function SummoningModal({
         <DialogHeader>
           <DialogTitle className="text-center">
             {status === "completed"
-              ? t(isRegenerate ? "summoning.regenerateCompleted" : "summoning.completed")
+              ? t("summoning.completed")
               : status === "failed"
-                ? t(isRegenerate ? "summoning.regenerateFailed" : "summoning.failed")
-                : t(isRegenerate ? "summoning.regenerateTitle" : "summoning.title")}
+                ? t("summoning.failed")
+                : t("summoning.title")}
           </DialogTitle>
         </DialogHeader>
 
@@ -169,7 +165,7 @@ export function SummoningModal({
                   : { duration: 0.5 }
               }
             >
-              {status === "completed" ? "\u2728" : status === "failed" ? "\u{1F4A8}" : isRegenerate ? "\u270F\uFE0F" : "\u{1FA84}"}
+              {status === "completed" ? "\u2728" : status === "failed" ? "\u{1F4A8}" : "\u{1FA84}"}
             </motion.div>
           </div>
 
@@ -184,7 +180,7 @@ export function SummoningModal({
                 {errorMsg || t("summoning.failed")}
               </span>
             ) : (
-              <>{t(isRegenerate ? "summoning.regenerateWeavingSoul" : "summoning.weavingSoul")} <span className="font-semibold text-foreground">{agentName}</span>...</>
+              <>{t("summoning.weavingSoul")} <span className="font-semibold text-foreground">{agentName}</span>...</>
             )}
           </p>
 
@@ -235,7 +231,7 @@ export function SummoningModal({
 
           {status === "summoning" && (
             <p className="text-center text-xs text-muted-foreground tabular-nums">
-              {t(isRegenerate ? "summoning.regenerateWait" : "summoning.wait")} ({Math.floor(elapsed / 60)}:{String(elapsed % 60).padStart(2, "0")})
+              {t("summoning.wait")} ({Math.floor(elapsed / 60)}:{String(elapsed % 60).padStart(2, "0")})
             </p>
           )}
 

@@ -321,7 +321,7 @@ func (h *ChannelInstancesHandler) handleWriterGroups(w http.ResponseWriter, r *h
 	if !ok {
 		return
 	}
-	perms, err := h.configPermStore.List(r.Context(), agentID, "file_writer", "")
+	perms, err := h.configPermStore.List(r.Context(), agentID, store.ConfigTypeFileWriter, "")
 	if err != nil {
 		slog.Error("channel_instances.writer_groups", "error", err)
 		locale := store.LocaleFromContext(r.Context())
@@ -357,7 +357,7 @@ func (h *ChannelInstancesHandler) handleListWriters(w http.ResponseWriter, r *ht
 		writeError(w, http.StatusBadRequest, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgRequired, "group_id"))
 		return
 	}
-	perms, err := h.configPermStore.List(r.Context(), agentID, "file_writer", groupID)
+	perms, err := h.configPermStore.List(r.Context(), agentID, store.ConfigTypeFileWriter, groupID)
 	if err != nil {
 		slog.Error("channel_instances.list_writers", "error", err)
 		writeError(w, http.StatusInternalServerError, protocol.ErrInternal, i18n.T(locale, i18n.MsgFailedToList, "writers"))
@@ -415,7 +415,7 @@ func (h *ChannelInstancesHandler) handleAddWriter(w http.ResponseWriter, r *http
 	if err := h.configPermStore.Grant(r.Context(), &store.ConfigPermission{
 		AgentID:    agentID,
 		Scope:      body.GroupID,
-		ConfigType: "file_writer",
+		ConfigType: store.ConfigTypeFileWriter,
 		UserID:     body.UserID,
 		Permission: "allow",
 		Metadata:   meta,
@@ -440,7 +440,7 @@ func (h *ChannelInstancesHandler) handleRemoveWriter(w http.ResponseWriter, r *h
 		return
 	}
 	// Prevent removing the last writer (same guard as Telegram /removewriter)
-	writers, _ := h.configPermStore.List(r.Context(), agentID, "file_writer", groupID)
+	writers, _ := h.configPermStore.List(r.Context(), agentID, store.ConfigTypeFileWriter, groupID)
 	allowCount := 0
 	for _, p := range writers {
 		if p.Permission == "allow" {
@@ -451,7 +451,7 @@ func (h *ChannelInstancesHandler) handleRemoveWriter(w http.ResponseWriter, r *h
 		writeError(w, http.StatusConflict, protocol.ErrFailedPrecondition, i18n.T(locale, i18n.MsgCannotRemoveLastWriter))
 		return
 	}
-	if err := h.configPermStore.Revoke(r.Context(), agentID, groupID, "file_writer", userID); err != nil {
+	if err := h.configPermStore.Revoke(r.Context(), agentID, groupID, store.ConfigTypeFileWriter, userID); err != nil {
 		slog.Error("channel_instances.remove_writer", "error", err)
 		writeError(w, http.StatusInternalServerError, protocol.ErrInternal, i18n.T(locale, i18n.MsgFailedToDelete, "writer", "internal error"))
 		return
@@ -540,7 +540,7 @@ func (h *ChannelInstancesHandler) handleResolveContacts(w http.ResponseWriter, r
 // isValidChannelType checks if the channel type is supported.
 func isValidChannelType(ct string) bool {
 	switch ct {
-	case "telegram", "discord", "slack", "whatsapp", "zalo_oa", "zalo_personal", "feishu", "line":
+	case "telegram", "discord", "slack", "whatsapp", "zalo_oa", "zalo_personal", "feishu", "line", "facebook", "pancake":
 		return true
 	}
 	return false

@@ -24,6 +24,50 @@ export interface CompactionConfig {
   }
 }
 
+export interface ContextPruningConfig {
+  mode?: 'off' | 'cache-ttl'
+  keepLastAssistants?: number
+  softTrimRatio?: number
+  hardClearRatio?: number
+  softTrim?: { maxChars?: number; headChars?: number; tailChars?: number }
+  hardClear?: { enabled?: boolean }
+}
+
+export interface SubagentsConfig {
+  maxConcurrent?: number
+  maxSpawnDepth?: number
+  maxChildrenPerAgent?: number
+  archiveAfterMinutes?: number
+  model?: string
+}
+
+export interface ToolPolicyConfig {
+  profile?: string
+  allow?: string[]
+  deny?: string[]
+  alsoAllow?: string[]
+  toolCallPrefix?: string
+}
+
+export interface SandboxConfig {
+  mode?: 'off' | 'non-main' | 'all'
+  image?: string
+  workspace_access?: 'none' | 'ro' | 'rw'
+  scope?: 'session' | 'agent' | 'shared'
+  timeout_sec?: number
+  memory_mb?: number
+  cpus?: number
+  network_enabled?: boolean
+}
+
+export type ReasoningOverrideMode = 'inherit' | 'custom'
+
+export interface AgentReasoningConfig {
+  override_mode?: ReasoningOverrideMode
+  effort?: string
+  fallback?: 'downgrade' | 'provider_default' | 'off'
+}
+
 // --- Main agent data ---
 
 export interface AgentData {
@@ -44,9 +88,22 @@ export interface AgentData {
   created_at?: string
   updated_at?: string
 
+  // Promoted fields (formerly in other_config, migration 000037 v3)
+  emoji?: string | null
+  agent_description?: string | null
+  thinking_level?: string | null
+  self_evolve?: boolean | null
+  skill_evolve?: boolean | null
+  skill_nudge_interval?: number | null
+  reasoning_config?: AgentReasoningConfig | null
+
   // Per-agent JSONB configs (null/undefined = use global defaults)
   memory_config?: MemoryConfig | null
   compaction_config?: CompactionConfig | null
+  context_pruning?: ContextPruningConfig | null
+  tools_config?: ToolPolicyConfig | null
+  sandbox_config?: SandboxConfig | null
+  subagents_config?: SubagentsConfig | null
   other_config?: Record<string, unknown> | null
   tenant_id?: string
 }
@@ -60,6 +117,14 @@ export interface AgentInput {
   is_default?: boolean
   context_window?: number
   max_tool_iterations?: number
+  // Promoted fields
+  emoji?: string | null
+  agent_description?: string | null
+  self_evolve?: boolean
+  thinking_level?: string | null
+  reasoning_config?: AgentReasoningConfig | null
+  skill_evolve?: boolean | null
+  skill_nudge_interval?: number | null
   memory_config?: MemoryConfig | null
   other_config?: Record<string, unknown>
 }

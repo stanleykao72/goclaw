@@ -27,6 +27,7 @@ import enMcp from "./locales/en/mcp.json";
 import enTts from "./locales/en/tts.json";
 import enSetup from "./locales/en/setup.json";
 import enMemory from "./locales/en/memory.json";
+import enVault from "./locales/en/vault.json";
 import enStorage from "./locales/en/storage.json";
 import enPendingMessages from "./locales/en/pending-messages.json";
 import enContacts from "./locales/en/contacts.json";
@@ -37,6 +38,8 @@ import enPackages from "./locales/en/packages.json";
 import enTenants from "./locales/en/tenants.json";
 import enSystemSettings from "./locales/en/system-settings.json";
 import enImportExport from "./locales/en/import-export.json";
+import enV3Capabilities from "./locales/en/v3-capabilities.json";
+import enBackup from "./locales/en/backup.json";
 
 // --- VI namespaces ---
 import viCommon from "./locales/vi/common.json";
@@ -64,6 +67,7 @@ import viMcp from "./locales/vi/mcp.json";
 import viTts from "./locales/vi/tts.json";
 import viSetup from "./locales/vi/setup.json";
 import viMemory from "./locales/vi/memory.json";
+import viVault from "./locales/vi/vault.json";
 import viStorage from "./locales/vi/storage.json";
 import viPendingMessages from "./locales/vi/pending-messages.json";
 import viContacts from "./locales/vi/contacts.json";
@@ -74,6 +78,8 @@ import viPackages from "./locales/vi/packages.json";
 import viTenants from "./locales/vi/tenants.json";
 import viSystemSettings from "./locales/vi/system-settings.json";
 import viImportExport from "./locales/vi/import-export.json";
+import viV3Capabilities from "./locales/vi/v3-capabilities.json";
+import viBackup from "./locales/vi/backup.json";
 
 // --- ZH namespaces ---
 import zhCommon from "./locales/zh/common.json";
@@ -101,6 +107,7 @@ import zhMcp from "./locales/zh/mcp.json";
 import zhTts from "./locales/zh/tts.json";
 import zhSetup from "./locales/zh/setup.json";
 import zhMemory from "./locales/zh/memory.json";
+import zhVault from "./locales/zh/vault.json";
 import zhStorage from "./locales/zh/storage.json";
 import zhPendingMessages from "./locales/zh/pending-messages.json";
 import zhContacts from "./locales/zh/contacts.json";
@@ -111,6 +118,8 @@ import zhPackages from "./locales/zh/packages.json";
 import zhTenants from "./locales/zh/tenants.json";
 import zhSystemSettings from "./locales/zh/system-settings.json";
 import zhImportExport from "./locales/zh/import-export.json";
+import zhV3Capabilities from "./locales/zh/v3-capabilities.json";
+import zhBackup from "./locales/zh/backup.json";
 
 const STORAGE_KEY = "goclaw:language";
 
@@ -128,8 +137,10 @@ const ns = [
   "agents", "teams", "sessions", "skills", "cron", "config",
   "channels", "providers", "traces", "events",
   "usage", "approvals", "nodes", "logs", "tools", "mcp", "tts",
-  "setup", "memory", "storage", "pending-messages", "contacts", "activity", "api-keys",
+  "setup", "memory", "vault", "storage", "pending-messages", "contacts", "activity", "api-keys",
   "cli-credentials", "packages", "tenants", "system-settings", "import-export",
+  "v3-capabilities",
+  "backup",
 ] as const;
 
 i18n.use(initReactI18next).init({
@@ -141,7 +152,7 @@ i18n.use(initReactI18next).init({
       channels: enChannels, providers: enProviders, traces: enTraces,
       events: enEvents, usage: enUsage,
       approvals: enApprovals, nodes: enNodes, logs: enLogs, tools: enTools,
-      mcp: enMcp, tts: enTts, setup: enSetup, memory: enMemory, storage: enStorage,
+      mcp: enMcp, tts: enTts, setup: enSetup, memory: enMemory, vault: enVault, storage: enStorage,
       "pending-messages": enPendingMessages,
       contacts: enContacts, activity: enActivity, "api-keys": enApiKeys,
       "cli-credentials": enCliCredentials,
@@ -149,6 +160,8 @@ i18n.use(initReactI18next).init({
       tenants: enTenants,
       "system-settings": enSystemSettings,
       "import-export": enImportExport,
+      "v3-capabilities": enV3Capabilities,
+      backup: enBackup,
     },
     vi: {
       common: viCommon, sidebar: viSidebar, topbar: viTopbar, login: viLogin,
@@ -157,7 +170,7 @@ i18n.use(initReactI18next).init({
       channels: viChannels, providers: viProviders, traces: viTraces,
       events: viEvents, usage: viUsage,
       approvals: viApprovals, nodes: viNodes, logs: viLogs, tools: viTools,
-      mcp: viMcp, tts: viTts, setup: viSetup, memory: viMemory, storage: viStorage,
+      mcp: viMcp, tts: viTts, setup: viSetup, memory: viMemory, vault: viVault, storage: viStorage,
       "pending-messages": viPendingMessages,
       contacts: viContacts, activity: viActivity, "api-keys": viApiKeys,
       "cli-credentials": viCliCredentials,
@@ -165,6 +178,8 @@ i18n.use(initReactI18next).init({
       tenants: viTenants,
       "system-settings": viSystemSettings,
       "import-export": viImportExport,
+      "v3-capabilities": viV3Capabilities,
+      backup: viBackup,
     },
     zh: {
       common: zhCommon, sidebar: zhSidebar, topbar: zhTopbar, login: zhLogin,
@@ -173,7 +188,7 @@ i18n.use(initReactI18next).init({
       channels: zhChannels, providers: zhProviders, traces: zhTraces,
       events: zhEvents, usage: zhUsage,
       approvals: zhApprovals, nodes: zhNodes, logs: zhLogs, tools: zhTools,
-      mcp: zhMcp, tts: zhTts, setup: zhSetup, memory: zhMemory, storage: zhStorage,
+      mcp: zhMcp, tts: zhTts, setup: zhSetup, memory: zhMemory, vault: zhVault, storage: zhStorage,
       "pending-messages": zhPendingMessages,
       contacts: zhContacts, activity: zhActivity, "api-keys": zhApiKeys,
       "cli-credentials": zhCliCredentials,
@@ -181,6 +196,8 @@ i18n.use(initReactI18next).init({
       tenants: zhTenants,
       "system-settings": zhSystemSettings,
       "import-export": zhImportExport,
+      "v3-capabilities": zhV3Capabilities,
+      backup: zhBackup,
     },
   },
   ns: [...ns],

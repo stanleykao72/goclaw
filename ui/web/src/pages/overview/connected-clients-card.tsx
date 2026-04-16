@@ -1,9 +1,12 @@
+import { useMemo } from "react";
 import { Users } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import type { ClientInfo } from "./types";
 import { formatClientTime } from "./hooks/use-live-uptime";
+import { useContactResolver } from "@/hooks/use-contact-resolver";
+import { formatUserLabel } from "@/lib/format-user-label";
 
 export function ConnectedClientsCard({
   clients,
@@ -13,6 +16,8 @@ export function ConnectedClientsCard({
   currentId?: string;
 }) {
   const { t } = useTranslation("overview");
+  const userIds = useMemo(() => clients.map((c) => c.userId).filter(Boolean) as string[], [clients]);
+  const { resolve } = useContactResolver(userIds);
   return (
     <Card>
       <CardHeader className="pb-3">
@@ -54,14 +59,14 @@ export function ConnectedClientsCard({
                         {isYou && (
                           <Badge
                             variant="info"
-                            className="ml-1.5 text-[10px] px-1 py-0"
+                            className="ml-1.5 text-2xs px-1 py-0"
                           >
                             {t("connectedClients.you")}
                           </Badge>
                         )}
                       </td>
                       <td className="py-2 px-3 font-mono text-xs">
-                        {c.userId || "--"}
+                        {c.userId ? formatUserLabel(c.userId, resolve) : "--"}
                       </td>
                       <td className="py-2 px-3">
                         <Badge
@@ -72,7 +77,7 @@ export function ConnectedClientsCard({
                                 ? "secondary"
                                 : "outline"
                           }
-                          className="text-[10px]"
+                          className="text-2xs"
                         >
                           {c.role}
                         </Badge>

@@ -42,10 +42,9 @@ function getAdvancedFields(channelType: string) {
 
 function deriveInitialValues(instance: ChannelInstanceData): Record<string, unknown> {
   const config = (instance.config ?? {}) as Record<string, unknown>;
-  const { groups: _groups, ...rest } = config as Record<string, unknown> & { groups?: unknown };
   // Only keep advanced keys (exclude essential + groups)
   return Object.fromEntries(
-    Object.entries(rest).filter(([k]) => !ESSENTIAL_CONFIG_KEYS.has(k)),
+    Object.entries(config).filter(([k]) => !ESSENTIAL_CONFIG_KEYS.has(k) && k !== "groups"),
   );
 }
 
@@ -65,8 +64,8 @@ export function ChannelAdvancedDialog({
   useEffect(() => {
     if (!open) return;
     setValues(deriveInitialValues(instance));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open]);
+     
+  }, [open, instance]);
 
   const handleChange = useCallback((key: string, value: unknown) => {
     setValues((prev) => ({ ...prev, [key]: value }));
@@ -93,7 +92,7 @@ export function ChannelAdvancedDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-h-[90vh] w-[95vw] flex flex-col sm:max-w-2xl">
+      <DialogContent className="max-h-[90vh] w-[95vw] flex flex-col sm:max-w-3xl">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <Settings className="h-4 w-4" />
