@@ -29,9 +29,23 @@ func (p *ACPProcess) Initialize(ctx context.Context) error {
 }
 
 // NewSession creates a new ACP session on this process.
+//
+// Cwd comes from the spawned process's working directory (cmd.Dir); agents
+// such as Gemini CLI 0.38.1 reject the request when cwd is missing with
+// jsonrpc -32603 ("expected array, received undefined" — the schema
+// validator fails on the first required field). MCPServers is sent as an
+// empty array for the same reason.
 func (p *ACPProcess) NewSession(ctx context.Context) error {
+	cwd := ""
+	if p.cmd != nil {
+		cwd = p.cmd.Dir
+	}
+	req := NewSessionRequest{
+		Cwd:        cwd,
+		MCPServers: []NewSessionMCPCfg{},
+	}
 	var resp NewSessionResponse
-	if err := p.conn.Call(ctx, "session/new", NewSessionRequest{}, &resp); err != nil {
+	if err := p.conn.Call(ctx, "session/new", req, &resp); err != nil {
 		return fmt.Errorf("acp session/new: %w", err)
 	}
 	p.sessionID = resp.SessionID

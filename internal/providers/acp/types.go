@@ -73,7 +73,28 @@ type SessionCaps struct{}
 // --- Session Methods ---
 
 // NewSessionRequest creates a new ACP session.
-type NewSessionRequest struct{}
+// NewSessionRequest establishes a new ACP session.
+//
+// Gemini CLI >= 0.38.1 requires both `cwd` (string) and `mcpServers` (array,
+// may be empty) — sending an empty object fails with "expected array,
+// received undefined". Cwd defaults to the process working directory if the
+// caller leaves it empty; MCPServers is always serialized (never omitempty)
+// so an empty slice marshals to `[]` instead of missing entirely.
+type NewSessionRequest struct {
+	Cwd        string             `json:"cwd"`
+	MCPServers []NewSessionMCPCfg `json:"mcpServers"`
+}
+
+// NewSessionMCPCfg describes one MCP server the agent should connect to for
+// the new session. Empty slice is fine; each entry tells Gemini where to
+// find an external tool server.
+type NewSessionMCPCfg struct {
+	Name    string            `json:"name"`
+	URL     string            `json:"url,omitempty"`
+	Command string            `json:"command,omitempty"`
+	Args    []string          `json:"args,omitempty"`
+	Env     map[string]string `json:"env,omitempty"`
+}
 
 // NewSessionResponse carries the new session ID.
 type NewSessionResponse struct {
