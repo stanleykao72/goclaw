@@ -161,6 +161,12 @@ func (h *LiffHandler) verifyAuthHeader(r *http.Request) (*line.IDTokenClaims, er
 // --- Bootstrap -------------------------------------------------------------
 
 func (h *LiffHandler) handleBootstrap(w http.ResponseWriter, r *http.Request) {
+	slog.Info("liff bootstrap: received",
+		"method", r.Method,
+		"ref", r.URL.Query().Get("ref"),
+		"origin", r.Header.Get("Origin"),
+		"has_auth", r.Header.Get("Authorization") != "",
+		"remote", r.RemoteAddr)
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -173,6 +179,8 @@ func (h *LiffHandler) handleBootstrap(w http.ResponseWriter, r *http.Request) {
 
 	claims, err := h.verifyAuthHeader(r)
 	if err != nil {
+		slog.Warn("liff bootstrap: token verify failed",
+			"ref", ref, "err", err.Error())
 		writeJSON(w, http.StatusForbidden, bootstrapResponse{Error: "invalid token"})
 		return
 	}
@@ -239,12 +247,18 @@ func (h *LiffHandler) fetchPartners(ctx context.Context) ([]partner, error) {
 // --- Submit ----------------------------------------------------------------
 
 func (h *LiffHandler) handleSubmit(w http.ResponseWriter, r *http.Request) {
+	slog.Info("liff submit: received",
+		"method", r.Method,
+		"origin", r.Header.Get("Origin"),
+		"remote", r.RemoteAddr,
+		"content_length", r.ContentLength)
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	var req submitRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		slog.Warn("liff submit: body decode failed", "err", err.Error())
 		writeJSON(w, http.StatusBadRequest, submitResponse{Error: "invalid body"})
 		return
 	}
