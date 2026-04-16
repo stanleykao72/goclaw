@@ -2,6 +2,7 @@ package acp
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -22,13 +23,22 @@ func roundTrip[T any](t *testing.T, v T) ([]byte, T) {
 
 func TestInitializeRequest_RoundTrip(t *testing.T) {
 	req := InitializeRequest{
-		ClientInfo: ClientInfo{Name: "goclaw", Version: "1.0"},
+		ProtocolVersion: 2,
+		ClientInfo:      ClientInfo{Name: "goclaw", Version: "1.0"},
 		Capabilities: ClientCaps{
 			Fs:       &FsCaps{ReadTextFile: true, WriteTextFile: false},
 			Terminal: &TerminalCaps{Enabled: true},
 		},
 	}
-	_, got := roundTrip(t, req)
+	data, got := roundTrip(t, req)
+	// Gemini CLI 0.38.1 rejects missing / non-numeric protocolVersion.
+	// Lock in both the JSON shape and the Go round-trip value.
+	if !strings.Contains(string(data), `"protocolVersion":2`) {
+		t.Errorf("protocolVersion not serialized as number; got: %s", string(data))
+	}
+	if got.ProtocolVersion != 2 {
+		t.Errorf("ProtocolVersion: got %d, want 2", got.ProtocolVersion)
+	}
 	if got.ClientInfo.Name != "goclaw" {
 		t.Errorf("ClientInfo.Name: got %q", got.ClientInfo.Name)
 	}

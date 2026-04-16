@@ -7,9 +7,14 @@ import (
 )
 
 // Initialize sends the ACP initialize request to establish capabilities.
+//
+// ProtocolVersion=2 mirrors what Gemini CLI 0.38.1 supports as maximum; if an
+// older agent is behind it, the agent caps the result down (Gemini responds
+// with protocolVersion=1 in the InitializeResponse).
 func (p *ACPProcess) Initialize(ctx context.Context) error {
 	req := InitializeRequest{
-		ClientInfo: ClientInfo{Name: "goclaw", Version: "1.0"},
+		ProtocolVersion: 2,
+		ClientInfo:      ClientInfo{Name: "goclaw", Version: "1.0"},
 		Capabilities: ClientCaps{
 			Fs:       &FsCaps{ReadTextFile: true, WriteTextFile: true},
 			Terminal: &TerminalCaps{Enabled: true},

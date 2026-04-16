@@ -6,9 +6,16 @@ package acp
 // --- Client → Agent Requests ---
 
 // InitializeRequest starts the ACP handshake.
+//
+// ProtocolVersion is the integer ACP protocol level. Gemini CLI >= 0.38.1
+// rejects the handshake when this field is missing or non-numeric with
+// jsonrpc error -32603 (`expected number, received string`). The agent may
+// cap its response to a lower version than requested — we send the highest
+// we understand (currently 2) and let the agent negotiate down.
 type InitializeRequest struct {
-	ClientInfo   ClientInfo `json:"clientInfo"`
-	Capabilities ClientCaps `json:"capabilities"`
+	ProtocolVersion int        `json:"protocolVersion"`
+	ClientInfo      ClientInfo `json:"clientInfo"`
+	Capabilities    ClientCaps `json:"capabilities"`
 }
 
 // ClientInfo identifies the ACP client.
