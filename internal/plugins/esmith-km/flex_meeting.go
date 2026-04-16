@@ -41,9 +41,14 @@ type project struct {
 }
 
 // partner is a tiny view of res.partner for the attendees picker.
+//
+// JSON tags are load-bearing: the LIFF bootstrap endpoint serializes this
+// struct directly into the page payload, and the IIFE JS reads p.id / p.name
+// (lowercase). Without tags Go would emit `ID` / `Name` and the LIFF page
+// would render empty checkbox rows.
 type partner struct {
-	ID   int
-	Name string
+	ID   int    `json:"id"`
+	Name string `json:"name"`
 }
 
 // meetingMinutesActionXMLID is the Odoo action XML id used to build deep
