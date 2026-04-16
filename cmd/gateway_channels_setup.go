@@ -88,12 +88,39 @@ func registerEsmithKmHook(ch *linechannel.Channel) *esmithkm.Hook {
 // buildEsmithKmLiffHandler constructs the km-meeting attendees LIFF HTTP
 // handler. Returns nil when the plugin is not configured so the caller can
 // skip registration on the gateway mux.
+//
+// ID token verification: LIFF tokens are signed with the LINE LOGIN channel
+// secret (the one that owns the LIFF App), not the messaging channel secret
+// that the goclaw bot uses. They are different channels with different
+// secrets. Rather than surface a second secret via env vars, we call LINE's
+// online verify endpoint with just the LIFF client id (public — the prefix of
+// the LIFF ID before the dash). See internal/plugins/esmith-km/liff_verifier.go.
 func buildEsmithKmLiffHandler(ch *linechannel.Channel) *esmithkm.LiffHandler {
 	mcpURL := os.Getenv("ODOO_STAGE35_MCP_URL")
 	mcpToken := os.Getenv("ODOO_STAGE35_MCP_TOKEN")
+	liffURL := os.Getenv("ESMITH_KM_ATTENDEES_LIFF_URL")
 	if mcpURL == "" || mcpToken == "" || ch == nil {
 		return nil
 	}
+
+	// Derive LIFF client id. Path ends in `<channel_id>-<app_token>` — e.g.
+	// `https://liff.line.me/2009610420-ClGgYLB1` → client id `2009610420`.
+	clientID := ""
+	if liffURL != "" {
+		if idx := strings.LastIndex(liffURL, "/"); idx >= 0 && idx+1 < len(liffURL) {
+			tail := liffURL[idx+1:]
+			if dash := strings.Index(tail, "-"); dash > 0 {
+				clientID = tail[:dash]
+			}
+		}
+	}
+	if clientID == "" {
+		slog.Error("esmith-km: cannot derive LIFF client id from ESMITH_KM_ATTENDEES_LIFF_URL; LIFF handler will reject every token",
+			"liff_url", liffURL,
+			"action", "Set ESMITH_KM_ATTENDEES_LIFF_URL=https://liff.line.me/<channel_id>-<app_token>")
+	}
+	verifier := esmithkm.NewLINELiffVerifier(clientID)
+
 	draftsDir := os.Getenv("ESMITH_KM_DRAFTS_DIR")
 	if draftsDir == "" {
 		// Production default; mirrors esmithkm.Config.WithDefaults.
@@ -118,7 +145,7 @@ func buildEsmithKmLiffHandler(ch *linechannel.Channel) *esmithkm.LiffHandler {
 			"https://odoo-esmith*.dev.odoo.com",
 		}
 	}
-	return esmithkm.NewLiffHandler(ch, draftsDir, mcpURL, mcpToken, cleaned)
+	return esmithkm.NewLiffHandler(verifier, draftsDir, mcpURL, mcpToken, cleaned)
 }
 
 // liffHandlerOnce guarantees the km-meeting LIFF HTTP handler is registered
