@@ -50,12 +50,13 @@ import (
 )
 
 const (
-	draftPushedSuffix      = ".pushed"
-	draftBindPendingSuffix = ".bind_pending"
-	maxProjectsPerPicker   = 15
-	maxAttendeesPerPicker  = 30
-	mcpRequestTimeout      = 15 * time.Second
-	pipelineExecTimeout    = 30 * time.Second
+	draftPushedSuffix        = ".pushed"
+	draftConfirmPushedSuffix = ".confirm_pushed"
+	draftBindPendingSuffix   = ".bind_pending"
+	maxProjectsPerPicker     = 15
+	maxAttendeesPerPicker    = 30
+	mcpRequestTimeout        = 15 * time.Second
+	pipelineExecTimeout      = 30 * time.Second
 
 	// draftStaleCheckEvery runs as part of the draft watcher, but at a slower
 	// cadence than the picker scan so it does not race with the picker push
@@ -100,63 +101,31 @@ type draftJSON struct {
 // conversationState is the per-hook runtime state for the meeting writeback
 // flow. It is independent from the file-first draft (which is the source of
 // truth for cross-process state) — this struct only tracks transient
-// in-memory concerns: the in-progress attendee multi-select set and a
-// projectName cache so the confirm bubble can show a friendly label.
+// in-memory concerns: a projectName cache so the confirm bubble can show a
+// friendly label without hitting MCP twice per draft.
+//
+// The attendees selection is no longer held here: since Phase 3b users
+// multi-select via a LIFF webview which posts the final set to the goclaw
+// gateway, which writes directly to the draft JSON. See liff_http.go.
 type conversationState struct {
 	mu sync.Mutex
-
-	// attendeesSelection tracks which partner ids the user has toggled on
-	// for each draft ref. The bash side stores partner_ids only after the
-	// user taps the "submit_attendees" button; up to that moment toggles
-	// only update this map and re-render the picker.
-	attendeesSelection map[string]map[int]bool
 
 	// projectNameCache lets the confirm bubble show a project name even
 	// though the bash draft only stores the integer id. Populated when
 	// the user picks a project from the project_picker bubble.
 	projectNameCache map[string]string // ref → project name
-
-	// attendeesPoolCache stores the candidate partners shown in the
-	// attendees_picker so re-renders after toggle don't re-fetch from MCP.
-	attendeesPoolCache map[string][]partner // ref → partner pool
 }
 
 func newConversationState() *conversationState {
 	return &conversationState{
-		attendeesSelection: make(map[string]map[int]bool),
-		projectNameCache:   make(map[string]string),
-		attendeesPoolCache: make(map[string][]partner),
+		projectNameCache: make(map[string]string),
 	}
-}
-
-func (s *conversationState) toggleAttendee(ref string, partnerID int) (selected map[int]bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	cur, ok := s.attendeesSelection[ref]
-	if !ok {
-		cur = map[int]bool{}
-		s.attendeesSelection[ref] = cur
-	}
-	if cur[partnerID] {
-		delete(cur, partnerID)
-	} else {
-		cur[partnerID] = true
-	}
-	return copyBoolMap(cur)
-}
-
-func (s *conversationState) getAttendees(ref string) map[int]bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return copyBoolMap(s.attendeesSelection[ref])
 }
 
 func (s *conversationState) clearRef(ref string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.attendeesSelection, ref)
 	delete(s.projectNameCache, ref)
-	delete(s.attendeesPoolCache, ref)
 }
 
 func (s *conversationState) cacheProjectName(ref, name string) {
@@ -169,28 +138,6 @@ func (s *conversationState) getProjectName(ref string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.projectNameCache[ref]
-}
-
-func (s *conversationState) cacheAttendeesPool(ref string, pool []partner) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.attendeesPoolCache[ref] = pool
-}
-
-func (s *conversationState) getAttendeesPool(ref string) []partner {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.attendeesPoolCache[ref]
-}
-
-func copyBoolMap(in map[int]bool) map[int]bool {
-	out := make(map[int]bool, len(in))
-	for k, v := range in {
-		if v {
-			out[k] = true
-		}
-	}
-	return out
 }
 
 // --- draft I/O --------------------------------------------------------------
@@ -217,6 +164,10 @@ func (h *Hook) draftPublishedPath(ref string) string {
 
 func (h *Hook) draftPushedMarker(ref string) string {
 	return filepath.Join(h.cfg.DraftsDir, ref+draftPushedSuffix)
+}
+
+func (h *Hook) draftConfirmPushedMarker(ref string) string {
+	return filepath.Join(h.cfg.DraftsDir, ref+draftConfirmPushedSuffix)
 }
 
 func (h *Hook) draftBindPendingMarker(ref string) string {
@@ -356,8 +307,14 @@ func (h *Hook) scanDraftsOnce() {
 		}
 		ref := strings.TrimSuffix(name, ".json")
 
-		if _, err := os.Stat(h.draftPushedMarker(ref)); err == nil {
-			continue // already pushed
+		pushedExists := statExists(h.draftPushedMarker(ref))
+		confirmPushedExists := statExists(h.draftConfirmPushedMarker(ref))
+
+		// Fast path: both markers present means this draft is fully
+		// handled by the scan loop. Postback handlers + LIFF handler
+		// drive any further transitions.
+		if pushedExists && confirmPushedExists {
+			continue
 		}
 
 		path := filepath.Join(dir, name)
@@ -366,54 +323,87 @@ func (h *Hook) scanDraftsOnce() {
 			slog.Warn("LINE meeting: skip unreadable draft", "ref", ref, "err", err)
 			continue
 		}
-		if d.State != "awaiting_project" {
-			// Not in initial state — either already in progress or
-			// finalized. Mark pushed so we stop scanning it.
-			_ = h.touchPushedMarker(ref)
-			continue
-		}
-		if d.LineChatID == nil || *d.LineChatID == "" {
-			slog.Debug("LINE meeting: draft has no chat id, skipping", "ref", ref)
-			_ = h.touchPushedMarker(ref)
-			continue
-		}
 
-		// Bind-pending recovery: a previous scan pushed the /bind hint
-		// because the LINE user was not bound. Re-attempt resolve via
-		// the bash sync_line helper — if the user has bound since,
-		// patch the draft + clear the bind_pending marker so we can
-		// fall through into the normal picker push.
-		if _, err := os.Stat(h.draftBindPendingMarker(ref)); err == nil {
-			if h.tryRecoverBindPending(ref, d, path) {
-				// recovery succeeded, draft now has resolved_user_id
+		if !pushedExists {
+			if d.State != "awaiting_project" {
+				// Not in initial state — either already in progress or
+				// finalized. Mark pushed so we stop scanning it as a
+				// project-picker candidate, but fall through to the
+				// awaiting_confirm check below (a draft that went
+				// straight from upload to awaiting_confirm via LIFF
+				// still needs its confirm bubble).
+				_ = h.touchPushedMarker(ref)
+			} else if d.LineChatID == nil || *d.LineChatID == "" {
+				slog.Debug("LINE meeting: draft has no chat id, skipping", "ref", ref)
+				_ = h.touchPushedMarker(ref)
+				continue
 			} else {
-				// still unbound — leave bind_pending marker so the
-				// next scan retries; do NOT re-push the hint to avoid
-				// LINE notification spam
-				continue
+				// Bind-pending recovery: a previous scan pushed the
+				// /bind hint because the LINE user was not bound. Retry
+				// resolve via the bash sync_line helper — if the user
+				// has bound since, patch the draft + clear the
+				// bind_pending marker.
+				if _, err := os.Stat(h.draftBindPendingMarker(ref)); err == nil {
+					if !h.tryRecoverBindPending(ref, d, path) {
+						// still unbound — leave bind_pending marker
+						// for the next scan; do NOT re-push the hint
+						// to avoid LINE notification spam.
+						continue
+					}
+				}
+				if err := h.pushProjectPickerForDraft(d); err != nil {
+					if errors.Is(err, errBindPending) {
+						// expected — scan again next tick to recover
+						continue
+					}
+					slog.Error("LINE meeting: push project_picker failed",
+						"ref", ref, "err", err)
+					continue
+				}
+				if err := h.touchPushedMarker(ref); err != nil {
+					slog.Warn("LINE meeting: failed to write .pushed marker",
+						"ref", ref, "err", err)
+				}
+				_ = os.Remove(h.draftBindPendingMarker(ref))
 			}
 		}
 
-		if err := h.pushProjectPickerForDraft(d); err != nil {
-			if errors.Is(err, errBindPending) {
-				// expected — scan again next tick to recover
+		// Confirm-push path: regardless of whether this scan pushed
+		// the project picker, if the draft is now in awaiting_confirm
+		// and we haven't sent the confirm bubble yet, push it. Ships
+		// the LIFF submit → confirm transition without relying on a
+		// postback reply.
+		if !confirmPushedExists && d.State == "awaiting_confirm" {
+			if err := h.pushConfirmBubbleForDraft(d); err != nil {
+				slog.Error("LINE meeting: push confirm bubble failed",
+					"ref", ref, "err", err)
 				continue
 			}
-			slog.Error("LINE meeting: push project_picker failed",
-				"ref", ref, "err", err)
-			continue
+			if err := h.touchConfirmPushedMarker(ref); err != nil {
+				slog.Warn("LINE meeting: failed to write .confirm_pushed marker",
+					"ref", ref, "err", err)
+			}
 		}
-		if err := h.touchPushedMarker(ref); err != nil {
-			slog.Warn("LINE meeting: failed to write .pushed marker",
-				"ref", ref, "err", err)
-		}
-		// Clear bind-pending now that we've successfully pushed the picker.
-		_ = os.Remove(h.draftBindPendingMarker(ref))
 	}
+}
+
+// statExists is a terse helper for the two-marker check at the top of the
+// scan loop.
+func statExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 func (h *Hook) touchPushedMarker(ref string) error {
 	f, err := os.Create(h.draftPushedMarker(ref))
+	if err != nil {
+		return err
+	}
+	return f.Close()
+}
+
+func (h *Hook) touchConfirmPushedMarker(ref string) error {
+	f, err := os.Create(h.draftConfirmPushedMarker(ref))
 	if err != nil {
 		return err
 	}
@@ -580,10 +570,6 @@ func (h *Hook) handlePostback(ev line.PostbackEvent) {
 	switch action {
 	case "update":
 		h.handleUpdatePostback(chatID, ref, values.Get("field"), values.Get("value"))
-	case "toggle":
-		h.handleTogglePostback(chatID, ref, values.Get("value"))
-	case "submit_attendees":
-		h.handleSubmitAttendees(chatID, ref)
 	case "finalize":
 		h.handleFinalize(chatID, ref)
 	case "cancel":
@@ -649,27 +635,6 @@ func (h *Hook) handleUpdatePostback(chatID, ref, field, value string) {
 	}
 }
 
-func (h *Hook) handleTogglePostback(chatID, ref, value string) {
-	pid, err := strconv.Atoi(value)
-	if err != nil {
-		return
-	}
-	h.conv.toggleAttendee(ref, pid)
-	h.sendAttendeesPicker(chatID, ref)
-}
-
-func (h *Hook) handleSubmitAttendees(chatID, ref string) {
-	selected := h.conv.getAttendees(ref)
-	if len(selected) == 0 {
-		if h.cfg.Sender != nil {
-			_ = h.cfg.Sender.SendChunks(chatID, []string{"請至少選擇 1 位出席者"})
-		}
-		return
-	}
-	csv := joinIntsCSV(sortedKeys(selected))
-	h.handleUpdatePostback(chatID, ref, "partner_ids", csv)
-}
-
 func (h *Hook) handleFinalize(chatID, ref string) {
 	id, err := h.runPublishFinalize(ref)
 	if err != nil {
@@ -702,30 +667,17 @@ func (h *Hook) handleCancel(chatID, ref string) {
 	}
 }
 
-// sendAttendeesPicker fetches partners (cached after first call), renders
-// the bubble with current selection, and replies / pushes.
+// sendAttendeesPicker builds the URI-button bubble pointing at the LIFF
+// attendees webview and replies to the current postback. The bubble has no
+// partner list — the LIFF page fetches its own pool via the goclaw gateway
+// bootstrap endpoint (see liff_http.go handleBootstrap).
 func (h *Hook) sendAttendeesPicker(chatID, ref string) {
-	pool := h.conv.getAttendeesPool(ref)
-	if pool == nil {
-		// First time — fetch partner candidates from MCP. We use the
-		// project's team members (project.user_ids → res.users → partner_id)
-		// as the pool. Falls back to top-N res.partner if empty.
-		fetched, err := h.fetchProjectAttendees(context.Background(), ref)
-		if err != nil {
-			slog.Warn("LINE meeting: fetch attendees failed", "ref", ref, "err", err)
-		}
-		pool = fetched
-		h.conv.cacheAttendeesPool(ref, pool)
-	}
-	if len(pool) == 0 {
-		if h.cfg.Sender != nil {
-			_ = h.cfg.Sender.SendChunks(chatID, []string{"找不到候選出席者，請至 Odoo 手動建立會議記錄。"})
-		}
+	d, err := readDraft(h.draftPath(ref))
+	if err != nil {
+		slog.Error("LINE meeting: read draft for attendees picker", "ref", ref, "err", err)
 		return
 	}
-
-	selected := h.conv.getAttendees(ref)
-	bubble, err := buildAttendeesPicker(ref, pool, selected)
+	bubble, err := buildAttendeesPicker(ref, d.Subject, len(d.Answers.PartnerIDs), h.cfg.LIFFAttendeesURL)
 	if err != nil {
 		slog.Error("LINE meeting: build attendees picker", "err", err)
 		return
@@ -735,21 +687,32 @@ func (h *Hook) sendAttendeesPicker(chatID, ref string) {
 	}
 }
 
+// pushAttendeesPickerForDraft is the watcher-path variant — uses PushFlex
+// (no reply token available outside a postback context). Currently unused
+// by the watcher (the state awaiting_attendees is entered via postback, not
+// by file arrival), but kept symmetric with pushConfirmBubbleForDraft so a
+// future caller can push attendees from the scan loop if needed.
+func (h *Hook) pushAttendeesPickerForDraft(d *draftJSON) error {
+	if d.LineChatID == nil || *d.LineChatID == "" {
+		return errors.New("attendees picker: draft has no line_chat_id")
+	}
+	bubble, err := buildAttendeesPicker(d.SourceRef, d.Subject, len(d.Answers.PartnerIDs), h.cfg.LIFFAttendeesURL)
+	if err != nil {
+		return err
+	}
+	if h.cfg.Sender == nil {
+		return nil
+	}
+	return h.cfg.Sender.PushFlex(*d.LineChatID, "選擇出席者", bubble)
+}
+
 func (h *Hook) sendConfirmBubble(chatID, ref string) {
 	d, err := readDraft(h.draftPath(ref))
 	if err != nil {
 		slog.Error("LINE meeting: re-read draft for confirm", "ref", ref, "err", err)
 		return
 	}
-	projectName := h.conv.getProjectName(ref)
-	if projectName == "" && d.Answers.ProjectID != nil {
-		projectName = "#" + strconv.Itoa(*d.Answers.ProjectID)
-	}
-	location := ""
-	if d.Answers.MeetingLocation != nil {
-		location = *d.Answers.MeetingLocation
-	}
-	bubble, err := buildConfirmBubble(ref, d.Subject, projectName, location, len(d.Answers.PartnerIDs))
+	bubble, err := h.buildConfirmBubbleFromDraft(d)
 	if err != nil {
 		slog.Error("LINE meeting: build confirm bubble", "ref", ref, "err", err)
 		return
@@ -757,6 +720,39 @@ func (h *Hook) sendConfirmBubble(chatID, ref string) {
 	if h.cfg.Sender != nil {
 		_ = h.cfg.Sender.ReplyFlex(chatID, "確認會議記錄", bubble)
 	}
+}
+
+// pushConfirmBubbleForDraft is the watcher-path equivalent of
+// sendConfirmBubble: called when scanDraftsOnce detects a draft has advanced
+// to awaiting_confirm (typically because the LIFF submit endpoint wrote the
+// partner_ids + advanced state). Uses PushFlex since there is no reply token.
+func (h *Hook) pushConfirmBubbleForDraft(d *draftJSON) error {
+	if d.LineChatID == nil || *d.LineChatID == "" {
+		return errors.New("confirm bubble: draft has no line_chat_id")
+	}
+	bubble, err := h.buildConfirmBubbleFromDraft(d)
+	if err != nil {
+		return err
+	}
+	if h.cfg.Sender == nil {
+		return nil
+	}
+	return h.cfg.Sender.PushFlex(*d.LineChatID, "確認會議記錄", bubble)
+}
+
+// buildConfirmBubbleFromDraft is the common body of sendConfirmBubble (reply
+// path) and pushConfirmBubbleForDraft (watcher path) — they only differ in
+// which Sender method transports the rendered JSON.
+func (h *Hook) buildConfirmBubbleFromDraft(d *draftJSON) ([]byte, error) {
+	projectName := h.conv.getProjectName(d.SourceRef)
+	if projectName == "" && d.Answers.ProjectID != nil {
+		projectName = "#" + strconv.Itoa(*d.Answers.ProjectID)
+	}
+	location := ""
+	if d.Answers.MeetingLocation != nil {
+		location = *d.Answers.MeetingLocation
+	}
+	return buildConfirmBubble(d.SourceRef, d.Subject, projectName, location, len(d.Answers.PartnerIDs))
 }
 
 // --- exec wrappers ----------------------------------------------------------
@@ -1132,96 +1128,6 @@ func (h *Hook) fetchUserProjectsViaMCP(ctx context.Context, userID int) ([]proje
 	return out, nil
 }
 
-// fetchProjectAttendees returns the partner pool used by the attendees
-// picker. Strategy: read draft.answers.project_id, fetch its team members,
-// then resolve them to res.partner. Falls back to top contacts if empty.
-func (h *Hook) fetchProjectAttendees(ctx context.Context, ref string) ([]partner, error) {
-	d, err := readDraft(h.draftPath(ref))
-	if err != nil {
-		return nil, err
-	}
-	if d.Answers.ProjectID == nil {
-		return nil, errors.New("project_id not yet set on draft")
-	}
-
-	// Get the project's user_ids.
-	var projectRows []struct {
-		ID      int   `json:"id"`
-		UserIDs []int `json:"user_ids"`
-	}
-	if err := mcpToolCall(ctx, h.cfg.MCPURL, h.cfg.MCPToken, "search_records", map[string]any{
-		"model":  "project.project",
-		"domain": [][]any{{"id", "=", *d.Answers.ProjectID}},
-		"fields": []string{"id", "user_ids"},
-		"limit":  1,
-	}, &projectRows); err != nil {
-		return nil, err
-	}
-	if len(projectRows) == 0 || len(projectRows[0].UserIDs) == 0 {
-		return h.fetchPartnersFallback(ctx)
-	}
-
-	// Resolve user_ids → partner_id.
-	var userRows []struct {
-		ID        int   `json:"id"`
-		PartnerID []any `json:"partner_id"` // [id, name] in Odoo many2one read format
-	}
-	if err := mcpToolCall(ctx, h.cfg.MCPURL, h.cfg.MCPToken, "search_records", map[string]any{
-		"model":  "res.users",
-		"domain": [][]any{{"id", "in", projectRows[0].UserIDs}},
-		"fields": []string{"id", "partner_id"},
-		"limit":  maxAttendeesPerPicker,
-	}, &userRows); err != nil {
-		return nil, err
-	}
-
-	out := make([]partner, 0, len(userRows))
-	for _, u := range userRows {
-		if len(u.PartnerID) >= 2 {
-			id, _ := u.PartnerID[0].(float64)
-			name, _ := u.PartnerID[1].(string)
-			if int(id) > 0 {
-				out = append(out, partner{ID: int(id), Name: name})
-			}
-		}
-	}
-	if len(out) == 0 {
-		return h.fetchPartnersFallback(ctx)
-	}
-	return out, nil
-}
-
-// fetchPartnersFallback returns partners that correspond to internal company
-// users (res.users with share=false). This is the canonical "company employee
-// picker list" — we deliberately do NOT show generic res.partner customer
-// contacts here. Per design D4, attendees are e-smith employees.
-func (h *Hook) fetchPartnersFallback(ctx context.Context) ([]partner, error) {
-	var rows []struct {
-		ID        int   `json:"id"`
-		PartnerID []any `json:"partner_id"` // [id, name] many2one read format
-	}
-	if err := mcpToolCall(ctx, h.cfg.MCPURL, h.cfg.MCPToken, "search_records", map[string]any{
-		"model":  "res.users",
-		"domain": [][]any{{"active", "=", true}, {"share", "=", false}},
-		"fields": []string{"id", "partner_id"},
-		"order":  "name asc",
-		"limit":  maxAttendeesPerPicker,
-	}, &rows); err != nil {
-		return nil, err
-	}
-	out := make([]partner, 0, len(rows))
-	for _, r := range rows {
-		if len(r.PartnerID) >= 2 {
-			id, _ := r.PartnerID[0].(float64)
-			name, _ := r.PartnerID[1].(string)
-			if int(id) > 0 {
-				out = append(out, partner{ID: int(id), Name: name})
-			}
-		}
-	}
-	return out, nil
-}
-
 // --- project name cache ----------------------------------------------------
 
 // projectNameMemo is a global cache populated whenever fetchUserProjects
@@ -1246,26 +1152,3 @@ func lookupProjectName(idStr string) string {
 	return projectNameMemo[idStr]
 }
 
-// --- helpers ---------------------------------------------------------------
-
-func sortedKeys(m map[int]bool) []int {
-	out := make([]int, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	// Insertion sort — n is small (≤10).
-	for i := 1; i < len(out); i++ {
-		for j := i; j > 0 && out[j-1] > out[j]; j-- {
-			out[j-1], out[j] = out[j], out[j-1]
-		}
-	}
-	return out
-}
-
-func joinIntsCSV(ints []int) string {
-	parts := make([]string, len(ints))
-	for i, n := range ints {
-		parts[i] = strconv.Itoa(n)
-	}
-	return strings.Join(parts, ",")
-}

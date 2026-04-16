@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -45,48 +46,99 @@ func TestBuildPostbackData_RoundTripsThroughURLValues(t *testing.T) {
 	}
 }
 
-// --- attendee selection state ----------------------------------------------
+// --- conversation state (post Phase 3b) -----------------------------------
 
-func TestAttendeeSelection_TogglesAreIdempotentInPairs(t *testing.T) {
+func TestConversationState_ProjectNameCacheIsolatesPerRef(t *testing.T) {
 	s := newConversationState()
-	const ref = "ref1"
-
-	s.toggleAttendee(ref, 522)
-	s.toggleAttendee(ref, 610)
-	got := s.getAttendees(ref)
-	if len(got) != 2 || !got[522] || !got[610] {
-		t.Fatalf("expected {522,610}, got %v", got)
-	}
-
-	// Toggling the same partner removes it.
-	s.toggleAttendee(ref, 522)
-	got = s.getAttendees(ref)
-	if len(got) != 1 || !got[610] {
-		t.Errorf("expected {610}, got %v", got)
-	}
-}
-
-func TestAttendeeSelection_ClearRefRemovesAllStateForThatRef(t *testing.T) {
-	s := newConversationState()
-	s.toggleAttendee("ref-a", 1)
-	s.toggleAttendee("ref-b", 2)
 	s.cacheProjectName("ref-a", "Project A")
-	s.cacheAttendeesPool("ref-a", []partner{{ID: 1, Name: "Alice"}})
+	s.cacheProjectName("ref-b", "Project B")
 
 	s.clearRef("ref-a")
 
-	if got := s.getAttendees("ref-a"); len(got) != 0 {
-		t.Errorf("expected attendees cleared, got %v", got)
-	}
 	if got := s.getProjectName("ref-a"); got != "" {
-		t.Errorf("expected project name cleared, got %q", got)
+		t.Errorf("expected ref-a cleared, got %q", got)
 	}
-	if got := s.getAttendeesPool("ref-a"); got != nil {
-		t.Errorf("expected pool cleared, got %v", got)
+	if got := s.getProjectName("ref-b"); got != "Project B" {
+		t.Errorf("expected ref-b unchanged, got %q", got)
 	}
-	// ref-b untouched.
-	if got := s.getAttendees("ref-b"); len(got) != 1 || !got[2] {
-		t.Errorf("expected ref-b unchanged, got %v", got)
+}
+
+// recordingSender captures PushFlex / SendChunks calls for assertions.
+type recordingSender struct {
+	mu        sync.Mutex
+	pushFlex  []string
+	sendCount int
+}
+
+func (r *recordingSender) SendChunks(_ string, _ []string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.sendCount++
+	return nil
+}
+
+func (r *recordingSender) PushFlex(chatID, _ string, _ []byte) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.pushFlex = append(r.pushFlex, chatID)
+	return nil
+}
+
+func (r *recordingSender) ReplyFlex(chatID, _ string, _ []byte) error {
+	return r.PushFlex(chatID, "", nil)
+}
+
+func TestScanDraftsOnce_AwaitingConfirmTransition(t *testing.T) {
+	dir := t.TempDir()
+	const ref = "20260416_120000_liff_confirm"
+	chat := "Cconfirm"
+
+	// Draft already advanced to awaiting_confirm (LIFF submit did this
+	// in production). Project picker was pushed earlier — simulate that
+	// with an existing .pushed marker — but .confirm_pushed not yet.
+	lu := "Uabc"
+	d := draftJSON{
+		SourceRef:   ref,
+		State:       "awaiting_confirm",
+		LineChatID:  &chat,
+		LineUserID:  &lu,
+		Subject:     "Weekly Sync",
+		MeetingDate: "2026-04-16",
+	}
+	d.Answers.PartnerIDs = []int{101, 102}
+	writeDraftFile(t, dir, d)
+
+	// Pre-touch .pushed to skip the initial project-picker branch.
+	pushedMarker := filepath.Join(dir, ref+draftPushedSuffix)
+	if err := os.WriteFile(pushedMarker, nil, 0o644); err != nil {
+		t.Fatalf("touch pushed marker: %v", err)
+	}
+
+	sender := &recordingSender{}
+	h := New(Config{
+		DraftsDir:        dir,
+		PublishedDir:     filepath.Join(dir, "published"),
+		Sender:           sender,
+		LIFFAttendeesURL: "https://liff.line.me/stub",
+	})
+
+	h.scanDraftsOnce()
+
+	sender.mu.Lock()
+	defer sender.mu.Unlock()
+	if len(sender.pushFlex) != 1 || sender.pushFlex[0] != chat {
+		t.Fatalf("expected 1 PushFlex to %q, got %v", chat, sender.pushFlex)
+	}
+	// .confirm_pushed marker must now exist.
+	if _, err := os.Stat(filepath.Join(dir, ref+draftConfirmPushedSuffix)); err != nil {
+		t.Errorf(".confirm_pushed marker missing: %v", err)
+	}
+
+	// A second scan should NOT push again — marker is the idempotency
+	// signal.
+	h.scanDraftsOnce()
+	if len(sender.pushFlex) != 1 {
+		t.Errorf("expected push to stay at 1, got %d", len(sender.pushFlex))
 	}
 }
 
@@ -182,16 +234,6 @@ func TestScanDraftsOnce_MarksNonInitialStateAsPushedAndDoesNotPush(t *testing.T)
 
 	if _, err := os.Stat(filepath.Join(dir, "ref2.pushed")); err != nil {
 		t.Errorf("expected .pushed marker after non-initial state scan: %v", err)
-	}
-}
-
-// --- helpers ---------------------------------------------------------------
-
-func TestSortedKeysAndJoinIntsCSV(t *testing.T) {
-	in := map[int]bool{610: true, 522: true, 701: true}
-	keys := sortedKeys(in)
-	if got := joinIntsCSV(keys); got != "522,610,701" {
-		t.Errorf("want 522,610,701, got %q", got)
 	}
 }
 

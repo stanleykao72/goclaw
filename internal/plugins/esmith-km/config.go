@@ -44,6 +44,12 @@ type Config struct {
 	// empty, the plugin derives it from MCPURL.
 	OdooBaseURL string
 
+	// LIFFAttendeesURL is the liff.line.me URL the attendees picker
+	// bubble sends users to. Empty means the plugin is running without
+	// the LIFF path configured and the bubble degrades to a
+	// configuration-hint message; production must set it.
+	LIFFAttendeesURL string
+
 	// DraftPollInterval is how often the draft watcher ticks. Zero means
 	// use default (10s).
 	DraftPollInterval time.Duration

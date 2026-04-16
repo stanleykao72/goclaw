@@ -140,3 +140,47 @@ func TestBuildProjectPicker_FavoritesGetStarPrefix(t *testing.T) {
 		t.Errorf("non-favorite must not have star prefix; got:\n%s", body)
 	}
 }
+
+func TestBuildAttendeesPicker_URIButton(t *testing.T) {
+	raw, err := buildAttendeesPicker("ref1", "週會紀錄", 3, "https://liff.line.me/2009610420-ClGgYLB1")
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	body := string(raw)
+
+	if !strings.Contains(body, `"type":"uri"`) {
+		t.Errorf("expected uri action, got:\n%s", body)
+	}
+	if !strings.Contains(body, "https://liff.line.me/2009610420-ClGgYLB1") {
+		t.Errorf("expected liff URL in bubble, got:\n%s", body)
+	}
+	if !strings.Contains(body, "ref%3Dref1") && !strings.Contains(body, "ref=ref1") {
+		t.Errorf("expected ref=ref1 query in URI, got:\n%s", body)
+	}
+	if !strings.Contains(body, "目前已選 3 人") {
+		t.Errorf("expected preselected count in bubble, got:\n%s", body)
+	}
+	// No postback toggle/submit buttons should remain.
+	if strings.Contains(body, `"action":"toggle"`) || strings.Contains(body, `"action":"submit_attendees"`) {
+		t.Errorf("legacy postback actions leaked into URI bubble:\n%s", body)
+	}
+}
+
+func TestBuildAttendeesPicker_FallbackWhenEmpty(t *testing.T) {
+	raw, err := buildAttendeesPicker("ref1", "週會紀錄", 0, "")
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	body := string(raw)
+
+	if strings.Contains(body, `"type":"uri"`) {
+		t.Errorf("URI action must not appear when liffURL is empty, got:\n%s", body)
+	}
+	if !strings.Contains(body, "LIFF 未設定") {
+		t.Errorf("expected configuration-hint message in fallback bubble, got:\n%s", body)
+	}
+	// Must not render a tap-to-toggle partner list as fallback.
+	if strings.Contains(body, `"action":"toggle"`) {
+		t.Errorf("fallback must not render legacy toggle buttons, got:\n%s", body)
+	}
+}
