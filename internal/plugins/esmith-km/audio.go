@@ -1,4 +1,4 @@
-package line
+package esmithkm
 
 import (
 	"encoding/json"
@@ -8,8 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"time"
-
-	"github.com/line/line-bot-sdk-go/v7/linebot"
 )
 
 // audioContentTypeToExt maps LINE audio Content-Type headers to file extensions.
@@ -63,52 +61,27 @@ type audioSidecar struct {
 	ReceivedAt          string `json:"received_at"`
 }
 
-// downloadAudioContent fetches a LINE audio message body to a temp file and
-// returns the file path plus the response Content-Type. The caller is
-// responsible for moving / renaming the file out of the temp area.
-func (c *Channel) downloadAudioContent(messageID string) (string, string, error) {
-	resp, err := c.bot.GetMessageContent(messageID).Do()
-	if err != nil {
-		return "", "", fmt.Errorf("get audio content: %w", err)
-	}
-	defer resp.Content.Close()
-
-	tmp, err := os.CreateTemp("", "line-audio-*")
-	if err != nil {
-		return "", "", fmt.Errorf("create temp file: %w", err)
-	}
-
-	if _, err := io.Copy(tmp, resp.Content); err != nil {
-		tmp.Close()
-		os.Remove(tmp.Name())
-		return "", "", fmt.Errorf("write audio: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmp.Name())
-		return "", "", fmt.Errorf("close temp file: %w", err)
-	}
-
-	return tmp.Name(), resp.ContentType, nil
-}
-
-// ingestLineAudio downloads an AudioMessage, names it per the meeting-pipeline
-// convention, and moves it into /data/km/meetings/inbox/. A sidecar JSON is
-// written alongside so the downstream cron knows the LINE provenance.
+// ingestAudio moves a pre-downloaded LINE audio file from its tmp path to
+// the configured inbox, renaming it per the km-meeting-pipeline convention,
+// and writes a sidecar JSON so the downstream cron knows the LINE provenance.
+//
+// The channel adapter is responsible for downloading the file BEFORE calling
+// OnAudio — the plugin just takes ownership of the tmp path. This keeps the
+// channel package free of any km-specific knowledge.
 //
 // This function deliberately does NOT call HandleMessage — audio messages have
 // no text content for the GoClaw agent and would just confuse it. The
 // downstream km-meeting-pipeline.sh cron will pick up the file and run it
 // through ffmpeg compression + nlm transcription independently.
-func (c *Channel) ingestLineAudio(msg *linebot.AudioMessage, userID, chatID string) error {
-	tmpPath, contentType, err := c.downloadAudioContent(msg.ID)
-	if err != nil {
-		return fmt.Errorf("download: %w", err)
+func (h *Hook) ingestAudio(tmpPath, contentType, messageID, userID, chatID string) error {
+	if tmpPath == "" {
+		return fmt.Errorf("empty tmp path")
 	}
 
 	ext, known := extensionForAudio(contentType)
 	if !known {
 		slog.Warn("LINE audio: unknown content type, falling back to .bin",
-			"content_type", contentType, "message_id", msg.ID)
+			"content_type", contentType, "message_id", messageID)
 	}
 
 	now := time.Now()
@@ -118,17 +91,19 @@ func (c *Channel) ingestLineAudio(msg *linebot.AudioMessage, userID, chatID stri
 		senderShort(userID),
 		ext,
 	)
-	finalPath := filepath.Join(meetingsInboxDir, fileName)
+	finalPath := filepath.Join(h.cfg.InboxDir, fileName)
 
-	if err := os.MkdirAll(meetingsInboxDir, 0o755); err != nil {
+	if err := os.MkdirAll(h.cfg.InboxDir, 0o755); err != nil {
 		os.Remove(tmpPath)
 		return fmt.Errorf("ensure inbox dir: %w", err)
 	}
 
 	if err := os.Rename(tmpPath, finalPath); err != nil {
 		// Cross-device rename can fail (e.g. /tmp on tmpfs, /data on disk).
-		// Fall back to copy + remove.
+		// Fall back to copy + remove. copyFile uses os.Create so a partial
+		// finalPath may exist after a failed copy — clean both paths.
 		if cerr := copyFile(tmpPath, finalPath); cerr != nil {
+			os.Remove(finalPath)
 			os.Remove(tmpPath)
 			return fmt.Errorf("move to inbox: %w", cerr)
 		}
@@ -139,11 +114,11 @@ func (c *Channel) ingestLineAudio(msg *linebot.AudioMessage, userID, chatID stri
 		SourceType:          "line_audio",
 		LineUserID:          userID,
 		LineChatID:          chatID,
-		LineMessageID:       msg.ID,
+		LineMessageID:       messageID,
 		OriginalContentType: contentType,
 		ReceivedAt:          now.UTC().Format(time.RFC3339),
 	}
-	sidecarPath := filepath.Join(meetingsInboxDir, fileName+".source.json")
+	sidecarPath := filepath.Join(h.cfg.InboxDir, fileName+".source.json")
 	if data, jerr := json.MarshalIndent(sidecar, "", "  "); jerr == nil {
 		if werr := os.WriteFile(sidecarPath, data, 0o644); werr != nil {
 			slog.Warn("LINE audio: failed to write sidecar",

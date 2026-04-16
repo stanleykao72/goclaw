@@ -1,4 +1,4 @@
-package line
+package esmithkm
 
 // dedup.go provides a small in-memory TTL cache used to detect LINE webhook
 // resends. LINE retries the same Event (with the same Message.ID) when our

@@ -2,8 +2,10 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 
 	"github.com/google/uuid"
@@ -13,8 +15,8 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/channels"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/discord"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/feishu"
-	slackchannel "github.com/nextlevelbuilder/goclaw/internal/channels/slack"
 	linechannel "github.com/nextlevelbuilder/goclaw/internal/channels/line"
+	slackchannel "github.com/nextlevelbuilder/goclaw/internal/channels/slack"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/telegram"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/whatsapp"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/zalo"
@@ -23,9 +25,68 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/config"
 	"github.com/nextlevelbuilder/goclaw/internal/gateway"
 	"github.com/nextlevelbuilder/goclaw/internal/gateway/methods"
+	esmithkm "github.com/nextlevelbuilder/goclaw/internal/plugins/esmith-km"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
 )
+
+// registerEsmithKmHook reads esmith-km env vars and, if present, constructs
+// an esmithkm.Hook and registers it on the given LINE channel.
+//
+// Three cases:
+//
+//  1. Both ODOO_STAGE35_MCP_URL and ODOO_STAGE35_MCP_TOKEN set → hook
+//     registered.
+//  2. Both unset → hook NOT registered, log at Info level. This is the
+//     backwards-compatible path for any goclaw deployment of this fork
+//     that does not need km-meeting writeback.
+//  3. One set but not the other → hook NOT registered, log at ERROR
+//     level. Partial config indicates operator intent to use esmith-km
+//     that failed at env-var wiring; silently skipping would be a
+//     silent functional regression for an e-smith deployment.
+//
+// This helper does not return an error because LINE channel startup
+// should not block on plugin config — but the error log in case 3 is
+// loud enough that any deployment monitoring slog output will catch it.
+func registerEsmithKmHook(ch *linechannel.Channel) {
+	mcpURL := os.Getenv("ODOO_STAGE35_MCP_URL")
+	mcpToken := os.Getenv("ODOO_STAGE35_MCP_TOKEN")
+
+	switch {
+	case mcpURL == "" && mcpToken == "":
+		slog.Info("esmith-km: MCP env not set, skipping hook registration (non-esmith deployment)")
+		return
+	case mcpURL == "" || mcpToken == "":
+		slog.Error("esmith-km: partial MCP config detected, HOOK WILL NOT BE REGISTERED",
+			"url_set", mcpURL != "",
+			"token_set", mcpToken != "",
+			"action", "Set both ODOO_STAGE35_MCP_URL and ODOO_STAGE35_MCP_TOKEN, or neither")
+		return
+	}
+
+	hook := esmithkm.New(esmithkm.Config{
+		Sender:      ch,
+		MCPURL:      mcpURL,
+		MCPToken:    mcpToken,
+		OdooBaseURL: os.Getenv("ODOO_STAGE35_BASE_URL"),
+	})
+	ch.RegisterHook(hook)
+	slog.Info("esmith-km: hook registered on LINE channel")
+}
+
+// lineFactoryWithEsmithKm wraps linechannel.Factory to register the
+// esmith-km plugin on every LINE channel instance created from the DB.
+func lineFactoryWithEsmithKm(name string, creds json.RawMessage, cfg json.RawMessage,
+	msgBus *bus.MessageBus, pairingSvc store.PairingStore) (channels.Channel, error) {
+	ch, err := linechannel.Factory(name, creds, cfg, msgBus, pairingSvc)
+	if err != nil {
+		return nil, err
+	}
+	if lc, ok := ch.(*linechannel.Channel); ok {
+		registerEsmithKmHook(lc)
+	}
+	return ch, nil
+}
 
 // registerConfigChannels registers config-based channels as fallback when no DB instances are loaded.
 func registerConfigChannels(cfg *config.Config, channelMgr *channels.Manager, msgBus *bus.MessageBus, pgStores *store.Stores, instanceLoader *channels.InstanceLoader) {
@@ -96,16 +157,17 @@ func registerConfigChannels(cfg *config.Config, channelMgr *channels.Manager, ms
 		} else {
 			channelMgr.RegisterChannel(channels.TypeFeishu, f)
 			slog.Info("feishu/lark channel enabled (config)")
+		}
+	}
 
 	if cfg.Channels.Line.Enabled && cfg.Channels.Line.ChannelAccessToken != "" && instanceLoader == nil {
 		l, err := linechannel.New(cfg.Channels.Line, msgBus, pgStores.Pairing)
 		if err != nil {
 			slog.Error("failed to initialize line channel", "error", err)
 		} else {
+			registerEsmithKmHook(l)
 			channelMgr.RegisterChannel(channels.TypeLine, l)
 			slog.Info("line channel enabled (config)")
-		}
-	}
 		}
 	}
 }

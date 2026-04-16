@@ -1,4 +1,4 @@
-package line
+package esmithkm
 
 // conversation.go implements the LINE Flex Message conversation flow that
 // follows km-meeting-pipeline.sh `cmd_check`. The bash side writes a draft
@@ -9,17 +9,17 @@ package line
 //
 // Architecture choice: file-first state, polling watcher.
 //
-//	bash               file system                 goclaw
-//	-----              -----------                 ------
+//	bash               file system                 esmith-km plugin
+//	-----              -----------                 ----------------
 //	cmd_check  ---->   drafts/<ref>.json     <---  draft watcher (polling, 10s)
-//	                   .pushed marker        --->  pushFlex project_picker
+//	                   .pushed marker        --->  Sender.PushFlex project_picker
 //	                                               -- user taps button --
-//	                   <- LINE PostbackEvent ---   handlePostback()
+//	                   <- LINE PostbackEvent ---   Hook.OnPostback → handlePostback
 //	                                               exec publish-odoo update
-//	                                               replyFlex next picker
+//	                                               Sender.ReplyFlex next picker
 //	                                               ...
 //	                                               exec publish-odoo finalize
-//	                                               replyText id confirmation
+//	                                               Sender.SendChunks id confirmation
 //
 // Polling > push trigger because it requires no bash changes and survives
 // goclaw restarts (drafts on disk get re-discovered). The 10s interval is
@@ -45,24 +45,22 @@ import (
 	"time"
 
 	"github.com/line/line-bot-sdk-go/v7/linebot"
+
+	"github.com/nextlevelbuilder/goclaw/internal/channels/line"
 )
 
 const (
-	defaultDraftsDir       = "/data/km/meetings/drafts"
-	defaultPublishedDir    = "/data/km/meetings/drafts/published"
 	draftPushedSuffix      = ".pushed"
 	draftBindPendingSuffix = ".bind_pending"
-	draftPollIntervalDef   = 10 * time.Second
-	maxProjectsPerPicker   = 10
-	maxAttendeesPerPicker  = 10
+	maxProjectsPerPicker   = 15
+	maxAttendeesPerPicker  = 30
 	mcpRequestTimeout      = 15 * time.Second
 	pipelineExecTimeout    = 30 * time.Second
 
-	// Stale-cleanup runs as part of the draft watcher, but at a slower
-	// cadence so it does not race with the picker push pass. The TTL
-	// itself defaults to 24h to match km-meeting-pipeline.sh DRAFT_TTL_HOURS.
+	// draftStaleCheckEvery runs as part of the draft watcher, but at a slower
+	// cadence than the picker scan so it does not race with the picker push
+	// pass. The TTL itself is read from Hook.cfg.DraftStaleTTL.
 	draftStaleCheckEvery = 5 * time.Minute
-	draftStaleTTL        = 24 * time.Hour
 )
 
 // errBindPending is the sentinel returned by pushProjectPickerForDraft when
@@ -79,18 +77,18 @@ var finalizeIDRegex = regexp.MustCompile(`id=(\d+)`)
 // state. Format: `update OK <ref>.<field>=<value> (state=<next>)`.
 var updateOKRegex = regexp.MustCompile(`update OK\s+\S+\s+\(state=(\w+)\)`)
 
-// draftJSON is the subset of the file-first draft state that goclaw needs.
-// The full schema lives in km-meeting-pipeline.sh; do not write fields here
-// that the bash side does not understand.
+// draftJSON is the subset of the file-first draft state that the plugin
+// needs. The full schema lives in km-meeting-pipeline.sh; do not write
+// fields here that the bash side does not understand.
 type draftJSON struct {
-	SourceRef          string  `json:"source_ref"`
-	State              string  `json:"state"`
-	LineChatID         *string `json:"line_chat_id"`
-	LineUserID         *string `json:"line_user_id"`
-	ResolvedUserID     *int    `json:"resolved_user_id"`
-	Subject            string  `json:"subject"`
-	MeetingDate        string  `json:"meeting_date"`
-	Answers            struct {
+	SourceRef      string  `json:"source_ref"`
+	State          string  `json:"state"`
+	LineChatID     *string `json:"line_chat_id"`
+	LineUserID     *string `json:"line_user_id"`
+	ResolvedUserID *int    `json:"resolved_user_id"`
+	Subject        string  `json:"subject"`
+	MeetingDate    string  `json:"meeting_date"`
+	Answers        struct {
 		ProjectID        *int    `json:"project_id"`
 		MeetingLocation  *string `json:"meeting_location"`
 		PartnerIDs       []int   `json:"partner_ids"`
@@ -99,10 +97,10 @@ type draftJSON struct {
 	} `json:"answers"`
 }
 
-// conversationState is the per-channel runtime state for the meeting writeback
+// conversationState is the per-hook runtime state for the meeting writeback
 // flow. It is independent from the file-first draft (which is the source of
 // truth for cross-process state) — this struct only tracks transient
-// goclaw-side concerns: the in-progress attendee multi-select set and a
+// in-memory concerns: the in-progress attendee multi-select set and a
 // projectName cache so the confirm bubble can show a friendly label.
 type conversationState struct {
 	mu sync.Mutex
@@ -195,31 +193,6 @@ func copyBoolMap(in map[int]bool) map[int]bool {
 	return out
 }
 
-// --- environment ------------------------------------------------------------
-
-func getDraftsDir() string {
-	if v := os.Getenv("KM_MEETING_DRAFTS_DIR"); v != "" {
-		return v
-	}
-	return defaultDraftsDir
-}
-
-func getPublishedDir() string {
-	if v := os.Getenv("KM_MEETING_PUBLISHED_DIR"); v != "" {
-		return v
-	}
-	return defaultPublishedDir
-}
-
-func getDraftPollInterval() time.Duration {
-	if v := os.Getenv("KM_MEETING_DRAFT_POLL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil && d > 0 {
-			return d
-		}
-	}
-	return draftPollIntervalDef
-}
-
 // --- draft I/O --------------------------------------------------------------
 
 func readDraft(path string) (*draftJSON, error) {
@@ -234,39 +207,39 @@ func readDraft(path string) (*draftJSON, error) {
 	return &d, nil
 }
 
-func draftPath(ref string) string {
-	return filepath.Join(getDraftsDir(), ref+".json")
+func (h *Hook) draftPath(ref string) string {
+	return filepath.Join(h.cfg.DraftsDir, ref+".json")
 }
 
-func draftPublishedPath(ref string) string {
-	return filepath.Join(getPublishedDir(), ref+".json")
+func (h *Hook) draftPublishedPath(ref string) string {
+	return filepath.Join(h.cfg.PublishedDir, ref+".json")
 }
 
-func draftPushedMarker(ref string) string {
-	return filepath.Join(getDraftsDir(), ref+draftPushedSuffix)
+func (h *Hook) draftPushedMarker(ref string) string {
+	return filepath.Join(h.cfg.DraftsDir, ref+draftPushedSuffix)
 }
 
-func draftBindPendingMarker(ref string) string {
-	return filepath.Join(getDraftsDir(), ref+draftBindPendingSuffix)
+func (h *Hook) draftBindPendingMarker(ref string) string {
+	return filepath.Join(h.cfg.DraftsDir, ref+draftBindPendingSuffix)
 }
 
 // --- draft watcher ---------------------------------------------------------
 
 // startDraftWatcher polls drafts/ for new awaiting_project drafts that need
 // the project_picker bubble pushed. Idempotent via .pushed marker file —
-// even if goclaw restarts, an already-pushed draft is not pushed again.
+// even if the plugin restarts, an already-pushed draft is not pushed again.
 //
 // A second slower ticker runs the stale-draft cleanup pass which pushes a
 // LINE expiry notification and removes drafts whose mtime is past TTL.
 //
-// The watcher exits when ctx is cancelled (Channel.Stop).
-func (c *Channel) startDraftWatcher(ctx context.Context) {
-	interval := getDraftPollInterval()
+// The watcher exits when ctx is cancelled (Hook.Stop via watcherCancel).
+func (h *Hook) startDraftWatcher(ctx context.Context) {
+	interval := h.cfg.DraftPollInterval
 	slog.Info("LINE meeting: draft watcher started",
-		"dir", getDraftsDir(),
+		"dir", h.cfg.DraftsDir,
 		"interval", interval,
 		"stale_check_every", draftStaleCheckEvery,
-		"stale_ttl", draftStaleTTL,
+		"stale_ttl", h.cfg.DraftStaleTTL,
 	)
 
 	pickerTick := time.NewTicker(interval)
@@ -280,21 +253,21 @@ func (c *Channel) startDraftWatcher(ctx context.Context) {
 			slog.Info("LINE meeting: draft watcher stopped")
 			return
 		case <-pickerTick.C:
-			c.scanDraftsOnce()
+			h.scanDraftsOnce()
 		case <-staleTick.C:
-			c.cleanupStaleDraftsOnce()
+			h.cleanupStaleDraftsOnce()
 		}
 	}
 }
 
-// cleanupStaleDraftsOnce removes drafts whose mtime is past draftStaleTTL,
+// cleanupStaleDraftsOnce removes drafts whose mtime is past DraftStaleTTL,
 // pushing a LINE expiry message to the original chat first when chat_id
 // is known. Idempotent: a draft removed in a previous pass simply isn't
 // there next time. Safe to call from a single goroutine.
 //
 // Spec scenario: "使用者放棄 draft → 24h TTL cleanup".
-func (c *Channel) cleanupStaleDraftsOnce() {
-	dir := getDraftsDir()
+func (h *Hook) cleanupStaleDraftsOnce() {
+	dir := h.cfg.DraftsDir
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
@@ -303,7 +276,7 @@ func (c *Channel) cleanupStaleDraftsOnce() {
 		return
 	}
 
-	cutoff := time.Now().Add(-draftStaleTTL)
+	cutoff := time.Now().Add(-h.cfg.DraftStaleTTL)
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
@@ -330,14 +303,16 @@ func (c *Channel) cleanupStaleDraftsOnce() {
 		if derr == nil && d.LineChatID != nil && *d.LineChatID != "" {
 			msg := fmt.Sprintf(
 				"⏰ 會議草稿「%s」已超過 %d 小時未完成補欄位，已自動清除。\n\n下次傳新的語音檔或 GDrive 連結時可以重新開始。",
-				truncate(d.Subject, 40),
-				int(draftStaleTTL/time.Hour),
+				line.Truncate(d.Subject, 40),
+				int(h.cfg.DraftStaleTTL/time.Hour),
 			)
-			if perr := c.sendChunks(*d.LineChatID, []string{msg}); perr != nil {
-				slog.Warn("LINE meeting: stale-cleanup notify failed",
-					"ref", ref, "err", perr)
-				// Push failure does not block deletion — file age is
-				// the source of truth, not whether LINE took the message.
+			if h.cfg.Sender != nil {
+				if perr := h.cfg.Sender.SendChunks(*d.LineChatID, []string{msg}); perr != nil {
+					slog.Warn("LINE meeting: stale-cleanup notify failed",
+						"ref", ref, "err", perr)
+					// Push failure does not block deletion — file age is
+					// the source of truth, not whether LINE took the message.
+				}
 			}
 		}
 
@@ -347,11 +322,11 @@ func (c *Channel) cleanupStaleDraftsOnce() {
 			continue
 		}
 		// Also drop the .pushed marker so the dir stays clean.
-		_ = os.Remove(draftPushedMarker(ref))
+		_ = os.Remove(h.draftPushedMarker(ref))
 
 		// Forget any per-ref in-memory state.
-		if c.conv != nil {
-			c.conv.clearRef(ref)
+		if h.conv != nil {
+			h.conv.clearRef(ref)
 		}
 
 		slog.Info("LINE meeting: stale draft removed",
@@ -361,8 +336,8 @@ func (c *Channel) cleanupStaleDraftsOnce() {
 	}
 }
 
-func (c *Channel) scanDraftsOnce() {
-	dir := getDraftsDir()
+func (h *Hook) scanDraftsOnce() {
+	dir := h.cfg.DraftsDir
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
@@ -381,7 +356,7 @@ func (c *Channel) scanDraftsOnce() {
 		}
 		ref := strings.TrimSuffix(name, ".json")
 
-		if _, err := os.Stat(draftPushedMarker(ref)); err == nil {
+		if _, err := os.Stat(h.draftPushedMarker(ref)); err == nil {
 			continue // already pushed
 		}
 
@@ -394,12 +369,12 @@ func (c *Channel) scanDraftsOnce() {
 		if d.State != "awaiting_project" {
 			// Not in initial state — either already in progress or
 			// finalized. Mark pushed so we stop scanning it.
-			_ = touchPushedMarker(ref)
+			_ = h.touchPushedMarker(ref)
 			continue
 		}
 		if d.LineChatID == nil || *d.LineChatID == "" {
 			slog.Debug("LINE meeting: draft has no chat id, skipping", "ref", ref)
-			_ = touchPushedMarker(ref)
+			_ = h.touchPushedMarker(ref)
 			continue
 		}
 
@@ -408,8 +383,8 @@ func (c *Channel) scanDraftsOnce() {
 		// the bash sync_line helper — if the user has bound since,
 		// patch the draft + clear the bind_pending marker so we can
 		// fall through into the normal picker push.
-		if _, err := os.Stat(draftBindPendingMarker(ref)); err == nil {
-			if c.tryRecoverBindPending(ref, d, path) {
+		if _, err := os.Stat(h.draftBindPendingMarker(ref)); err == nil {
+			if h.tryRecoverBindPending(ref, d, path) {
 				// recovery succeeded, draft now has resolved_user_id
 			} else {
 				// still unbound — leave bind_pending marker so the
@@ -419,7 +394,7 @@ func (c *Channel) scanDraftsOnce() {
 			}
 		}
 
-		if err := c.pushProjectPickerForDraft(d); err != nil {
+		if err := h.pushProjectPickerForDraft(d); err != nil {
 			if errors.Is(err, errBindPending) {
 				// expected — scan again next tick to recover
 				continue
@@ -428,25 +403,25 @@ func (c *Channel) scanDraftsOnce() {
 				"ref", ref, "err", err)
 			continue
 		}
-		if err := touchPushedMarker(ref); err != nil {
+		if err := h.touchPushedMarker(ref); err != nil {
 			slog.Warn("LINE meeting: failed to write .pushed marker",
 				"ref", ref, "err", err)
 		}
 		// Clear bind-pending now that we've successfully pushed the picker.
-		_ = os.Remove(draftBindPendingMarker(ref))
+		_ = os.Remove(h.draftBindPendingMarker(ref))
 	}
 }
 
-func touchPushedMarker(ref string) error {
-	f, err := os.Create(draftPushedMarker(ref))
+func (h *Hook) touchPushedMarker(ref string) error {
+	f, err := os.Create(h.draftPushedMarker(ref))
 	if err != nil {
 		return err
 	}
 	return f.Close()
 }
 
-func touchBindPendingMarker(ref string) error {
-	f, err := os.Create(draftBindPendingMarker(ref))
+func (h *Hook) touchBindPendingMarker(ref string) error {
+	f, err := os.Create(h.draftBindPendingMarker(ref))
 	if err != nil {
 		return err
 	}
@@ -458,11 +433,11 @@ func touchBindPendingMarker(ref string) error {
 // with the new resolved_user_id and updates the in-memory draftJSON,
 // then notifies the user that resolution succeeded so they understand
 // why a fresh picker bubble is about to land. Returns true on recovery.
-func (c *Channel) tryRecoverBindPending(ref string, d *draftJSON, path string) bool {
+func (h *Hook) tryRecoverBindPending(ref string, d *draftJSON, path string) bool {
 	if d.LineUserID == nil || *d.LineUserID == "" {
 		return false
 	}
-	out, err := runPipeline("publish-odoo", "resolve", *d.LineUserID)
+	out, err := runPipeline(h.cfg.PipelineScript, "publish-odoo", "resolve", *d.LineUserID)
 	if err != nil {
 		slog.Debug("LINE meeting: bind recovery resolve still failing",
 			"ref", ref, "err", err)
@@ -481,8 +456,8 @@ func (c *Channel) tryRecoverBindPending(ref string, d *draftJSON, path string) b
 	}
 	d.ResolvedUserID = &uid
 
-	if d.LineChatID != nil {
-		_ = c.sendChunks(*d.LineChatID, []string{
+	if d.LineChatID != nil && h.cfg.Sender != nil {
+		_ = h.cfg.Sender.SendChunks(*d.LineChatID, []string{
 			"✅ 已偵測到你完成綁定，正在重新傳送會議補欄位選單…",
 		})
 	}
@@ -531,7 +506,7 @@ func patchDraftResolvedUserID(path string, uid int) error {
 	return os.Rename(tmp, path)
 }
 
-func (c *Channel) pushProjectPickerForDraft(d *draftJSON) error {
+func (h *Hook) pushProjectPickerForDraft(d *draftJSON) error {
 	chatID := *d.LineChatID
 
 	if d.ResolvedUserID == nil {
@@ -541,56 +516,59 @@ func (c *Channel) pushProjectPickerForDraft(d *draftJSON) error {
 		// hint via the .pushed marker). The bind_pending marker is
 		// idempotent — it gets cleared once recovery succeeds.
 		msg := "👋 已收到語音檔，但找不到對應的 Odoo 使用者。\n\n請先傳送 `/bind <你的 e-smith email>` 完成綁定，綁定成功後系統會自動繼續對話。"
-		if err := touchBindPendingMarker(d.SourceRef); err != nil {
+		if err := h.touchBindPendingMarker(d.SourceRef); err != nil {
 			slog.Warn("LINE meeting: failed to write .bind_pending marker",
 				"ref", d.SourceRef, "err", err)
 		}
 		// Return a sentinel error so the caller does NOT touch the
 		// .pushed marker — bind-pending state is the authoritative one.
-		if perr := c.sendChunks(chatID, []string{msg}); perr != nil {
-			return perr
+		if h.cfg.Sender != nil {
+			if perr := h.cfg.Sender.SendChunks(chatID, []string{msg}); perr != nil {
+				return perr
+			}
 		}
 		return errBindPending
 	}
 
-	projects, err := fetchUserProjects(context.Background(), *d.ResolvedUserID)
+	var lineUID string
+	if d.LineUserID != nil {
+		lineUID = *d.LineUserID
+	}
+	projects, err := h.fetchUserProjects(context.Background(), lineUID, *d.ResolvedUserID)
 	if err != nil {
 		return fmt.Errorf("fetch projects: %w", err)
 	}
 	if len(projects) == 0 {
 		msg := "已收到會議錄音，但找不到你最近活躍的專案。請至 Odoo 確認你的負責專案後再試。"
-		return c.sendChunks(chatID, []string{msg})
+		if h.cfg.Sender != nil {
+			return h.cfg.Sender.SendChunks(chatID, []string{msg})
+		}
+		return nil
 	}
 
 	bubble, err := buildProjectPicker(d.SourceRef, d.Subject, projects)
 	if err != nil {
 		return fmt.Errorf("build project picker: %w", err)
 	}
-	return c.pushFlex(chatID, "請選擇會議專案", bubble)
+	if h.cfg.Sender != nil {
+		return h.cfg.Sender.PushFlex(chatID, "請選擇會議專案", bubble)
+	}
+	return nil
 }
 
 // --- postback handler ------------------------------------------------------
 
 // handlePostback parses the postback `data` query string and routes to the
-// matching state-machine action. Called from handleEvent on EventTypePostback.
-func (c *Channel) handlePostback(event *linebot.Event) {
-	chatID := chatIDFromSource(event.Source)
+// matching state-machine action. Called from Hook.OnPostback.
+func (h *Hook) handlePostback(ev line.PostbackEvent) {
+	chatID := ev.ChatID
 	if chatID == "" {
 		return
 	}
 
-	// Cache the reply token for any subsequent send within 30s.
-	c.replyTokens.Store(chatID, replyTokenEntry{
-		token:      event.ReplyToken,
-		receivedAt: time.Now(),
-	})
-
-	if event.Postback == nil {
-		return
-	}
-	values, err := url.ParseQuery(event.Postback.Data)
+	values, err := url.ParseQuery(ev.Data)
 	if err != nil {
-		slog.Warn("LINE meeting: bad postback data", "data", event.Postback.Data, "err", err)
+		slog.Warn("LINE meeting: bad postback data", "data", ev.Data, "err", err)
 		return
 	}
 	action := values.Get("action")
@@ -601,23 +579,24 @@ func (c *Channel) handlePostback(event *linebot.Event) {
 
 	switch action {
 	case "update":
-		c.handleUpdatePostback(chatID, ref, values.Get("field"), values.Get("value"))
+		h.handleUpdatePostback(chatID, ref, values.Get("field"), values.Get("value"))
 	case "toggle":
-		c.handleTogglePostback(chatID, ref, values.Get("value"))
+		h.handleTogglePostback(chatID, ref, values.Get("value"))
 	case "submit_attendees":
-		c.handleSubmitAttendees(chatID, ref)
+		h.handleSubmitAttendees(chatID, ref)
 	case "finalize":
-		c.handleFinalize(chatID, ref)
+		h.handleFinalize(chatID, ref)
 	case "cancel":
-		c.handleCancel(chatID, ref)
+		h.handleCancel(chatID, ref)
 	default:
 		slog.Warn("LINE meeting: unknown postback action", "action", action)
 	}
 }
 
 // chatIDFromSource extracts a stable chat id from any LINE event source.
-// Mirrors the logic in handleEvent so postback events use the same key as
-// the original message events that opened the conversation.
+// Kept in the plugin (instead of exported from channels/line) because it
+// is an e-smith-specific helper used only when a LINE-typed source leaks
+// through a test fixture.
 func chatIDFromSource(src *linebot.EventSource) string {
 	if src == nil {
 		return ""
@@ -633,15 +612,17 @@ func chatIDFromSource(src *linebot.EventSource) string {
 	return ""
 }
 
-func (c *Channel) handleUpdatePostback(chatID, ref, field, value string) {
+func (h *Hook) handleUpdatePostback(chatID, ref, field, value string) {
 	if field == "" || value == "" {
 		return
 	}
-	nextState, err := runPublishUpdate(ref, field, value)
+	nextState, err := h.runPublishUpdate(ref, field, value)
 	if err != nil {
 		slog.Error("LINE meeting: publish-odoo update failed",
 			"ref", ref, "field", field, "err", err)
-		_ = c.sendChunks(chatID, []string{"⚠️ 更新會議草稿失敗，請稍後再試"})
+		if h.cfg.Sender != nil {
+			_ = h.cfg.Sender.SendChunks(chatID, []string{"⚠️ 更新會議草稿失敗，請稍後再試"})
+		}
 		return
 	}
 
@@ -649,132 +630,118 @@ func (c *Channel) handleUpdatePostback(chatID, ref, field, value string) {
 	// can show a label instead of just an id.
 	if field == "project_id" {
 		if name := lookupProjectName(value); name != "" {
-			c.conv.cacheProjectName(ref, name)
+			h.conv.cacheProjectName(ref, name)
 		}
 	}
 
 	switch nextState {
 	case "awaiting_location":
 		bubble, _ := buildLocationPicker(ref)
-		_ = c.replyFlex(chatID, "選擇會議地點", bubble)
+		if h.cfg.Sender != nil {
+			_ = h.cfg.Sender.ReplyFlex(chatID, "選擇會議地點", bubble)
+		}
 	case "awaiting_attendees":
-		c.sendAttendeesPicker(chatID, ref)
+		h.sendAttendeesPicker(chatID, ref)
 	case "awaiting_confirm":
-		c.sendConfirmBubble(chatID, ref)
+		h.sendConfirmBubble(chatID, ref)
 	default:
 		slog.Warn("LINE meeting: unknown next state", "ref", ref, "state", nextState)
 	}
 }
 
-func (c *Channel) handleTogglePostback(chatID, ref, value string) {
+func (h *Hook) handleTogglePostback(chatID, ref, value string) {
 	pid, err := strconv.Atoi(value)
 	if err != nil {
 		return
 	}
-	c.conv.toggleAttendee(ref, pid)
-	c.sendAttendeesPicker(chatID, ref)
+	h.conv.toggleAttendee(ref, pid)
+	h.sendAttendeesPicker(chatID, ref)
 }
 
-func (c *Channel) handleSubmitAttendees(chatID, ref string) {
-	selected := c.conv.getAttendees(ref)
+func (h *Hook) handleSubmitAttendees(chatID, ref string) {
+	selected := h.conv.getAttendees(ref)
 	if len(selected) == 0 {
-		_ = c.sendChunks(chatID, []string{"請至少選擇 1 位出席者"})
+		if h.cfg.Sender != nil {
+			_ = h.cfg.Sender.SendChunks(chatID, []string{"請至少選擇 1 位出席者"})
+		}
 		return
 	}
 	csv := joinIntsCSV(sortedKeys(selected))
-	c.handleUpdatePostback(chatID, ref, "partner_ids", csv)
+	h.handleUpdatePostback(chatID, ref, "partner_ids", csv)
 }
 
-func (c *Channel) handleFinalize(chatID, ref string) {
-	id, err := runPublishFinalize(ref)
+func (h *Hook) handleFinalize(chatID, ref string) {
+	id, err := h.runPublishFinalize(ref)
 	if err != nil {
 		slog.Error("LINE meeting: publish-odoo finalize failed",
 			"ref", ref, "err", err)
-		_ = c.sendChunks(chatID, []string{
-			"⚠️ 建立會議記錄時發生錯誤，請稍後再試或聯絡系統管理員",
-		})
+		if h.cfg.Sender != nil {
+			_ = h.cfg.Sender.SendChunks(chatID, []string{
+				"⚠️ 建立會議記錄時發生錯誤，請稍後再試或聯絡系統管理員",
+			})
+		}
 		return
 	}
 	msg := "✅ 會議記錄已建立"
 	if id > 0 {
 		msg = fmt.Sprintf("%s（id=%d）", msg, id)
-		if link := buildOdooDeepLink("job.meeting.minutes", id); link != "" {
+		if link := h.buildOdooDeepLink("job.meeting.minutes", id); link != "" {
 			msg = msg + "\n\n📎 點此查看：\n" + link
 		}
 	}
-	c.conv.clearRef(ref)
-	_ = c.sendChunks(chatID, []string{msg})
-}
-
-// buildOdooDeepLink returns a clickable Odoo 18 SPA URL to a record.
-// Odoo 18 dropped the legacy `/web#id=...` hash route in the new SPA
-// shell — `/odoo/action-<xml_id>/<id>` is the working format. We hard-
-// code the action XML id for job.meeting.minutes since this whole flow
-// is anchored on that one model; if other models need links later,
-// pass an actionXMLID parameter instead of the model alone.
-//
-// Resolution order for the base URL:
-//  1. ODOO_STAGE35_BASE_URL env (explicit)
-//  2. Strip "/mcp/v1" suffix from ODOO_STAGE35_MCP_URL
-//
-// Empty string when the base URL cannot be determined.
-const meetingMinutesActionXMLID = "job_working_plan.action_job_meeting_minutes"
-
-func buildOdooDeepLink(_ string, id int) string {
-	base := os.Getenv("ODOO_STAGE35_BASE_URL")
-	if base == "" {
-		mcp := os.Getenv("ODOO_STAGE35_MCP_URL")
-		if mcp == "" {
-			return ""
-		}
-		// Strip path suffix — accept both /mcp/v1 and /mcp/v1/.
-		base = strings.TrimSuffix(strings.TrimSuffix(mcp, "/"), "/mcp/v1")
+	h.conv.clearRef(ref)
+	if h.cfg.Sender != nil {
+		_ = h.cfg.Sender.SendChunks(chatID, []string{msg})
 	}
-	return fmt.Sprintf("%s/odoo/action-%s/%d",
-		strings.TrimRight(base, "/"), meetingMinutesActionXMLID, id)
 }
 
-func (c *Channel) handleCancel(chatID, ref string) {
-	c.conv.clearRef(ref)
-	_ = c.sendChunks(chatID, []string{"已取消。下次錄音時可重新填寫。"})
+func (h *Hook) handleCancel(chatID, ref string) {
+	h.conv.clearRef(ref)
+	if h.cfg.Sender != nil {
+		_ = h.cfg.Sender.SendChunks(chatID, []string{"已取消。下次錄音時可重新填寫。"})
+	}
 }
 
 // sendAttendeesPicker fetches partners (cached after first call), renders
 // the bubble with current selection, and replies / pushes.
-func (c *Channel) sendAttendeesPicker(chatID, ref string) {
-	pool := c.conv.getAttendeesPool(ref)
+func (h *Hook) sendAttendeesPicker(chatID, ref string) {
+	pool := h.conv.getAttendeesPool(ref)
 	if pool == nil {
 		// First time — fetch partner candidates from MCP. We use the
 		// project's team members (project.user_ids → res.users → partner_id)
 		// as the pool. Falls back to top-N res.partner if empty.
-		fetched, err := fetchProjectAttendees(context.Background(), ref)
+		fetched, err := h.fetchProjectAttendees(context.Background(), ref)
 		if err != nil {
 			slog.Warn("LINE meeting: fetch attendees failed", "ref", ref, "err", err)
 		}
 		pool = fetched
-		c.conv.cacheAttendeesPool(ref, pool)
+		h.conv.cacheAttendeesPool(ref, pool)
 	}
 	if len(pool) == 0 {
-		_ = c.sendChunks(chatID, []string{"找不到候選出席者，請至 Odoo 手動建立會議記錄。"})
+		if h.cfg.Sender != nil {
+			_ = h.cfg.Sender.SendChunks(chatID, []string{"找不到候選出席者，請至 Odoo 手動建立會議記錄。"})
+		}
 		return
 	}
 
-	selected := c.conv.getAttendees(ref)
+	selected := h.conv.getAttendees(ref)
 	bubble, err := buildAttendeesPicker(ref, pool, selected)
 	if err != nil {
 		slog.Error("LINE meeting: build attendees picker", "err", err)
 		return
 	}
-	_ = c.replyFlex(chatID, "選擇出席者", bubble)
+	if h.cfg.Sender != nil {
+		_ = h.cfg.Sender.ReplyFlex(chatID, "選擇出席者", bubble)
+	}
 }
 
-func (c *Channel) sendConfirmBubble(chatID, ref string) {
-	d, err := readDraft(draftPath(ref))
+func (h *Hook) sendConfirmBubble(chatID, ref string) {
+	d, err := readDraft(h.draftPath(ref))
 	if err != nil {
 		slog.Error("LINE meeting: re-read draft for confirm", "ref", ref, "err", err)
 		return
 	}
-	projectName := c.conv.getProjectName(ref)
+	projectName := h.conv.getProjectName(ref)
 	if projectName == "" && d.Answers.ProjectID != nil {
 		projectName = "#" + strconv.Itoa(*d.Answers.ProjectID)
 	}
@@ -787,15 +754,17 @@ func (c *Channel) sendConfirmBubble(chatID, ref string) {
 		slog.Error("LINE meeting: build confirm bubble", "ref", ref, "err", err)
 		return
 	}
-	_ = c.replyFlex(chatID, "確認會議記錄", bubble)
+	if h.cfg.Sender != nil {
+		_ = h.cfg.Sender.ReplyFlex(chatID, "確認會議記錄", bubble)
+	}
 }
 
 // --- exec wrappers ----------------------------------------------------------
 
 // runPublishUpdate calls `km-meeting-pipeline.sh publish-odoo update <ref> <field> <value>`
 // and parses the next state from stdout.
-func runPublishUpdate(ref, field, value string) (string, error) {
-	out, err := runPipeline("publish-odoo", "update", ref, field, value)
+func (h *Hook) runPublishUpdate(ref, field, value string) (string, error) {
+	out, err := runPipeline(h.cfg.PipelineScript, "publish-odoo", "update", ref, field, value)
 	if err != nil {
 		return "", err
 	}
@@ -804,7 +773,7 @@ func runPublishUpdate(ref, field, value string) (string, error) {
 	}
 	// Field is one of the optional ones (job_type_id / job_working_plan_id) —
 	// the bash side does not advance state. Re-read draft for current state.
-	d, derr := readDraft(draftPath(ref))
+	d, derr := readDraft(h.draftPath(ref))
 	if derr != nil {
 		return "", fmt.Errorf("update succeeded but state read failed: %w", derr)
 	}
@@ -813,8 +782,8 @@ func runPublishUpdate(ref, field, value string) (string, error) {
 
 // runPublishFinalize calls `km-meeting-pipeline.sh publish-odoo finalize <ref>`
 // and parses the new record id from stdout.
-func runPublishFinalize(ref string) (int, error) {
-	out, err := runPipeline("publish-odoo", "finalize", ref)
+func (h *Hook) runPublishFinalize(ref string) (int, error) {
+	out, err := runPipeline(h.cfg.PipelineScript, "publish-odoo", "finalize", ref)
 	if err != nil {
 		return 0, err
 	}
@@ -830,10 +799,10 @@ func runPublishFinalize(ref string) (int, error) {
 // merges stdout/stderr (the script logs to both) so callers can grep for
 // the marker patterns regardless of where the line was emitted.
 //
-// Override the script path with KM_MEETING_PIPELINE_SCRIPT for tests; the
-// constant lives in constants.go.
-var runPipeline = func(args ...string) (string, error) {
-	scriptPath := getMeetingPipelineScript()
+// Package-level var so tests can stub it — the `var runPipeline = func…`
+// form is deliberate. Tests in this package save the original and restore
+// it via a deferred assignment.
+var runPipeline = func(scriptPath string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), pipelineExecTimeout)
 	defer cancel()
 
@@ -875,11 +844,15 @@ func (e *mcpError) Error() string {
 // mcpToolCall posts a JSON-RPC tools/call request to the stage35 MCP server.
 // The MCP server's `tools/call` returns a structuredContent envelope; we
 // unmarshal directly into the caller-provided dst pointer.
-var mcpToolCall = func(ctx context.Context, tool string, args map[string]any, dst any) error {
-	endpoint := os.Getenv("ODOO_STAGE35_MCP_URL")
-	token := os.Getenv("ODOO_STAGE35_MCP_TOKEN")
+//
+// Package-level var so tests can stub it (see conversation_test.go's
+// `original := mcpToolCall; mcpToolCall = func(...)` pattern). Endpoint
+// and token are passed in by the Hook's callers from h.cfg — this keeps
+// the function free of env-var reads and makes Hook.cfg the single
+// source of truth for MCP configuration.
+var mcpToolCall = func(ctx context.Context, endpoint, token, tool string, args map[string]any, dst any) error {
 	if endpoint == "" || token == "" {
-		return errors.New("ODOO_STAGE35_MCP_URL / ODOO_STAGE35_MCP_TOKEN not set")
+		return errors.New("esmith-km: MCP endpoint/token not configured (h.cfg.MCPURL / h.cfg.MCPToken)")
 	}
 
 	body := mcpRequest{
@@ -943,9 +916,191 @@ var mcpToolCall = func(ctx context.Context, tool string, args map[string]any, ds
 	return errors.New("mcp result has no usable payload")
 }
 
-// fetchUserProjects returns up to 10 most-recently-active project.project
-// rows for the given Odoo user_id. Falls back to all projects on miss.
-func fetchUserProjects(ctx context.Context, userID int) ([]project, error) {
+// fetchUserProjects returns up to maxProjectsPerPicker projects to show
+// in the picker bubble.
+//
+// Primary path: call the e-smith job_field_recorder LIFF endpoint
+// `/liff/field_recorder/projects` with the LINE user ID. That endpoint
+// applies the FR module's "my projects" logic: favorites → recent →
+// others, scoped via Odoo record rules under the employee's user
+// context. This is the same three-tier ordering the FR SPA shows,
+// which is what operators expect.
+//
+// Fallback path (when LIFF is unreachable or returns zero): the older
+// MCP-based query against project.project filtered by user_id. That
+// path is known to be incomplete (see the 2026-04-08 dual-review
+// findings — it queries project.project instead of job.project, so
+// it may show projects without active working plans), but it is kept
+// as a safety net so the picker never silently fails.
+func (h *Hook) fetchUserProjects(ctx context.Context, lineUserID string, fallbackUserID int) ([]project, error) {
+	if lineUserID != "" {
+		projects, err := h.fetchProjectsViaLIFF(ctx, lineUserID)
+		if err == nil && len(projects) > 0 {
+			rememberProjectNames(projects)
+			return projects, nil
+		}
+		if err != nil {
+			slog.Warn("esmith-km: LIFF project fetch failed, falling back to MCP",
+				"line_user_id", lineUserID, "err", err)
+		}
+	}
+	return h.fetchUserProjectsViaMCP(ctx, fallbackUserID)
+}
+
+// fetchProjectsViaLIFF calls the e-smith job_field_recorder LIFF endpoint
+// `/liff/field_recorder/projects`. The endpoint uses `type='json'` which
+// means it follows the Odoo JSON-RPC 2.0 envelope:
+//
+//	{"jsonrpc":"2.0","method":"call","params":{...},"id":1}
+//
+// and returns:
+//
+//	{"jsonrpc":"2.0","id":1,"result":{"success":true,"projects":[...]}}
+//
+// On Odoo-side errors the `result` object has `success: false` and an
+// `error` field — we treat that as a non-nil error so the caller can
+// fall back to the MCP path.
+func (h *Hook) fetchProjectsViaLIFF(ctx context.Context, lineUserID string) ([]project, error) {
+	base := parseBaseURL(h.cfg.MCPURL)
+	if base == "" {
+		base = h.cfg.OdooBaseURL
+	}
+	if base == "" {
+		return nil, errors.New("esmith-km: LIFF base URL not configured")
+	}
+	endpoint := strings.TrimRight(base, "/") + "/liff/field_recorder/projects"
+
+	envelope := map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "call",
+		"id":      1,
+		"params": map[string]any{
+			"line_user_id": lineUserID,
+		},
+	}
+	raw, err := json.Marshal(envelope)
+	if err != nil {
+		return nil, err
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, mcpRequestTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, endpoint, bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("liff http: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("liff http %d", resp.StatusCode)
+	}
+
+	var decoded struct {
+		Result struct {
+			Success  bool   `json:"success"`
+			Error    string `json:"error,omitempty"`
+			Projects []struct {
+				ID         int    `json:"id"` // job.project.id
+				Name       string `json:"name"`
+				IsFavorite bool   `json:"is_favorite"`
+			} `json:"projects"`
+		} `json:"result"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+		return nil, fmt.Errorf("liff decode: %w", err)
+	}
+	if !decoded.Result.Success {
+		return nil, fmt.Errorf("liff error: %s", decoded.Result.Error)
+	}
+
+	// Collect ONLY the favorites. Per user feedback on 2026-04-08 E2E:
+	// the picker should show "我的收藏" only, not the full FR three-tier
+	// list (favorites + recent + others). Users curate their meeting
+	// picker explicitly via the FR "我的專案" screen star button; if
+	// they haven't starred anything, fall back to MCP further down.
+	type staged struct {
+		jobProjectID int
+		name         string
+	}
+	stagedRows := make([]staged, 0, maxProjectsPerPicker)
+	for _, p := range decoded.Result.Projects {
+		if !p.IsFavorite {
+			continue
+		}
+		stagedRows = append(stagedRows, staged{
+			jobProjectID: p.ID,
+			name:         p.Name,
+		})
+		if len(stagedRows) >= maxProjectsPerPicker {
+			break
+		}
+	}
+	if len(stagedRows) == 0 {
+		return nil, nil
+	}
+
+	// Resolve job.project.id → project.project.id via the m2o. Required
+	// because job.meeting.minutes.project_id is a FK to project.project,
+	// not job.project — the LIFF endpoint exposes job.project rows keyed
+	// by their own PK so we cannot use those ids directly at finalize
+	// time (see the 2026-04-08 phase 6 E2E error: FK constraint
+	// job_meeting_minutes_project_id_fkey violated when goclaw passed
+	// job.project.id as the meeting's project_id).
+	jobIDs := make([]int, len(stagedRows))
+	for i, r := range stagedRows {
+		jobIDs[i] = r.jobProjectID
+	}
+	var jpRows []struct {
+		ID        int   `json:"id"`
+		ProjectID []any `json:"project_id"` // [pp_id, pp_name] in m2o read format
+	}
+	if err := mcpToolCall(ctx, h.cfg.MCPURL, h.cfg.MCPToken, "search_records", map[string]any{
+		"model":  "job.project",
+		"domain": [][]any{{"id", "in", jobIDs}},
+		"fields": []string{"id", "project_id"},
+		"limit":  len(jobIDs),
+	}, &jpRows); err != nil {
+		return nil, fmt.Errorf("resolve job.project.project_id: %w", err)
+	}
+	ppByJobID := make(map[int]int, len(jpRows))
+	for _, r := range jpRows {
+		if len(r.ProjectID) >= 2 {
+			if f, ok := r.ProjectID[0].(float64); ok && int(f) > 0 {
+				ppByJobID[r.ID] = int(f)
+			}
+		}
+	}
+
+	// Build the final picker slice with project.project.id as the key.
+	// Preserves the LIFF favorites order (by field.recorder.favorite.sequence).
+	// Every entry here is a favorite by construction — we filtered above —
+	// so IsFavorite is hardcoded true.
+	out := make([]project, 0, len(stagedRows))
+	for _, s := range stagedRows {
+		ppID, ok := ppByJobID[s.jobProjectID]
+		if !ok {
+			slog.Warn("esmith-km: job.project missing project_id, skipping from picker",
+				"job_project_id", s.jobProjectID)
+			continue
+		}
+		out = append(out, project{
+			ID:         ppID,
+			Name:       s.name,
+			IsFavorite: true,
+		})
+	}
+	return out, nil
+}
+
+// fetchUserProjectsViaMCP is the legacy MCP-based query kept as a
+// fallback for when the LIFF endpoint is unreachable. See fetchUserProjects
+// for the primary path.
+func (h *Hook) fetchUserProjectsViaMCP(ctx context.Context, userID int) ([]project, error) {
 	args := map[string]any{
 		"model":  "project.project",
 		"domain": [][]any{{"user_id", "=", userID}},
@@ -958,13 +1113,13 @@ func fetchUserProjects(ctx context.Context, userID int) ([]project, error) {
 		ID   int    `json:"id"`
 		Name string `json:"name"`
 	}
-	if err := mcpToolCall(ctx, "search_records", args, &rows); err != nil {
+	if err := mcpToolCall(ctx, h.cfg.MCPURL, h.cfg.MCPToken, "search_records", args, &rows); err != nil {
 		return nil, err
 	}
 	if len(rows) == 0 {
 		// Fallback: any active project the bearer-token user can see.
 		args["domain"] = [][]any{{"active", "=", true}}
-		if err := mcpToolCall(ctx, "search_records", args, &rows); err != nil {
+		if err := mcpToolCall(ctx, h.cfg.MCPURL, h.cfg.MCPToken, "search_records", args, &rows); err != nil {
 			return nil, err
 		}
 	}
@@ -980,8 +1135,8 @@ func fetchUserProjects(ctx context.Context, userID int) ([]project, error) {
 // fetchProjectAttendees returns the partner pool used by the attendees
 // picker. Strategy: read draft.answers.project_id, fetch its team members,
 // then resolve them to res.partner. Falls back to top contacts if empty.
-func fetchProjectAttendees(ctx context.Context, ref string) ([]partner, error) {
-	d, err := readDraft(draftPath(ref))
+func (h *Hook) fetchProjectAttendees(ctx context.Context, ref string) ([]partner, error) {
+	d, err := readDraft(h.draftPath(ref))
 	if err != nil {
 		return nil, err
 	}
@@ -994,7 +1149,7 @@ func fetchProjectAttendees(ctx context.Context, ref string) ([]partner, error) {
 		ID      int   `json:"id"`
 		UserIDs []int `json:"user_ids"`
 	}
-	if err := mcpToolCall(ctx, "search_records", map[string]any{
+	if err := mcpToolCall(ctx, h.cfg.MCPURL, h.cfg.MCPToken, "search_records", map[string]any{
 		"model":  "project.project",
 		"domain": [][]any{{"id", "=", *d.Answers.ProjectID}},
 		"fields": []string{"id", "user_ids"},
@@ -1003,7 +1158,7 @@ func fetchProjectAttendees(ctx context.Context, ref string) ([]partner, error) {
 		return nil, err
 	}
 	if len(projectRows) == 0 || len(projectRows[0].UserIDs) == 0 {
-		return fetchPartnersFallback(ctx)
+		return h.fetchPartnersFallback(ctx)
 	}
 
 	// Resolve user_ids → partner_id.
@@ -1011,7 +1166,7 @@ func fetchProjectAttendees(ctx context.Context, ref string) ([]partner, error) {
 		ID        int   `json:"id"`
 		PartnerID []any `json:"partner_id"` // [id, name] in Odoo many2one read format
 	}
-	if err := mcpToolCall(ctx, "search_records", map[string]any{
+	if err := mcpToolCall(ctx, h.cfg.MCPURL, h.cfg.MCPToken, "search_records", map[string]any{
 		"model":  "res.users",
 		"domain": [][]any{{"id", "in", projectRows[0].UserIDs}},
 		"fields": []string{"id", "partner_id"},
@@ -1031,7 +1186,7 @@ func fetchProjectAttendees(ctx context.Context, ref string) ([]partner, error) {
 		}
 	}
 	if len(out) == 0 {
-		return fetchPartnersFallback(ctx)
+		return h.fetchPartnersFallback(ctx)
 	}
 	return out, nil
 }
@@ -1040,12 +1195,12 @@ func fetchProjectAttendees(ctx context.Context, ref string) ([]partner, error) {
 // users (res.users with share=false). This is the canonical "company employee
 // picker list" — we deliberately do NOT show generic res.partner customer
 // contacts here. Per design D4, attendees are e-smith employees.
-func fetchPartnersFallback(ctx context.Context) ([]partner, error) {
+func (h *Hook) fetchPartnersFallback(ctx context.Context) ([]partner, error) {
 	var rows []struct {
 		ID        int   `json:"id"`
 		PartnerID []any `json:"partner_id"` // [id, name] many2one read format
 	}
-	if err := mcpToolCall(ctx, "search_records", map[string]any{
+	if err := mcpToolCall(ctx, h.cfg.MCPURL, h.cfg.MCPToken, "search_records", map[string]any{
 		"model":  "res.users",
 		"domain": [][]any{{"active", "=", true}, {"share", "=", false}},
 		"fields": []string{"id", "partner_id"},

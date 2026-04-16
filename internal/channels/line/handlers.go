@@ -2,6 +2,7 @@ package line
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,14 +15,85 @@ import (
 	"github.com/line/line-bot-sdk-go/v7/linebot"
 )
 
+// hookContext returns c.hookCtx or context.Background() if the channel
+// has not been Start'd yet. The fallback exists so unit tests that
+// exercise fan-out helpers directly without calling Start still work.
+func (c *Channel) hookContext() context.Context {
+	if c.hookCtx != nil {
+		return c.hookCtx
+	}
+	return context.Background()
+}
+
+// fanOutAudio delivers an AudioEvent to every registered hook in a goroutine
+// so one slow hook cannot block others. Errors are logged but do not retry.
+// Goroutines are tracked via hookWG so Stop can wait for them to drain.
+func (c *Channel) fanOutAudio(ev AudioEvent) {
+	ctx := c.hookContext()
+	for _, h := range c.hooks {
+		h := h
+		c.hookWG.Add(1)
+		go func() {
+			defer c.hookWG.Done()
+			if err := h.OnAudio(ctx, ev); err != nil {
+				slog.Error("LINE: hook OnAudio failed", "err", err)
+			}
+		}()
+	}
+}
+
+// fanOutText delivers a TextEvent to every registered hook.
+func (c *Channel) fanOutText(ev TextEvent) {
+	ctx := c.hookContext()
+	for _, h := range c.hooks {
+		h := h
+		c.hookWG.Add(1)
+		go func() {
+			defer c.hookWG.Done()
+			if err := h.OnText(ctx, ev); err != nil {
+				slog.Error("LINE: hook OnText failed", "err", err)
+			}
+		}()
+	}
+}
+
+// fanOutPostback delivers a PostbackEvent to every registered hook.
+func (c *Channel) fanOutPostback(ev PostbackEvent) {
+	ctx := c.hookContext()
+	for _, h := range c.hooks {
+		h := h
+		c.hookWG.Add(1)
+		go func() {
+			defer c.hookWG.Done()
+			if err := h.OnPostback(ctx, ev); err != nil {
+				slog.Error("LINE: hook OnPostback failed", "err", err)
+			}
+		}()
+	}
+}
+
 // handleEvent dispatches a single LINE webhook event.
 func (c *Channel) handleEvent(event *linebot.Event) {
-	// Postback events drive the meeting writeback Flex flow. They never
-	// need policy filtering or sender bookkeeping — the conversation is
-	// always anchored on a draft that already passed those checks at
-	// AudioMessage time.
+	// Postback events are delivered to every registered MessageHook.
+	// The LINE channel itself has no business-logic opinion on postbacks;
+	// hooks interpret the `data` payload and route to their own state
+	// machine.
 	if event.Type == linebot.EventTypePostback {
-		c.handlePostback(event)
+		var uid, cid string
+		switch event.Source.Type {
+		case linebot.EventSourceTypeUser:
+			uid, cid = event.Source.UserID, event.Source.UserID
+		case linebot.EventSourceTypeGroup:
+			uid, cid = event.Source.UserID, event.Source.GroupID
+		case linebot.EventSourceTypeRoom:
+			uid, cid = event.Source.UserID, event.Source.RoomID
+		}
+		c.fanOutPostback(PostbackEvent{
+			UserID:     uid,
+			ChatID:     cid,
+			Data:       event.Postback.Data,
+			ReplyToken: event.ReplyToken,
+		})
 		return
 	}
 	if event.Type != linebot.EventTypeMessage {
@@ -70,16 +142,15 @@ func (c *Channel) handleEvent(event *linebot.Event) {
 	switch msg := event.Message.(type) {
 	case *linebot.TextMessage:
 		text = msg.Text
-		// Process any GDrive shared links in the message body asynchronously.
-		// The agent still sees the original text via HandleMessage below — a
-		// user message like "請整理 https://drive..." should still get an
-		// agent acknowledgment, with the actual file ingestion happening in
-		// parallel. Successes are silent; failures reply via LINE.
-		//
-		// Per-URL dedup happens inside ingestGdriveLinks itself so the
-		// agent path still receives the original text on resends — only
-		// the file download is suppressed.
-		go c.ingestGdriveLinks(msg.Text, userID, chatID)
+		// Fan out to hooks for any subscribers. The agent still sees
+		// the original text via HandleMessage below — hooks run in
+		// parallel to the agent path.
+		c.fanOutText(TextEvent{
+			UserID:     userID,
+			ChatID:     chatID,
+			Text:       msg.Text,
+			ReplyToken: event.ReplyToken,
+		})
 	case *linebot.ImageMessage:
 		path, err := c.downloadContent(msg.ID)
 		if err != nil {
@@ -88,25 +159,22 @@ func (c *Channel) handleEvent(event *linebot.Event) {
 		}
 		mediaFiles = append(mediaFiles, path)
 	case *linebot.AudioMessage:
-		// LINE webhook resend detection — same Message.ID arriving within
-		// the dedup TTL means LINE retried because the first response was
-		// slow. We MUST NOT re-ingest (would create a second draft) — push
-		// a "已收到此會議錄音" reply so the user knows their original send
-		// is still in flight.
-		if c.dedup != nil && c.dedup.SeenOrMark(audioMessageKey(msg.ID)) {
-			slog.Info("LINE: audio message resend detected, skipping ingest",
-				"message_id", msg.ID, "chat", chatID)
-			_ = c.sendChunks(chatID, []string{
-				"⏳ 已收到此會議錄音，正在處理中。完成後會自動傳送選單請你補欄位。",
-			})
+		// Audio messages are generic LINE content — download to a tmp
+		// file, then fan out to hooks with TempPath + ContentType set.
+		// Hooks take ownership of the tmp file (move/delete). The channel
+		// itself has no opinion on what to do with audio.
+		tmpPath, contentType, err := c.downloadAudioContent(msg.ID)
+		if err != nil {
+			slog.Error("LINE: failed to download audio", "err", err, "message_id", msg.ID)
 			return
 		}
-		// Audio messages bypass the agent and go straight to the
-		// km-meeting-pipeline inbox. The downstream cron handles ffmpeg
-		// compression and nlm transcription independently.
-		if err := c.ingestLineAudio(msg, userID, chatID); err != nil {
-			slog.Error("LINE: failed to ingest audio", "err", err, "message_id", msg.ID)
-		}
+		c.fanOutAudio(AudioEvent{
+			UserID:      userID,
+			ChatID:      chatID,
+			MessageID:   msg.ID,
+			ContentType: contentType,
+			TempPath:    tmpPath,
+		})
 		return
 	default:
 		// Unsupported message type — ignore.
@@ -118,6 +186,34 @@ func (c *Channel) handleEvent(event *linebot.Event) {
 	}
 
 	c.HandleMessage(senderID, chatID, text, mediaFiles, metadata, peerKind)
+}
+
+// downloadAudioContent fetches a LINE audio message body to a temp file and
+// returns the file path plus the response Content-Type. The caller is
+// responsible for moving / renaming the file out of the temp area.
+func (c *Channel) downloadAudioContent(messageID string) (string, string, error) {
+	resp, err := c.bot.GetMessageContent(messageID).Do()
+	if err != nil {
+		return "", "", fmt.Errorf("get audio content: %w", err)
+	}
+	defer resp.Content.Close()
+
+	tmp, err := os.CreateTemp("", "line-audio-*")
+	if err != nil {
+		return "", "", fmt.Errorf("create temp file: %w", err)
+	}
+
+	if _, err := io.Copy(tmp, resp.Content); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return "", "", fmt.Errorf("write audio: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmp.Name())
+		return "", "", fmt.Errorf("close temp file: %w", err)
+	}
+
+	return tmp.Name(), resp.ContentType, nil
 }
 
 // downloadContent downloads message content to a temp file and returns the path.
