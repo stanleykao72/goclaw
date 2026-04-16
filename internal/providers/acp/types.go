@@ -102,9 +102,15 @@ type NewSessionResponse struct {
 }
 
 // PromptRequest sends user content to the agent.
+// PromptRequest sends user content to the agent.
+//
+// The content array serializes under the JSON key "prompt" — Gemini CLI's
+// session/prompt validator expects that key; sending "content" raises
+// jsonrpc -32603. The Go field name stays as "Content" for continuity with
+// other ACP clients in the codebase; only the wire tag moves.
 type PromptRequest struct {
 	SessionID string         `json:"sessionId"`
-	Content   []ContentBlock `json:"content"`
+	Content   []ContentBlock `json:"prompt"`
 }
 
 // PromptResponse is the final response after the agent completes.
