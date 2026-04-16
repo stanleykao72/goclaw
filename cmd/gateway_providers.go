@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -18,6 +19,26 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 	"github.com/nextlevelbuilder/goclaw/internal/tools"
 )
+
+// resolveACPArgs returns the spawn args for an ACP subprocess with DWIM handling
+// of the config-level model field. If cfgModel is non-empty and cfgArgs does not
+// already specify --model (either as separate token or --model=X form), the
+// function prepends ["--model", cfgModel] to the args and reports injected=true.
+// Otherwise it returns cfgArgs unchanged with injected=false.
+func resolveACPArgs(cfgModel string, cfgArgs []string) (args []string, injected bool) {
+	if cfgModel == "" {
+		return cfgArgs, false
+	}
+	for _, a := range cfgArgs {
+		if a == "--model" || strings.HasPrefix(a, "--model=") {
+			return cfgArgs, false
+		}
+	}
+	resolved := make([]string, 0, len(cfgArgs)+2)
+	resolved = append(resolved, "--model", cfgModel)
+	resolved = append(resolved, cfgArgs...)
+	return resolved, true
+}
 
 // loopbackAddr normalizes a gateway address for local connections.
 // CLI processes on the same machine can't connect to 0.0.0.0 on some OSes.
@@ -443,8 +464,15 @@ func registerACPFromConfig(registry *providers.Registry, cfg config.ACPConfig) {
 	if cfg.PermMode != "" {
 		opts = append(opts, providers.WithACPPermMode(cfg.PermMode))
 	}
+	spawnArgs, injected := resolveACPArgs(cfg.Model, cfg.Args)
+	if injected {
+		slog.Warn("acp: auto-injected --model from config.acp.model",
+			"model", cfg.Model,
+			"original_args", cfg.Args,
+			"spawn_args", spawnArgs)
+	}
 	registry.Register(providers.NewACPProvider(
-		cfg.Binary, cfg.Args, workDir, idleTTL, tools.DefaultDenyPatterns(), opts...,
+		cfg.Binary, spawnArgs, workDir, idleTTL, tools.DefaultDenyPatterns(), opts...,
 	))
 	slog.Info("registered provider", "name", "acp", "binary", cfg.Binary)
 }
