@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"log/slog"
+	"maps"
 	"sync"
 
 	"github.com/google/uuid"
@@ -255,12 +256,8 @@ func BuiltinToolSettingsFromCtx(ctx context.Context) BuiltinToolSettings {
 
 	// Both tiers present: layer tenant override on top of global defaults.
 	merged := make(BuiltinToolSettings, len(global)+len(tenant))
-	for k, v := range global {
-		merged[k] = v
-	}
-	for k, v := range tenant {
-		merged[k] = v
-	}
+	maps.Copy(merged, global)
+	maps.Copy(merged, tenant)
 	return merged
 }
 
@@ -361,6 +358,24 @@ func MemoryConfigFromCtx(ctx context.Context) *config.MemoryConfig {
 	return nil
 }
 
+// --- Per-agent wait tool config override ---
+
+const ctxWaitToolCfg toolContextKey = "tool_wait_config"
+
+func WithWaitToolConfig(ctx context.Context, cfg *config.WaitToolPolicy) context.Context {
+	return context.WithValue(ctx, ctxWaitToolCfg, cfg)
+}
+
+func WaitToolConfigFromCtx(ctx context.Context) *config.WaitToolPolicy {
+	if v, _ := ctx.Value(ctxWaitToolCfg).(*config.WaitToolPolicy); v != nil {
+		return v
+	}
+	if rc := store.RunContextFromCtx(ctx); rc != nil {
+		return rc.WaitToolCfg
+	}
+	return nil
+}
+
 // --- Team ID propagation (task dispatch → workspace tools) ---
 
 const ctxTeamID toolContextKey = "tool_team_id"
@@ -400,6 +415,27 @@ func ToolTeamWorkspaceFromCtx(ctx context.Context) string {
 	}
 	if rc := store.RunContextFromCtx(ctx); rc != nil {
 		return rc.TeamWorkspace
+	}
+	return ""
+}
+
+// --- Team root (team-wide shared root, above UserChatLayer) ---
+
+const ctxTeamRoot toolContextKey = "tool_team_root"
+
+// WithToolTeamRoot stores the team-wide root directory (e.g. /app/workspace/teams/<team_id>/)
+// without the UserChatLayer suffix. Any agent belonging to the team (leader or member) sees
+// this path as an allowed prefix so file tools can read across chat/user scopes within the
+// same team. Per-chat write isolation is preserved by still resolving writes against the
+// agent's own workspace first; this key only widens the allowed-prefix set for path checks.
+func WithToolTeamRoot(ctx context.Context, dir string) context.Context {
+	return context.WithValue(ctx, ctxTeamRoot, dir)
+}
+
+// ToolTeamRootFromCtx returns the team-wide root directory, or empty if not set.
+func ToolTeamRootFromCtx(ctx context.Context) string {
+	if v, _ := ctx.Value(ctxTeamRoot).(string); v != "" {
+		return v
 	}
 	return ""
 }
@@ -602,6 +638,22 @@ func InjectTeamDispatch(ctx context.Context, postTurn PostTurnProcessor) (contex
 	return ctx, drain
 }
 
+// --- Workstation ID (for tool execution context) ---
+
+const ctxWorkstationID toolContextKey = "tool_workstation_id"
+
+// WithWorkstationID injects the active workstation UUID string into context.
+// Used by workstation execution tools (Phase 5) to identify the target backend.
+func WithWorkstationID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, ctxWorkstationID, id)
+}
+
+// WorkstationIDFromCtx returns the workstation ID from context, or empty string.
+func WorkstationIDFromCtx(ctx context.Context) string {
+	v, _ := ctx.Value(ctxWorkstationID).(string)
+	return v
+}
+
 // --- Delivered media tracker (write_file → message self-send dedup) ---
 
 const ctxDeliveredMedia toolContextKey = "tool_delivered_media"
@@ -707,6 +759,29 @@ func SandboxConfigFromCtx(ctx context.Context) *sandbox.Config {
 	}
 	if rc := store.RunContextFromCtx(ctx); rc != nil {
 		return rc.SandboxCfg
+	}
+	return nil
+}
+
+// --- Per-tenant allowed paths (filesystem tool access beyond workspace) ---
+
+const ctxTenantAllowedPaths toolContextKey = "tool_tenant_allowed_paths"
+
+// WithTenantAllowedPaths injects tenant-specific allowed path prefixes into context.
+// These paths extend filesystem tool access beyond the agent's workspace.
+// Loaded from system_configs['allowed_paths'] per tenant.
+func WithTenantAllowedPaths(ctx context.Context, paths []string) context.Context {
+	return context.WithValue(ctx, ctxTenantAllowedPaths, paths)
+}
+
+// TenantAllowedPathsFromCtx returns tenant-specific allowed paths from context.
+// Falls back to RunContext for subagent inheritance.
+func TenantAllowedPathsFromCtx(ctx context.Context) []string {
+	if v, _ := ctx.Value(ctxTenantAllowedPaths).([]string); len(v) > 0 {
+		return v
+	}
+	if rc := store.RunContextFromCtx(ctx); rc != nil {
+		return rc.TenantAllowedPaths
 	}
 	return nil
 }

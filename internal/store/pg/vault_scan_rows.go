@@ -16,6 +16,7 @@ type vaultDocRow struct {
 	TenantID     uuid.UUID  `db:"tenant_id"`
 	AgentID      *uuid.UUID `db:"agent_id"`
 	TeamID       *uuid.UUID `db:"team_id"`
+	ChatID       *string    `db:"chat_id"`
 	Scope        string     `db:"scope"`
 	CustomScope  *string    `db:"custom_scope"`
 	Path         string     `db:"path"`
@@ -53,10 +54,23 @@ func (r *vaultDocRow) toVaultDocument() store.VaultDocument {
 		s := r.TeamID.String()
 		doc.TeamID = &s
 	}
+	if r.ChatID != nil {
+		s := *r.ChatID
+		doc.ChatID = &s
+	}
 	if len(r.MetaJSON) > 0 {
 		json.Unmarshal(r.MetaJSON, &doc.Metadata) //nolint:errcheck
 	}
 	return doc
+}
+
+// vaultDocRowsToDocs converts a slice of vaultDocRow to store.VaultDocument.
+func vaultDocRowsToDocs(rows []vaultDocRow) []store.VaultDocument {
+	docs := make([]store.VaultDocument, len(rows))
+	for i := range rows {
+		docs[i] = rows[i].toVaultDocument()
+	}
+	return docs
 }
 
 // vaultSearchRow extends vaultDocRow with a computed score column for search queries.

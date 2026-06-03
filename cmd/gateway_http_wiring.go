@@ -3,8 +3,13 @@ package cmd
 import (
 	"context"
 	"log/slog"
+	"os"
+	"time"
 
+	"github.com/nextlevelbuilder/goclaw/internal/audio"
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
+	"github.com/nextlevelbuilder/goclaw/internal/edition"
+	"github.com/nextlevelbuilder/goclaw/internal/gateway/methods"
 	httpapi "github.com/nextlevelbuilder/goclaw/internal/http"
 	mcpbridge "github.com/nextlevelbuilder/goclaw/internal/mcp"
 	"github.com/nextlevelbuilder/goclaw/internal/media"
@@ -118,6 +123,8 @@ func (d *gatewayDeps) wireHTTPHandlersOnServer(
 						pgMem.UpdateChunkConfig(mem.MaxChunkLen, mem.ChunkOverlap)
 					}
 				}
+				// Note: vault enrichment provider is resolved per-tenant at runtime,
+				// no hot-reload needed here
 				slog.Debug("system_configs refreshed to in-memory config", "keys", len(sysConfigs))
 			}
 		})
@@ -128,8 +135,12 @@ func (d *gatewayDeps) wireHTTPHandlersOnServer(
 		d.server.SetUsageHandler(httpapi.NewUsageHandler(d.pgStores.Snapshots, d.pgStores.DB))
 	}
 
-	// Runtime package management (install/uninstall system/pip/npm packages)
-	d.server.SetPackagesHandler(httpapi.NewPackagesHandler())
+	// Runtime package management (install/uninstall system/pip/npm/github packages)
+	// Wire the update registry AFTER initGitHubInstaller so DefaultGitHubInstaller() is set.
+	initGitHubInstaller()
+	pkgHandler := wirePackagesHandler(d)
+	d.server.SetPackagesHandler(pkgHandler)
+	d.server.SetGatewayUpgradeHandler(httpapi.NewGatewayUpgradeHandlerFromEnv())
 
 	// API documentation (OpenAPI spec + Swagger UI at /docs)
 	d.server.SetDocsHandler(httpapi.NewDocsHandler())
@@ -141,6 +152,71 @@ func (d *gatewayDeps) wireHTTPHandlersOnServer(
 		d.server.SetAPIKeysHandler(httpapi.NewAPIKeysHandler(d.pgStores.APIKeys, d.msgBus))
 		d.server.SetAPIKeyStore(d.pgStores.APIKeys)
 		httpapi.InitAPIKeyCache(d.pgStores.APIKeys, d.msgBus)
+	}
+
+	// K10: single shared webhookLimiter — one per process enforces per-tenant RPM cap across
+	// both LLM and message endpoints. Two separate instances would double the effective cap.
+	webhookEncKey := os.Getenv("GOCLAW_ENCRYPTION_KEY")
+
+	// K6: refuse to mount any webhook handler when GOCLAW_ENCRYPTION_KEY is unset.
+	// crypto.Encrypt("", "") returns plaintext unchanged, so an empty key would silently
+	// persist raw secrets to the database — defeating the stated DB-leak protection.
+	// Skip-mount approach: process still starts (all other subsystems work), but
+	// /v1/webhooks/* returns 404. Set GOCLAW_ENCRYPTION_KEY to re-enable webhooks.
+	if webhookEncKey == "" {
+		slog.Error("webhook subsystem disabled: GOCLAW_ENCRYPTION_KEY not set. Set the env var to enable /v1/webhooks/* endpoints.")
+	} else {
+		sharedWebhookLimiter := httpapi.NewWebhookLimiter()
+
+		// Webhook admin CRUD — available in all editions (Standard + Lite).
+		// Runtime routes (/v1/webhooks/message, /v1/webhooks/llm) are mounted by phases 05/06.
+		if d.pgStores != nil && d.pgStores.Webhooks != nil {
+			adminH := httpapi.NewWebhooksAdminHandler(
+				d.pgStores.Webhooks,
+				d.pgStores.Tenants,
+				d.msgBus,
+			)
+			adminH.SetEncKey(webhookEncKey)
+			d.server.SetWebhooksAdminHandler(adminH)
+		}
+
+		// Webhook message endpoint — Standard edition only (channels required).
+		// Phase 05b: POST /v1/webhooks/message → sync channel send (text + optional media).
+		if edition.Current().AllowsChannels() &&
+			d.pgStores != nil &&
+			d.pgStores.Webhooks != nil &&
+			d.pgStores.WebhookCalls != nil &&
+			d.pgStores.ChannelInstances != nil &&
+			d.channelMgr != nil {
+			msgH := httpapi.NewWebhookMessageHandler(
+				d.channelMgr,
+				d.pgStores.ChannelInstances,
+				d.pgStores.WebhookCalls,
+				d.pgStores.Webhooks,
+				sharedWebhookLimiter, // K10: shared limiter
+			)
+			msgH.SetEncKey(webhookEncKey) // K6: decrypt secret at HMAC verify time
+			d.server.SetWebhookMessageHandler(msgH)
+		}
+
+		// Webhook LLM endpoint — all editions (Standard + Lite).
+		// Phase 06: POST /v1/webhooks/llm → sync agent run (≤30s) or async enqueue.
+		// LocalhostOnly enforcement is handled by WebhookAuthMiddleware at request time.
+		// lane=nil → handler self-creates internal default lane (4-slot).
+		if d.pgStores != nil &&
+			d.pgStores.Webhooks != nil &&
+			d.pgStores.WebhookCalls != nil &&
+			d.agentRouter != nil {
+			llmH := httpapi.NewWebhookLLMHandler(
+				d.agentRouter,
+				d.pgStores.WebhookCalls,
+				d.pgStores.Webhooks,
+				sharedWebhookLimiter, // K10: shared limiter
+				nil,                  // lane: nil → internal default (4-slot); configurable in future via cfg
+			)
+			llmH.SetEncKey(webhookEncKey) // K6: decrypt secret at HMAC verify time
+			d.server.SetWebhookLLMHandler(llmH)
+		}
 	}
 
 	// Allow browser-paired users to access HTTP APIs
@@ -177,7 +253,18 @@ func (d *gatewayDeps) wireHTTPHandlersOnServer(
 	if d.pgStores != nil && d.pgStores.Vault != nil {
 		vh := httpapi.NewVaultHandler(d.pgStores.Vault, d.pgStores.Teams, d.workspace, d.domainBus, d.pgStores.Agents, d.pgStores.Teams)
 		vh.SetEnrichProgress(d.enrichProgress)
+		vh.SetEnrichWorker(d.enrichWorker)
 		d.server.SetVaultHandler(vh)
+
+		// Lightweight graph visualization endpoints (vault + KG).
+		var kgGraph store.KGGraphStore
+		if d.pgStores.KnowledgeGraph != nil {
+			kgGraph = newKGGraphStore(d.pgStores.DB)
+		}
+		vgHandler := httpapi.NewVaultGraphHandler(
+			newVaultGraphStore(d.pgStores.DB), kgGraph, d.pgStores.Teams,
+		)
+		d.server.SetVaultGraphHandler(vgHandler)
 	}
 
 	// V3: Episodic memory summaries API
@@ -199,7 +286,7 @@ func (d *gatewayDeps) wireHTTPHandlersOnServer(
 	d.server.SetFilesHandler(httpapi.NewFilesHandler(d.workspace, d.dataDir))
 
 	// Storage file management — browse/delete files under the resolved workspace directory.
-	d.server.SetStorageHandler(httpapi.NewStorageHandler(d.workspace))
+	d.server.SetStorageHandler(httpapi.NewStorageHandler(d.workspace, d.pgStores.Tenants))
 
 	// Media upload endpoint — accepts multipart file uploads, returns temp path + MIME type.
 	d.server.SetMediaUploadHandler(httpapi.NewMediaUploadHandler())
@@ -207,6 +294,68 @@ func (d *gatewayDeps) wireHTTPHandlersOnServer(
 	// Media serve endpoint — serves persisted media files by ID for WS/web clients.
 	if mediaStore != nil {
 		d.server.SetMediaServeHandler(httpapi.NewMediaServeHandler(mediaStore))
+	}
+
+	// ElevenLabs voice list + refresh endpoints (GET /v1/voices, POST /v1/voices/refresh).
+	// VoiceCache is shared between the HTTP handler and the WS voices.list method.
+	// TTL 1h + LRU cap 1000 tenants.
+	{
+		voiceCache := audio.NewVoiceCache(1*time.Hour, 1000)
+		var secretStore store.ConfigSecretsStore
+		if d.pgStores != nil && d.pgStores.ConfigSecrets != nil {
+			secretStore = d.pgStores.ConfigSecrets
+		}
+		var tenantStore store.TenantStore
+		if d.pgStores != nil && d.pgStores.Tenants != nil {
+			tenantStore = d.pgStores.Tenants
+		}
+		voicesH := httpapi.NewVoicesHandler(voiceCache, secretStore, tenantStore)
+		d.server.SetVoicesHandler(voicesH)
+		// Wire WS method — provider nil means each request resolves key via secretStore at HTTP layer.
+		// For WS, use same cache. Provider is resolved via secretStore at WS level in a future phase.
+		methods.NewVoicesMethods(voiceCache, nil).Register(d.server.Router())
+	}
+
+	// TTS synthesize endpoint — shares audio.Manager with setupTTS.
+	if d.audioMgr != nil {
+		ttsH := httpapi.NewTTSHandler(d.audioMgr)
+		// Reuse the server's rate limiter (per-IP/token; NOT per-user).
+		// Server.RateLimiter() is non-nil by construction (server.go:104).
+		if rl := d.server.RateLimiter(); rl != nil && rl.Enabled() {
+			ttsH.SetRateLimiter(rl.Allow)
+		}
+		// Wire stores for per-tenant TTS config lookup at synthesis time.
+		if d.pgStores.SystemConfigs != nil && d.pgStores.ConfigSecrets != nil {
+			ttsH.SetStores(d.pgStores.SystemConfigs, d.pgStores.ConfigSecrets)
+			// Wire tenant resolver for channels TTS auto-apply
+			d.audioMgr.SetTenantResolver(httpapi.NewTenantTTSResolver(d.pgStores.SystemConfigs, d.pgStores.ConfigSecrets))
+		}
+		d.server.SetTTSHandler(ttsH)
+		d.ttsHandler = ttsH // store for hot-reload
+	}
+
+	// Per-tenant TTS config endpoint — allows tenant admins to configure TTS.
+	if d.pgStores.SystemConfigs != nil && d.pgStores.ConfigSecrets != nil {
+		d.server.SetTTSConfigHandler(httpapi.NewTTSConfigHandler(d.pgStores.SystemConfigs, d.pgStores.ConfigSecrets, d.pgStores.Tenants))
+	}
+
+	// Workstations API — Standard edition only.
+	// Lite edition MUST NOT expose these routes (silent orphan data + contract violation).
+	if edition.Current().Name != "lite" {
+		if d.pgStores != nil && d.pgStores.Workstations != nil && d.pgStores.WorkstationLinks != nil {
+			wsH := httpapi.NewWorkstationsHandler(
+				d.pgStores.Workstations,
+				d.pgStores.WorkstationLinks,
+				d.pgStores.Tenants,
+			)
+			if d.pgStores.WorkstationPermissions != nil {
+				wsH.SetPermStore(d.pgStores.WorkstationPermissions)
+			}
+			if d.pgStores.WorkstationActivity != nil {
+				wsH.SetActivityStore(d.pgStores.WorkstationActivity)
+			}
+			d.server.SetWorkstationsHandler(wsH)
+		}
 	}
 
 	// Seed + apply builtin tool disables

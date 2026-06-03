@@ -6,7 +6,10 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/google/uuid"
+	"github.com/nextlevelbuilder/goclaw/internal/hooks"
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
+	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
 
 // FinalizeStage runs once after the iteration loop exits. Sanitizes content,
@@ -58,7 +61,27 @@ func (s *FinalizeStage) Execute(ctx context.Context, state *RunState) error {
 	// 3. Deduplicate + populate media sizes
 	s.processMedia(state)
 
-	// 3b. Build final assistant message with MediaRefs for session persistence.
+	// 3b. Persist assistant-generated images (Codex image_generation_call) to disk
+	// BEFORE building the assistant message so MediaRefs are included in the session store.
+	// Source is state.Observe.AssistantImages, which ObserveStage accumulates across
+	// every iteration — required because LastResponse holds only the final iteration's
+	// response (an image emitted mid-loop alongside a tool call would otherwise be lost).
+	var assistantImageRefs []providers.MediaRef
+	if s.deps.PersistAssistantImages != nil && len(state.Observe.AssistantImages) > 0 {
+		workspace := ""
+		if state.Workspace != nil {
+			workspace = state.Workspace.ActivePath
+		}
+		// Build a scratch message carrying only Images so PersistAssistantImages can
+		// decode/hash/write them and populate MediaRefs. The caller clears Images on
+		// the scratch message — we harvest MediaRefs from there.
+		scratch := &providers.Message{Images: state.Observe.AssistantImages}
+		s.deps.PersistAssistantImages(scratch, workspace)
+		assistantImageRefs = scratch.MediaRefs
+		state.Observe.AssistantImages = nil // prevent double-processing on retries
+	}
+
+	// 3c. Build final assistant message with MediaRefs for session persistence.
 	assistantMsg := providers.Message{
 		Role:     "assistant",
 		Content:  state.Observe.FinalContent,
@@ -79,8 +102,11 @@ func (s *FinalizeStage) Execute(ctx context.Context, state *RunState) error {
 			MimeType: mr.ContentType,
 			Kind:     kind,
 			Path:     mr.Path,
+			Prompt:   mr.Prompt,
 		})
 	}
+	// Append persisted assistant image refs (Codex image_generation_call output).
+	assistantMsg.MediaRefs = append(assistantMsg.MediaRefs, assistantImageRefs...)
 	state.Messages.AppendPending(assistantMsg)
 
 	// 4. Flush remaining pending messages to session store
@@ -129,8 +155,19 @@ func (s *FinalizeStage) Execute(ctx context.Context, state *RunState) error {
 		state.Observe.FinalContent = ""
 	}
 
+	// 11. Hook: async EventStop — fire and forget.
 	// run.completed event is emitted by loop_run.go after Pipeline.Run() returns,
 	// with full tracing context. No duplicate emission here.
+	if s.deps.Hooks != nil {
+		detached := context.WithoutCancel(ctx)
+		go s.deps.FireHook(detached, hooks.Event{ //nolint:errcheck
+			EventID:   uuid.NewString(),
+			SessionID: state.Input.SessionKey,
+			TenantID:  store.TenantIDFromContext(ctx),
+			AgentID:   store.AgentIDFromContext(ctx),
+			HookEvent: hooks.EventStop,
+		})
+	}
 
 	return nil
 }

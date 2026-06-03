@@ -15,6 +15,7 @@ import (
 type WriteFileTool struct {
 	workspace       string
 	restrict        bool
+	allowedPrefixes []string // extra allowed path prefixes (cross-drive on Windows)
 	deniedPrefixes  []string // path prefixes to deny access to (e.g. .goclaw)
 	sandboxMgr      sandbox.Manager
 	contextFileIntc *ContextFileInterceptor     // nil = no virtual FS routing
@@ -22,6 +23,12 @@ type WriteFileTool struct {
 	permStore       store.ConfigPermissionStore // nil = no group write restriction
 	workspaceIntc   *WorkspaceInterceptor       // nil = no team workspace validation
 	vaultIntc       *VaultInterceptor           // nil = no vault registration
+}
+
+// AllowPaths adds extra path prefixes that write_file is allowed to access
+// even when restrict_to_workspace is true (e.g. cross-drive on Windows).
+func (t *WriteFileTool) AllowPaths(prefixes ...string) {
+	t.allowedPrefixes = append(t.allowedPrefixes, prefixes...)
 }
 
 // DenyPaths adds path prefixes that write_file must reject.
@@ -162,7 +169,7 @@ func (t *WriteFileTool) Execute(ctx context.Context, args map[string]any) *Resul
 	if workspace == "" {
 		workspace = t.workspace
 	}
-	allowed := allowedWithTeamWorkspace(ctx, nil)
+	allowed := allowedWriteWithTeamWorkspace(ctx, t.allowedPrefixes)
 	resolved, err := resolvePathWithAllowed(path, workspace, effectiveRestrict(ctx, t.restrict), allowed)
 	if err != nil {
 		return ErrorResult(err.Error())
@@ -223,7 +230,7 @@ func (t *WriteFileTool) Execute(ctx context.Context, args map[string]any) *Resul
 	result := SilentResult(msg)
 	result.Deliverable = content
 	if deliver {
-		result.Media = []bus.MediaFile{{Path: resolved}}
+		result.Media = []bus.MediaFile{{Path: resolved, Filename: filepath.Base(resolved)}}
 		// Track delivered path so message tool's self-send guard can detect duplicates.
 		if dm := DeliveredMediaFromCtx(ctx); dm != nil {
 			dm.Mark(resolved)
@@ -233,14 +240,13 @@ func (t *WriteFileTool) Execute(ctx context.Context, args map[string]any) *Resul
 }
 
 func (t *WriteFileTool) executeInSandbox(ctx context.Context, path, content, sandboxKey string, deliver, appendMode bool) *Result {
-	bridge, err := t.getFsBridge(ctx, sandboxKey)
-	if err != nil {
-		return ErrorResult(fmt.Sprintf("sandbox error: %v", err))
-	}
-
 	containerCwd, cwdErr := SandboxCwd(ctx, t.workspace, sandbox.DefaultContainerWorkdir)
 	if cwdErr != nil {
 		return ErrorResult(fmt.Sprintf("sandbox path mapping: %v", cwdErr))
+	}
+	bridge, err := t.getFsBridge(ctx, sandboxKey, containerCwd)
+	if err != nil {
+		return ErrorResult(fmt.Sprintf("sandbox error: %v", err))
 	}
 	containerPath := ResolveSandboxPath(path, containerCwd)
 
@@ -269,7 +275,7 @@ func (t *WriteFileTool) executeInSandbox(ctx context.Context, path, content, san
 			workspace = t.workspace
 		}
 		hostPath := filepath.Join(workspace, path)
-		result.Media = []bus.MediaFile{{Path: hostPath}}
+		result.Media = []bus.MediaFile{{Path: hostPath, Filename: filepath.Base(hostPath)}}
 		if dm := DeliveredMediaFromCtx(ctx); dm != nil {
 			dm.Mark(hostPath)
 		}
@@ -277,10 +283,10 @@ func (t *WriteFileTool) executeInSandbox(ctx context.Context, path, content, san
 	return result
 }
 
-func (t *WriteFileTool) getFsBridge(ctx context.Context, sandboxKey string) (*sandbox.FsBridge, error) {
+func (t *WriteFileTool) getFsBridge(ctx context.Context, sandboxKey, containerCwd string) (*sandbox.FsBridge, error) {
 	sb, err := t.sandboxMgr.Get(ctx, sandboxKey, t.workspace, SandboxConfigFromCtx(ctx))
 	if err != nil {
 		return nil, err
 	}
-	return sandbox.NewFsBridge(sb.ID(), sandbox.DefaultContainerWorkdir), nil
+	return sandbox.NewFsBridge(sb.ID(), containerCwd), nil
 }

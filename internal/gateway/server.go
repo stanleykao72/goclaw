@@ -21,11 +21,11 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/config"
 	httpapi "github.com/nextlevelbuilder/goclaw/internal/http"
 	mcpbridge "github.com/nextlevelbuilder/goclaw/internal/mcp"
-	"github.com/nextlevelbuilder/goclaw/internal/webui"
 	"github.com/nextlevelbuilder/goclaw/internal/permissions"
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 	"github.com/nextlevelbuilder/goclaw/internal/tools"
+	"github.com/nextlevelbuilder/goclaw/internal/webui"
 	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
 )
 
@@ -50,21 +50,21 @@ type Server struct {
 	// Non-handler dependencies (don't implement RegisterRoutes)
 	policyEngine   *permissions.PolicyEngine
 	pairingService store.PairingStore
-	apiKeyStore    store.APIKeyStore  // for API key auth lookup
-	agentStore     store.AgentStore   // for context injection in tools_invoke
-	msgBus         *bus.MessageBus    // for MCP bridge media delivery
+	apiKeyStore    store.APIKeyStore // for API key auth lookup
+	agentStore     store.AgentStore  // for context injection in tools_invoke
+	msgBus         *bus.MessageBus   // for MCP bridge media delivery
 
 	upgrader    websocket.Upgrader
 	rateLimiter *RateLimiter
 	clients     map[string]*Client
 	mu          sync.RWMutex
 
-	startedAt      time.Time
-	version        string
-	db             interface{ PingContext(context.Context) error } // for health check DB ping
-	updateChecker  *UpdateChecker
+	startedAt     time.Time
+	version       string
+	db            interface{ PingContext(context.Context) error } // for health check DB ping
+	updateChecker *UpdateChecker
 
-	logTee   *LogTee                  // optional; auto-unsubscribes clients on disconnect
+	logTee   *LogTee                 // optional; auto-unsubscribes clients on disconnect
 	postTurn tools.PostTurnProcessor // optional; for team task dispatch in HTTP API paths
 
 	httpServer *http.Server
@@ -185,7 +185,7 @@ func (s *Server) BuildMux() *http.ServeMux {
 		if s.cfg.Gateway.Token != "" {
 			bridgeHandler := mcpbridge.NewBridgeServer(s.tools, "1.0.0", s.msgBus)
 			handler := tokenAuthMiddleware(s.cfg.Gateway.Token,
-				bridgeContextMiddleware(s.cfg.Gateway.Token, bridgeHandler))
+				bridgeContextMiddleware(s.cfg.Gateway.Token, s.agentStore, bridgeHandler))
 			mux.Handle("/mcp/bridge", handler)
 		} else {
 			slog.Warn("security.mcp_bridge_disabled: no gateway token configured, MCP bridge is disabled")
@@ -212,7 +212,7 @@ func (s *Server) BuildMux() *http.ServeMux {
 // access agent/user scope and resolve workspace-relative paths.
 // When a gateway token is configured, the context headers must be accompanied by
 // a valid X-Bridge-Sig HMAC to prevent forgery.
-func bridgeContextMiddleware(gatewayToken string, next http.Handler) http.Handler {
+func bridgeContextMiddleware(gatewayToken string, agentStore store.AgentStore, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		agentIDStr := r.Header.Get("X-Agent-ID")
@@ -221,6 +221,8 @@ func bridgeContextMiddleware(gatewayToken string, next http.Handler) http.Handle
 		chatID := r.Header.Get("X-Chat-ID")
 		peerKind := r.Header.Get("X-Peer-Kind")
 		workspace := r.Header.Get("X-Workspace")
+		localKey := r.Header.Get("X-Local-Key")
+		sessionKey := r.Header.Get("X-Session-Key")
 
 		if agentIDStr != "" || userID != "" {
 			// Reject context headers when no gateway token — prevents unauthenticated impersonation.
@@ -234,7 +236,7 @@ func bridgeContextMiddleware(gatewayToken string, next http.Handler) http.Handle
 			// Verify HMAC signature over all context fields.
 			tenantIDStr := r.Header.Get("X-Tenant-ID")
 			sig := r.Header.Get("X-Bridge-Sig")
-			ok, tenantVerified := providers.VerifyBridgeContext(gatewayToken, agentIDStr, userID, channel, chatID, peerKind, workspace, tenantIDStr, sig)
+			ok, tenantVerified := providers.VerifyBridgeContext(gatewayToken, agentIDStr, userID, channel, chatID, peerKind, workspace, tenantIDStr, sig, localKey, sessionKey)
 			if !ok {
 				slog.Warn("security.mcp_bridge: invalid bridge context signature",
 					"agent_id", agentIDStr, "user_id", userID)
@@ -245,6 +247,18 @@ func bridgeContextMiddleware(gatewayToken string, next http.Handler) http.Handle
 			if agentIDStr != "" {
 				if id, err := uuid.Parse(agentIDStr); err == nil {
 					ctx = store.WithAgentID(ctx, id)
+
+					// Inject per-agent shell deny group overrides so the exec tool
+					// respects the same policy as the normal agent loop.
+					if agentStore != nil {
+						ag, err := agentStore.GetByIDUnscoped(ctx, id)
+						if err == nil && ag != nil {
+							groups := ag.ParseShellDenyGroups()
+							if groups != nil {
+								ctx = store.WithShellDenyGroups(ctx, groups)
+							}
+						}
+					}
 				}
 			}
 			if userID != "" {
@@ -273,6 +287,15 @@ func bridgeContextMiddleware(gatewayToken string, next http.Handler) http.Handle
 		// Only when agent context is present (HMAC-protected) to prevent unauthenticated path injection.
 		if workspace != "" && (agentIDStr != "" || userID != "") {
 			ctx = tools.WithToolWorkspace(ctx, workspace)
+		}
+		// Routing context (localKey, sessionKey) is injected unconditionally like channel/chatID.
+		// These are used for message routing (forum topics), not security-sensitive operations.
+		// Without valid agent context, tool execution will fail anyway.
+		if localKey != "" {
+			ctx = tools.WithToolLocalKey(ctx, localKey)
+		}
+		if sessionKey != "" {
+			ctx = tools.WithToolSessionKey(ctx, sessionKey)
 		}
 
 		next.ServeHTTP(w, r.WithContext(ctx))
@@ -441,11 +464,34 @@ func (s *Server) SetPackagesHandler(h *httpapi.PackagesHandler) {
 	s.handlers = append(s.handlers, h)
 }
 
+// SetGatewayUpgradeHandler sets the host-local gateway upgrade trigger handler.
+func (s *Server) SetGatewayUpgradeHandler(h *httpapi.GatewayUpgradeHandler) {
+	s.handlers = append(s.handlers, h)
+}
+
 // SetOAuthHandler sets the OAuth handler (available in all modes).
 func (s *Server) SetOAuthHandler(h *httpapi.OAuthHandler) { s.handlers = append(s.handlers, h) }
 
 // SetAPIKeysHandler sets the API key management handler.
 func (s *Server) SetAPIKeysHandler(h *httpapi.APIKeysHandler) {
+	s.handlers = append(s.handlers, h)
+}
+
+// SetWebhooksAdminHandler registers the webhook admin CRUD handler.
+func (s *Server) SetWebhooksAdminHandler(h *httpapi.WebhooksAdminHandler) {
+	s.handlers = append(s.handlers, h)
+}
+
+// SetWebhookMessageHandler registers the POST /v1/webhooks/message runtime handler.
+// Only called when edition.Current().AllowsChannels() is true (Standard edition).
+func (s *Server) SetWebhookMessageHandler(h *httpapi.WebhookMessageHandler) {
+	s.handlers = append(s.handlers, h)
+}
+
+// SetWebhookLLMHandler registers the POST /v1/webhooks/llm runtime handler.
+// Available in all editions (Standard + Lite). Localhost-only enforcement is
+// handled by WebhookAuthMiddleware at request time via webhook.LocalhostOnly.
+func (s *Server) SetWebhookLLMHandler(h *httpapi.WebhookLLMHandler) {
 	s.handlers = append(s.handlers, h)
 }
 
@@ -486,8 +532,22 @@ func (s *Server) SetEvolutionHandler(h *httpapi.EvolutionHandler) {
 	s.handlers = append(s.handlers, h)
 }
 
+// SetVoicesHandler sets the ElevenLabs voices list + refresh handler.
+func (s *Server) SetVoicesHandler(h *httpapi.VoicesHandler) { s.handlers = append(s.handlers, h) }
+
+// SetTTSHandler sets the TTS synthesize handler.
+func (s *Server) SetTTSHandler(h *httpapi.TTSHandler) { s.handlers = append(s.handlers, h) }
+
+// SetTTSConfigHandler sets the per-tenant TTS config handler.
+func (s *Server) SetTTSConfigHandler(h *httpapi.TTSConfigHandler) { s.handlers = append(s.handlers, h) }
+
 // SetVaultHandler sets the Knowledge Vault document handler.
 func (s *Server) SetVaultHandler(h *httpapi.VaultHandler) { s.handlers = append(s.handlers, h) }
+
+// SetVaultGraphHandler sets the lightweight graph visualization handler.
+func (s *Server) SetVaultGraphHandler(h *httpapi.VaultGraphHandler) {
+	s.handlers = append(s.handlers, h)
+}
 
 // SetEpisodicHandler sets the episodic memory handler.
 func (s *Server) SetEpisodicHandler(h *httpapi.EpisodicHandler) { s.handlers = append(s.handlers, h) }
@@ -538,6 +598,11 @@ func (s *Server) SetAgentStore(as store.AgentStore) { s.agentStore = as }
 
 // SetMessageBus sets the message bus for MCP bridge media delivery.
 func (s *Server) SetMessageBus(mb *bus.MessageBus) { s.msgBus = mb }
+
+// SetWorkstationsHandler sets the workstations CRUD handler (Standard edition only).
+func (s *Server) SetWorkstationsHandler(h *httpapi.WorkstationsHandler) {
+	s.handlers = append(s.handlers, h)
+}
 
 // SetVersion sets the server version for health responses.
 func (s *Server) SetVersion(v string) { s.version = v }

@@ -100,16 +100,25 @@ All four filesystem tools (`read_file`, `write_file`, `list_files`, `edit`) impl
 | **Deny patterns** | Per-binary regex deny lists on arguments + verbose flags | Sensitive operations per CLI (e.g., `auth`, `ssh-key`) |
 | **Output scrub** | Credential values registered for dynamic scrubbing | Credentials in stdout/stderr |
 
-**Edge case mitigations** (13 scenarios analyzed):
-- Shell operators in command string → Blocked by early regex scan
-- Argument injection via spaces → Protected by shell-word parsing (not shell evaluation)
-- Binary PATH manipulation → Absolute path required + config match
-- Symlink attacks → Verified by `exec.LookPath()` + config match
-- Env var exfiltration → Command runs without shell, env vars never expand
-- Output parsing tricks → Dynamic scrubbing catches all registered credential values
-- Timeout abuse → Configurable per-binary timeout with context deadline
-- Sandbox escape → Docker container isolation if sandbox enabled
-- Verbose flag leakage → Separate deny_verbose list blocks verbose/debug output
+| Attack Surface | Mitigation |
+|----------------|------------|
+| Shell operator injection, argument injection via spaces | Early regex scan + shell-word parsing (no shell evaluation) |
+| Binary PATH manipulation, symlink attacks | `exec.LookPath()` + absolute path required + config match |
+| Env var exfiltration, output parsing tricks | No-shell exec (env vars never expand) + dynamic credential scrubbing |
+| Timeout abuse | Configurable per-binary timeout with context deadline |
+| Sandbox escape | Docker container isolation when sandbox enabled |
+| Verbose flag leakage | Separate deny_verbose list blocks verbose/debug output |
+
+**Agent-level grant enforcement** -- The gate runs **before** any process spawn, blocking ungranted agents from executing registered binaries:
+
+| Control | Implementation |
+|---------|-----------------|
+| **Grant lookup** | `store.SecureCLIStore.IsRegisteredBinary(ctx, binaryName)` checks `secure_cli_agent_grants` table. Non-global binaries require a row for the calling agent. |
+| **Fail-CLOSED** | If the grant lookup errors (DB down, timeout), exec is denied with retry message. Per-lookup timeout: 2 seconds. |
+| **Env scrubbing** | When a command escapes the credentialed path (e.g., via adversarial `exec` tool), child process env is scrubbed of all credential keys (static deny list + dynamic keys from every registered binary in the tenant) before spawn. Prevents credential leakage into non-credentialed commands. |
+| **Wrapper unwrap** | Blocks shell wrappers (`sh -c`, `bash -c`, etc.) that attempt to evade binary path matching. Checks up to 3 levels of nesting; deeper chains are rejected as adversarial. |
+| **Logging** | Three security events: `security.credentialed_binary_denied` (ungranted agent), `security.credentialed_binary_gate_error` (lookup failure), `security.credentialed_binary_wrapper_too_deep` (nested wrapper attack). All include: binary, wrapper, agent_id, tenant_id, command prefix. |
+| **Subagent wiring** | Subagent `ExecTool`s use the same `SecureCLIStore` via `cmd/gateway_agents.go` → `buildSubagentToolsRegistry`. Parent agents cannot bypass the gate by delegating exec to spawned subagents. |
 
 ### Layer 4: Output Security
 
@@ -447,31 +456,54 @@ When concurrency limits are hit, the error message is written for LLM reasoning:
 
 ---
 
+## 13. Package Management Security
+
+### pkg-helper privilege model (v1 / v2)
+
+The `pkg-helper` sidecar is the only root-privileged component of the gateway.
+
+| Boundary | Detail |
+|----------|--------|
+| Socket path | `/tmp/pkg.sock` |
+| Permissions | 0600 — owner `root`, accessible only to `goclaw` uid 1000 |
+| Gateway process | Runs as uid 1000 (goclaw); never calls `apk` directly |
+| Helper process | Runs as root inside the container; started by `docker-entrypoint.sh` before privilege drop |
+
+Package name validation is defense-in-depth at three layers:
+1. HTTP handler (`ValidateApkPackageName` — strict `^[a-z0-9][a-z0-9._+-]*$` regex)
+2. `ApkUpdateExecutor.Update()` — same validator before socket dial
+3. pkg-helper itself — validates again server-side before exec
+
+### pkg-helper v2 (Phase 2b)
+
+- **Trust boundary unchanged from v1:** `/tmp/pkg.sock` 0600 owned by `root`,
+  group-readable by `goclaw`.
+- **New actions** (`upgrade`, `update-index`, `list-outdated`) run under the same
+  root privilege as v1 `install`/`uninstall`. No privilege escalation; same exec
+  path, new action names.
+- **`code` field** on error responses enables HTTP handlers to map errors to
+  appropriate 4xx/5xx statuses without stderr parsing — eliminates the string-grep
+  anti-pattern that risked misclassification.
+- **apk invocation serialization** via process-wide `sync.Mutex` (`apkMutex`)
+  prevents TOCTOU races between concurrent `install` + `upgrade` operations on the
+  `/var/lib/apk/db` lock file.
+- **No new network surface:** pkg-helper has no HTTP listener; it uses the same
+  Unix socket as v1. The socket path (`/tmp/pkg.sock`) is unchanged.
+- **Stderr truncation:** helper stderr captured by the gateway is truncated to
+  500 chars (ANSI-stripped) before logging — prevents path leakage and PII in logs.
+
+---
+
 ## File Reference
 
-| File | Description |
-|------|-------------|
-| `internal/agent/input_guard.go` | Injection pattern detection (6 patterns) |
-| `internal/tools/scrub.go` | Credential scrubbing (regex-based redaction), dynamic scrub values |
-| `internal/tools/shell.go` | Shell deny patterns, command validation |
-| `internal/tools/web_fetch.go` | Web content wrapping, SSRF protection |
-| `internal/permissions/policy.go` | RBAC (3 roles, scope-based access), method routing |
-| `internal/gateway/ratelimit.go` | Gateway-level token bucket rate limiter (per user/IP) |
-| `internal/sandbox/sandbox.go` | Docker sandbox configuration and modes |
-| `internal/sandbox/docker.go` | Docker sandbox creation, execution, pruning |
-| `internal/sandbox/fsbridge.go` | File operations in sandbox (read/write/list) |
-| `internal/crypto/aes.go` | AES-256-GCM encrypt/decrypt |
-| `internal/crypto/apikey.go` | API key generation (format, hash, display prefix) |
-| `internal/tools/types.go` | PathDenyable interface definition |
-| `internal/tools/filesystem.go` | Denied path checking (`checkDeniedPath` helper) |
-| `internal/tools/filesystem_list.go` | Denied path support + directory filtering |
-| `internal/gateway/methods/pairing.go` | Pairing RPC methods (request, approve, deny, list, revoke) |
-| `internal/store/pg/pairing.go` | Pairing store implementation (code generation, TTLs) |
-| `internal/store/pairing_store.go` | Pairing store interface definition |
-| `cmd/pkg-helper/main.go` | Root-privileged helper for apk add/del via Unix socket |
-| `internal/http/packages.go` | HTTP handlers for package management endpoints |
-| `internal/skills/package_lister.go` | Query installed packages from apk/pip3/npm |
-| `docker-entrypoint.sh` | Container initialization: setup runtime dirs, start pkg-helper, drop privileges |
+| Module | Path | Purpose |
+|---|---|---|
+| Input & output protection | `internal/agent/input_guard.go`, `internal/tools/scrub.go`, `internal/tools/shell.go`, `internal/tools/web_fetch.go` | Injection detection, credential scrubbing, shell deny patterns, SSRF protection |
+| Crypto, RBAC & rate limiting | `internal/crypto/`, `internal/permissions/policy.go`, `internal/gateway/ratelimit.go` | AES-256-GCM, API key generation, 3-role RBAC, token bucket |
+| Sandbox & filesystem isolation | `internal/sandbox/`, `internal/tools/filesystem*.go`, `internal/tools/types.go` | Docker sandbox lifecycle, FsBridge, PathDenyable interface |
+| Pairing, packages & container init | `internal/gateway/methods/pairing.go`, `internal/store/pg/pairing.go`, `cmd/pkg-helper/`, `docker-entrypoint.sh` | Browser pairing, pkg-helper Unix socket, container privilege drop |
+
+Use `grep` or your editor's symbol search for specific files.
 
 ---
 

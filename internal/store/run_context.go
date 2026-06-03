@@ -33,6 +33,8 @@ type RunContext struct {
 	SelfEvolve          bool
 	SharedMemory        bool
 	SharedKG            bool
+	SharedSessions      bool
+	SharedContext       bool
 	RestrictToWorkspace bool
 
 	// Tool configuration
@@ -43,18 +45,21 @@ type RunContext struct {
 	ParentProvider      string
 	MemoryCfg           *config.MemoryConfig
 	SandboxCfg          *sandbox.Config
+	WaitToolCfg         *config.WaitToolPolicy
 	ShellDenyGroups     map[string]bool
 
 	// Workspace
-	Workspace        string
-	TeamWorkspace    string
-	TeamID           string
-	WorkspaceChannel string
-	WorkspaceChatID  string
-	TeamTaskID       string
-	DelegationID     string // delegation identifier for vault auto-linking (empty when not in delegation)
-	LeaderAgentID    string // leader's agent UUID for member memory read fallback
-	AgentToolKey     string // tool-level agent key for registry routing
+	Workspace          string
+	TeamWorkspace      string
+	TeamID             string
+	WorkspaceChannel   string
+	WorkspaceChatID    string
+	TeamIsolated       bool // true when team.workspace_scope != "shared" — drives chat_id filtering in vault search
+	TeamTaskID         string
+	DelegationID       string   // delegation identifier for vault auto-linking (empty when not in delegation)
+	LeaderAgentID      string   // leader's agent UUID for member memory read fallback
+	AgentToolKey       string   // tool-level agent key for registry routing
+	TenantAllowedPaths []string // tenant-specific allowed paths beyond workspace (from system_configs)
 }
 
 // WithRunContext stores a RunContext on the context.

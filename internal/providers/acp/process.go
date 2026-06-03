@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 )
 
@@ -178,9 +177,7 @@ func (pp *ProcessPool) spawn(ctx context.Context, poolKey string) (*ACPProcess, 
 	cmd := exec.CommandContext(procCtx, pp.agentBinary, pp.agentArgs...)
 	cmd.Dir = pp.workDir
 	cmd.Env = filterACPEnv(os.Environ())
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Pdeathsig: syscall.SIGKILL,
-	}
+	cmd.SysProcAttr = sysProcAttr()
 
 	stdinPipe, err := cmd.StdinPipe()
 	if err != nil {

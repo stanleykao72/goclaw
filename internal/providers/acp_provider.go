@@ -102,7 +102,7 @@ func NewACPProvider(binary string, args []string, workDir string, idleTTL time.D
 }
 
 // sessionReaper removes ACP sessions idle for more than 30 minutes.
-// This reduces memory on the Gemini process side over time.
+// Sends session/cancel to release resources on the agent side before purging locally.
 func (p *ACPProvider) sessionReaper() {
 	const sessionIdleTTL = 30 * time.Minute
 	ticker := time.NewTicker(5 * time.Minute)
@@ -114,6 +114,9 @@ func (p *ACPProvider) sessionReaper() {
 				entry := value.(*acpSessionEntry)
 				if time.Since(entry.lastUsed) > sessionIdleTTL {
 					slog.Info("acp: expiring idle session", "goclaw_session", key, "sid", entry.id)
+					if entry.proc != nil {
+						_ = entry.proc.Cancel(entry.id)
+					}
 					p.acpSessions.Delete(key)
 				}
 				return true
@@ -224,7 +227,7 @@ func (p *ACPProvider) Chat(ctx context.Context, req ChatRequest) (*ChatResponse,
 		return &ChatResponse{
 			Content:      fmt.Sprintf("[ACP Error] %v", err),
 			FinishReason: "error",
-		}, nil
+		}, err
 	}
 
 	slog.Info("acp: chat completed", "session", sessionKey, "sid", acpSessionID,
@@ -298,7 +301,7 @@ func (p *ACPProvider) ChatStream(ctx context.Context, req ChatRequest, onChunk f
 		return &ChatResponse{
 			Content:      fmt.Sprintf("[ACP Error] %v", err),
 			FinishReason: "error",
-		}, nil
+		}, err
 	}
 
 	onChunk(StreamChunk{Done: true})
@@ -313,8 +316,15 @@ func (p *ACPProvider) ChatStream(ctx context.Context, req ChatRequest, onChunk f
 }
 
 // purgeSession removes a session entry from both tracking maps.
+// Sends session/cancel to release resources on the agent side before purging locally.
 // Used to immediately discard one-shot (temp-) sessions after completion.
 func (p *ACPProvider) purgeSession(key string) {
+	if val, ok := p.acpSessions.Load(key); ok {
+		entry := val.(*acpSessionEntry)
+		if entry.proc != nil {
+			_ = entry.proc.Cancel(entry.id)
+		}
+	}
 	p.acpSessions.Delete(key)
 	p.sessionMu.Delete(key)
 	slog.Info("acp: purged temp session", "goclaw_session", key)

@@ -85,6 +85,10 @@
     "tenantDisabled": "Tắt cho tenant này",
     "tenantDefault": "Dùng mặc định",
     "resetToDefault": "Đặt lại mặc định",
+    "tenantOverrideBadge": "Ghi đè tenant",
+    "tenantOverrideHint": "Đang chỉnh ghi đè của tenant này. Thay đổi chỉ áp dụng cho tenant này.",
+    "tenantOverrideNewHint": "Tạo ghi đè mới cho tenant này. Đã điền sẵn giá trị mặc định toàn cục.",
+    "resetToGlobalDefault": "Đặt lại về mặc định toàn cục",
     "unconfiguredWarning": "{{count}} công cụ cần cấu hình provider để agent sử dụng đầy đủ năng lực.",
     "unconfiguredAction": "Cấu hình",
     "categories": {
@@ -139,6 +143,64 @@
       "save": "Lưu",
       "saving": "Đang lưu..."
     },
+    "searchChain": {
+      "title": "Chuỗi nhà cung cấp tìm kiếm web",
+      "description": "Kéo để sắp xếp lại nhà cung cấp tìm kiếm. Nhà cung cấp đầu tiên được bật với API key hợp lệ sẽ được thử trước.",
+      "maxResults": "Số kết quả tối đa",
+      "locked": "Dự phòng luôn bật",
+      "cancel": "Hủy",
+      "save": "Lưu",
+      "saving": "Đang lưu...",
+      "providers": {
+        "exa": "Exa",
+        "tavily": "Tavily",
+        "brave": "Brave Search",
+        "duckduckgo": "DuckDuckGo"
+      },
+      "apiKey": "API Key",
+      "apiKeySet": "✓ Đã có key",
+      "apiKeyChange": "Thay đổi",
+      "apiKeyPlaceholder": "Nhập API key",
+      "apiKeyReplacePlaceholder": "Nhập key mới để thay thế"
+    },
+    "ttsForm": {
+      "title": "Cài đặt TTS",
+      "description": "Cấu hình nhà cung cấp chuyển văn bản thành giọng nói và chế độ tự động áp dụng.",
+      "primary": "Nhà cung cấp chính",
+      "auto": "Chế độ tự động",
+      "autoOff": "Tắt",
+      "autoInbound": "Giọng nói đến",
+      "autoTagged": "Có thẻ",
+      "autoAlways": "Luôn luôn",
+      "autoOffDesc": "Chỉ khi agent tường minh sử dụng công cụ tts",
+      "autoInboundDesc": "Tự động áp dụng khi người dùng gửi giọng nói/âm thanh",
+      "autoTaggedDesc": "Áp dụng khi văn bản chứa chỉ thị [[tts]]",
+      "autoAlwaysDesc": "Luôn chuyển đổi câu trả lời cuối thành giọng nói",
+      "cancel": "Hủy",
+      "save": "Lưu",
+      "saving": "Đang lưu..."
+    },
+    "sttForm": {
+      "title": "Cài đặt STT",
+      "description": "Cấu hình nhà cung cấp chuyển giọng nói thành văn bản cho tin nhắn thoại.",
+      "providersLabel": "Nhà cung cấp",
+      "providersPlaceholder": "Chọn nhà cung cấp",
+      "elevenlabsSectionTitle": "ElevenLabs",
+      "elevenlabsApiKeyLabel": "API Key",
+      "elevenlabsDefaultLanguageLabel": "Ngôn ngữ mặc định",
+      "proxySectionTitle": "Proxy",
+      "proxyUrlLabel": "URL Proxy",
+      "proxyApiKeyLabel": "API Key Proxy",
+      "proxyTenantIdLabel": "Tenant ID Proxy",
+      "whatsappEnabledLabel": "Bật STT cho WhatsApp",
+      "whatsappPrivacyWarning": "Bật STT cho WhatsApp sẽ phá vỡ mã hóa đầu cuối cho tin nhắn thoại gửi đến agent này.",
+      "providersRequiredError": "Phải chọn ít nhất một nhà cung cấp.",
+      "cancel": "Hủy",
+      "save": "Lưu",
+      "saving": "Đang lưu...",
+      "saveSuccess": "Đã lưu cài đặt STT",
+      "saveFailed": "Lưu cài đặt STT thất bại"
+    },
     "extractorChain": {
       "title": "Web Fetch — Chuỗi bộ trích xuất",
       "description": "Danh sách bộ trích xuất nội dung theo thứ tự. Mỗi URL được thử từ trên xuống cho đến khi một bộ trả về nội dung chất lượng.",
@@ -170,7 +232,10 @@
       "addProvider": "Thêm provider",
       "cancel": "Hủy",
       "save": "Lưu",
-      "saving": "Đang lưu..."
+      "saving": "Đang lưu...",
+      "imageModelLabel": "Mô hình ảnh",
+      "imageModelDefaultOption": "Mặc định · gpt-image-2 (khuyến nghị)",
+      "imageModelLegacyOption": "Cũ · gpt-image-1.5"
     },
     "toast": {
       "toggled": "Đã cập nhật công cụ",

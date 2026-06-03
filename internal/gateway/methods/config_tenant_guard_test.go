@@ -11,13 +11,13 @@ import (
 	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
 )
 
-// ---- Tests: isMasterScopeContext helper ----
+// ---- Tests: store.IsMasterScope helper ----
 
 func TestIsMasterScopeContext_OwnerRole_Allowed(t *testing.T) {
 	ctx := store.WithRole(context.Background(), store.RoleOwner)
 	// Tenant set to a non-master tenant — owner role must still pass
 	ctx = store.WithTenantID(ctx, uuid.MustParse("11111111-1111-1111-1111-111111111111"))
-	if !isMasterScopeContext(ctx) {
+	if !store.IsMasterScope(ctx) {
 		t.Fatalf("owner role with non-master tenant should be allowed")
 	}
 }
@@ -25,14 +25,14 @@ func TestIsMasterScopeContext_OwnerRole_Allowed(t *testing.T) {
 func TestIsMasterScopeContext_NilTenant_Allowed(t *testing.T) {
 	// Legacy / system callers without tenant scope → treated as master
 	ctx := context.Background()
-	if !isMasterScopeContext(ctx) {
+	if !store.IsMasterScope(ctx) {
 		t.Fatalf("nil tenant ctx should be allowed (master-scope fallback)")
 	}
 }
 
 func TestIsMasterScopeContext_MasterTenant_Allowed(t *testing.T) {
 	ctx := store.WithTenantID(context.Background(), store.MasterTenantID)
-	if !isMasterScopeContext(ctx) {
+	if !store.IsMasterScope(ctx) {
 		t.Fatalf("master tenant ctx should be allowed")
 	}
 }
@@ -40,7 +40,7 @@ func TestIsMasterScopeContext_MasterTenant_Allowed(t *testing.T) {
 func TestIsMasterScopeContext_NonMasterTenantNoOwner_Denied(t *testing.T) {
 	tid := uuid.MustParse("22222222-2222-2222-2222-222222222222")
 	ctx := store.WithTenantID(context.Background(), tid)
-	if isMasterScopeContext(ctx) {
+	if store.IsMasterScope(ctx) {
 		t.Fatalf("non-master tenant ctx without owner role must be denied")
 	}
 }
@@ -50,7 +50,7 @@ func TestIsMasterScopeContext_NonMasterTenantWithOwnerRole_Allowed(t *testing.T)
 	tid := uuid.MustParse("33333333-3333-3333-3333-333333333333")
 	ctx := store.WithTenantID(context.Background(), tid)
 	ctx = store.WithRole(ctx, store.RoleOwner)
-	if !isMasterScopeContext(ctx) {
+	if !store.IsMasterScope(ctx) {
 		t.Fatalf("owner role must bypass tenant scope check")
 	}
 }

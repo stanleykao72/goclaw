@@ -85,6 +85,10 @@
     "tenantDisabled": "Disabled for this tenant",
     "tenantDefault": "Using default",
     "resetToDefault": "Reset to default",
+    "tenantOverrideBadge": "Tenant override",
+    "tenantOverrideHint": "Editing this tenant's override. Changes apply only to this tenant.",
+    "tenantOverrideNewHint": "Creating a new override for this tenant. Pre-filled with global defaults.",
+    "resetToGlobalDefault": "Reset to global default",
     "unconfiguredWarning": "{{count}} tools need provider configuration for agents to use them at full capacity.",
     "unconfiguredAction": "Configure",
     "categories": {
@@ -139,6 +143,64 @@
       "save": "Save",
       "saving": "Saving..."
     },
+    "searchChain": {
+      "title": "Web Search Provider Chain",
+      "description": "Drag to reorder search providers. First enabled provider with a valid API key is tried first.",
+      "maxResults": "Max results",
+      "locked": "Always-on fallback",
+      "cancel": "Cancel",
+      "save": "Save",
+      "saving": "Saving...",
+      "providers": {
+        "exa": "Exa",
+        "tavily": "Tavily",
+        "brave": "Brave Search",
+        "duckduckgo": "DuckDuckGo"
+      },
+      "apiKey": "API Key",
+      "apiKeySet": "✓ Key set",
+      "apiKeyChange": "Change",
+      "apiKeyPlaceholder": "Enter API key",
+      "apiKeyReplacePlaceholder": "Enter new key to replace"
+    },
+    "ttsForm": {
+      "title": "TTS Settings",
+      "description": "Configure text-to-speech provider and auto-apply mode.",
+      "primary": "Primary provider",
+      "auto": "Auto mode",
+      "autoOff": "Off",
+      "autoInbound": "Voice inbound",
+      "autoTagged": "Tagged",
+      "autoAlways": "Always",
+      "autoOffDesc": "Only when agent explicitly uses tts tool",
+      "autoInboundDesc": "Auto-apply when user sends voice/audio",
+      "autoTaggedDesc": "Apply when text contains [[tts]] directive",
+      "autoAlwaysDesc": "Always convert final reply to speech",
+      "cancel": "Cancel",
+      "save": "Save",
+      "saving": "Saving..."
+    },
+    "sttForm": {
+      "title": "STT Settings",
+      "description": "Configure speech-to-text providers for transcribing voice messages.",
+      "providersLabel": "Providers",
+      "providersPlaceholder": "Select providers",
+      "elevenlabsSectionTitle": "ElevenLabs",
+      "elevenlabsApiKeyLabel": "API Key",
+      "elevenlabsDefaultLanguageLabel": "Default Language",
+      "proxySectionTitle": "Proxy",
+      "proxyUrlLabel": "Proxy URL",
+      "proxyApiKeyLabel": "Proxy API Key",
+      "proxyTenantIdLabel": "Proxy Tenant ID",
+      "whatsappEnabledLabel": "Enable STT for WhatsApp",
+      "whatsappPrivacyWarning": "Enabling STT for WhatsApp breaks end-to-end encryption for voice messages sent to this agent.",
+      "providersRequiredError": "At least one provider must be selected.",
+      "cancel": "Cancel",
+      "save": "Save",
+      "saving": "Saving...",
+      "saveSuccess": "STT settings saved",
+      "saveFailed": "Failed to save STT settings"
+    },
     "extractorChain": {
       "title": "Web Fetch — Extractor Chain",
       "description": "Ordered list of content extractors. Each URL is tried top-to-bottom until one returns quality content.",
@@ -170,7 +232,10 @@
       "addProvider": "Add Provider",
       "cancel": "Cancel",
       "save": "Save",
-      "saving": "Saving..."
+      "saving": "Saving...",
+      "imageModelLabel": "Image model",
+      "imageModelDefaultOption": "Default · gpt-image-2 (recommended)",
+      "imageModelLegacyOption": "Legacy · gpt-image-1.5"
     },
     "toast": {
       "toggled": "Tool updated",

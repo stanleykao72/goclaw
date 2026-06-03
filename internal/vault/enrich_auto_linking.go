@@ -18,7 +18,7 @@ import (
 //
 // Nil-tolerant: teamStore may be unset (e.g. during tests), in which
 // case the phase is a silent no-op.
-func (w *enrichWorker) phase25TaskLinking(ctx context.Context, embedded []enriched, docMap map[string]*store.VaultDocument) {
+func (w *EnrichWorker) phase25TaskLinking(ctx context.Context, embedded []enriched, docMap map[string]*store.VaultDocument) {
 	if w.teamStore == nil || len(embedded) == 0 {
 		return
 	}
@@ -102,7 +102,7 @@ func (w *enrichWorker) phase25TaskLinking(ctx context.Context, embedded []enrich
 //
 // Batched query via VaultStore.BatchFindByDelegationIDs; single
 // CreateLinks call. No-op when no embedded doc carries metadata.delegation_id.
-func (w *enrichWorker) phase26DelegationLinking(ctx context.Context, embedded []enriched, docMap map[string]*store.VaultDocument) {
+func (w *EnrichWorker) phase26DelegationLinking(ctx context.Context, embedded []enriched, docMap map[string]*store.VaultDocument) {
 	if len(embedded) == 0 {
 		return
 	}

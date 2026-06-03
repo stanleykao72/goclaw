@@ -12,27 +12,29 @@ import (
 	"time"
 
 	"github.com/nextlevelbuilder/goclaw/internal/agent"
+	"github.com/nextlevelbuilder/goclaw/internal/bgalert"
 	"github.com/nextlevelbuilder/goclaw/internal/bootstrap"
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/cache"
 	"github.com/nextlevelbuilder/goclaw/internal/channels"
-	"github.com/nextlevelbuilder/goclaw/internal/consolidation"
-	"github.com/nextlevelbuilder/goclaw/internal/eventbus"
-	kg "github.com/nextlevelbuilder/goclaw/internal/knowledgegraph"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/discord"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/facebook"
-	"github.com/nextlevelbuilder/goclaw/internal/channels/pancake"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/feishu"
+	"github.com/nextlevelbuilder/goclaw/internal/channels/pancake"
 	slackchannel "github.com/nextlevelbuilder/goclaw/internal/channels/slack"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/telegram"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/whatsapp"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/zalo"
 	zalopersonal "github.com/nextlevelbuilder/goclaw/internal/channels/zalo/personal"
 	"github.com/nextlevelbuilder/goclaw/internal/config"
+	"github.com/nextlevelbuilder/goclaw/internal/consolidation"
 	"github.com/nextlevelbuilder/goclaw/internal/edition"
+	"github.com/nextlevelbuilder/goclaw/internal/eventbus"
 	"github.com/nextlevelbuilder/goclaw/internal/gateway"
 	"github.com/nextlevelbuilder/goclaw/internal/gateway/methods"
+	"github.com/nextlevelbuilder/goclaw/internal/hooks"
 	httpapi "github.com/nextlevelbuilder/goclaw/internal/http"
+	kg "github.com/nextlevelbuilder/goclaw/internal/knowledgegraph"
 	mcpbridge "github.com/nextlevelbuilder/goclaw/internal/mcp"
 	"github.com/nextlevelbuilder/goclaw/internal/media"
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
@@ -42,6 +44,9 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/tools"
 	"github.com/nextlevelbuilder/goclaw/internal/vault"
 	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
+
+	// Register workstation backend factories via init().
+	_ "github.com/nextlevelbuilder/goclaw/internal/workstation/backends"
 )
 
 func runGateway() {
@@ -77,6 +82,10 @@ func runGateway() {
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		slog.Error("failed to load config", "error", err)
+		os.Exit(1)
+	}
+	if err := config.ValidateGatewayAuth(cfg.Gateway); err != nil {
+		slog.Error("unsafe gateway auth configuration", "error", err)
 		os.Exit(1)
 	}
 
@@ -132,7 +141,7 @@ func runGateway() {
 		tools.DetectServerIPs(context.Background())
 	}
 
-	toolsReg, execApprovalMgr, mcpMgr, sandboxMgr, browserMgr, webFetchTool, ttsTool, permPE, toolPE, dataDir, agentCfg := setupToolRegistry(cfg, workspace, providerRegistry)
+	toolsReg, execApprovalMgr, mcpMgr, sandboxMgr, browserMgr, webFetchTool, ttsTool, audioMgr, permPE, toolPE, dataDir, agentCfg := setupToolRegistry(cfg, workspace, providerRegistry)
 	if browserMgr != nil {
 		defer browserMgr.Close()
 	}
@@ -141,6 +150,17 @@ func runGateway() {
 	}
 
 	pgStores, traceCollector, snapshotWorker := setupStoresAndTracing(cfg, dataDir, msgBus)
+
+	// Recover from crashes: flip ghost 'summoning' rows to 'summon_failed'.
+	// Summon goroutines don't survive process restart; stale DB rows would trap the UI.
+	if pgStores.Agents != nil {
+		if n, err := pgStores.Agents.ResetStuckSummoning(context.Background()); err != nil {
+			slog.Warn("agents.reset_stuck_summoning_failed", "err", err)
+		} else if n > 0 {
+			slog.Info("agents.reset_stuck_summoning", "count", n)
+		}
+	}
+
 	if traceCollector != nil {
 		defer traceCollector.Stop()
 		// OTel OTLP export: compiled via build tags. Build with 'go build -tags otel' to enable.
@@ -198,9 +218,10 @@ func runGateway() {
 				KGStore:       pgStores.KnowledgeGraph,
 				SessionStore:  pgStores.Sessions,
 				EventBus:      domainBus,
-				Provider:      bgProvider,
-				Model:         bgModel,
+				SystemConfigs: pgStores.SystemConfigs,
+				Registry:      providerRegistry,
 				Extractor:     kgExtractor,
+				AlertDeps:     bgalert.AlertDeps{SystemConfigs: pgStores.SystemConfigs, MsgBus: msgBus},
 				AgentStore:    pgStores.Agents,
 			})
 			defer cleanupConsolidation()
@@ -211,19 +232,23 @@ func runGateway() {
 	}
 
 	// V3: Wire vault enrichment worker (async summary + embedding + auto-linking).
+	// Provider is resolved per-tenant at runtime — no static provider needed.
 	var enrichProgress *vault.EnrichProgress
-	if pgStores.Vault != nil && bgProvider != nil {
-		cleanupVaultEnrich, ep := vault.RegisterEnrichWorker(vault.EnrichWorkerDeps{
-			VaultStore: pgStores.Vault,
-			Provider:   bgProvider,
-			Model:      bgModel,
-			EventBus:   domainBus,
-			MsgBus:     msgBus,
-			TeamStore:  pgStores.Teams, // Phase 04 task-based auto-linking
+	var enrichWorker *vault.EnrichWorker
+	if pgStores.Vault != nil && providerRegistry != nil {
+		cleanupVaultEnrich, ep, ew := vault.RegisterEnrichWorker(vault.EnrichWorkerDeps{
+			VaultStore:    pgStores.Vault,
+			SystemConfigs: pgStores.SystemConfigs,
+			Registry:      providerRegistry,
+			EventBus:      domainBus,
+			MsgBus:        msgBus,
+			TeamStore:     pgStores.Teams,
+			AlertDeps:     bgalert.AlertDeps{SystemConfigs: pgStores.SystemConfigs, MsgBus: msgBus},
 		})
 		enrichProgress = ep
+		enrichWorker = ew
 		defer cleanupVaultEnrich()
-		slog.Info("vault enrichment worker registered", "provider", bgProvider.Name(), "model", bgModel)
+		slog.Info("vault enrichment worker registered (per-tenant provider resolution)")
 	}
 
 	loadBootstrapFiles(pgStores, workspace, agentCfg)
@@ -235,8 +260,8 @@ func runGateway() {
 		slog.Info("bootstrap: capabilities backfill complete", "agents", count)
 	}
 
-	// Subagent system
-	subagentMgr := setupSubagents(providerRegistry, cfg, msgBus, toolsReg, workspace, sandboxMgr)
+	// Subagent system (secureCLI store wired so subagent ExecTools enforce the gate)
+	subagentMgr := setupSubagents(providerRegistry, cfg, msgBus, toolsReg, workspace, sandboxMgr, pgStores.SecureCLI)
 	if subagentMgr != nil {
 		// Wire announce queue for batched subagent result delivery (matching TS debounce pattern).
 		announceQueue := tools.NewAnnounceQueue(1000, 20, makeDelegateAnnounceCallback(subagentMgr, msgBus))
@@ -255,8 +280,16 @@ func runGateway() {
 	// Register cron/heartbeat/session/message tools, aliases, allow-paths, store wiring.
 	heartbeatTool, hasMemory := wireExtraTools(pgStores, toolsReg, msgBus, workspace, dataDir, agentCfg, globalSkillsDir, builtinSkillsDir)
 
+	// Register workstation_exec + claude_remote tools (Standard edition only; deny-all until Phase 6).
+	// cleanupWorkstation stops the activity sink retention goroutine and drains the write buffer.
+	cleanupWorkstation := wireWorkstationTools(pgStores, toolsReg, domainBus)
+	defer cleanupWorkstation()
+
 	// Create all agents — resolved lazily from database by the managed resolver.
 	agentRouter := agent.NewRouter()
+	if traceCollector != nil {
+		agentRouter.SetTraceCollector(traceCollector)
+	}
 	slog.Info("agents will be resolved lazily from database")
 
 	// Create gateway server and wire enforcement
@@ -297,9 +330,11 @@ func runGateway() {
 		toolsReg:         toolsReg,
 		skillsLoader:     skillsLoader,
 		enrichProgress:   enrichProgress,
+		enrichWorker:     enrichWorker,
 		workspace:        workspace,
 		dataDir:          dataDir,
 		domainBus:        domainBus,
+		audioMgr:         audioMgr,
 	}
 
 	gatewayAddr := loopbackAddr(cfg.Gateway.Host, cfg.Gateway.Port)
@@ -308,9 +343,10 @@ func runGateway() {
 		mcpToolLister = mcpMgr
 	}
 	httpapi.InitGatewayToken(cfg.Gateway.Token)
+	httpapi.InitGatewayNoAuthFallbackAllowed(config.GatewayNoAuthFallbackAllowed(cfg.Gateway))
 	exportTokenStore := httpapi.InitExportTokenStore()
 	defer exportTokenStore.Stop()
-	agentsH, skillsH, tracesH, mcpH, channelInstancesH, providersH, builtinToolsH, pendingMessagesH, teamEventsH, secureCLIH, secureCLIGrantH, mcpUserCredsH := wireHTTP(pgStores, cfg.Agents.Defaults.Workspace, dataDir, bundledSkillsDir, msgBus, toolsReg, providerRegistry, permPE.IsOwner, gatewayAddr, mcpToolLister)
+	agentsH, skillsH, tracesH, mcpH, channelInstancesH, providersH, builtinToolsH, pendingMessagesH, teamEventsH, secureCLIH, secureCLIGrantH, mcpUserCredsH := wireHTTP(pgStores, cfg.Agents.Defaults.Workspace, dataDir, bundledSkillsDir, msgBus, toolsReg, providerRegistry, modelReg, permPE.IsOwner, gatewayAddr, mcpToolLister)
 
 	// Wire dependencies for system prompt preview parity.
 	if agentsH != nil {
@@ -366,7 +402,33 @@ func runGateway() {
 
 	// Register all RPC methods
 	server.SetLogTee(logTee)
-	pairingMethods, heartbeatMethods, chatMethods := registerAllMethods(server, agentRouter, pgStores.Sessions, pgStores.Cron, pgStores.Pairing, cfg, cfgPath, workspace, dataDir, msgBus, execApprovalMgr, pgStores.Agents, pgStores.Skills, pgStores.ConfigSecrets, pgStores.Teams, contextFileInterceptor, logTee, pgStores.Heartbeats, pgStores.ConfigPermissions, pgStores.SystemConfigs, pgStores.Tenants, pgStores.SkillTenantCfgs)
+	pairingMethods, heartbeatMethods, chatMethods, cfgPermsMethods := registerAllMethods(server, agentRouter, pgStores.Sessions, pgStores.Cron, pgStores.Pairing, cfg, cfgPath, workspace, dataDir, msgBus, execApprovalMgr, pgStores.Agents, pgStores.Skills, pgStores.ConfigSecrets, pgStores.Teams, contextFileInterceptor, logTee, pgStores.Heartbeats, pgStores.ConfigPermissions, pgStores.SystemConfigs, pgStores.Tenants, pgStores.SkillTenantCfgs, audioMgr)
+
+	// Phase 3: Agent hooks RPC methods (hooks.list/create/update/delete/toggle/test/history).
+	if hs, ok := pgStores.Hooks.(hooks.HookStore); ok && hs != nil {
+		hm := methods.NewHookMethods(hs, edition.Current())
+		// Reuse dispatcher handlers for dry-run test runner so UI test panel
+		// exercises the exact code that will run in production.
+		if sharedHookHandlers != nil {
+			hm.SetTestRunner(methods.NewDispatcherTestRunner(sharedHookHandlers))
+		}
+		hm.Register(server.Router())
+		slog.Info("registered hooks RPC methods")
+	}
+
+	// Workstations WS methods — Standard edition only.
+	// Lite (desktop/SQLite) must NOT expose workstation RPC methods.
+	if edition.Current().Name != "lite" && pgStores.Workstations != nil && pgStores.WorkstationLinks != nil {
+		wsMethods := methods.NewWorkstationsMethods(pgStores.Workstations, pgStores.WorkstationLinks)
+		if pgStores.WorkstationPermissions != nil {
+			wsMethods.SetPermStore(pgStores.WorkstationPermissions)
+		}
+		if pgStores.WorkstationActivity != nil {
+			wsMethods.SetActivityStore(pgStores.WorkstationActivity)
+		}
+		wsMethods.Register(server.Router())
+		slog.Info("registered workstations RPC methods")
+	}
 
 	// Wire post-turn processor for team task dispatch (WS chat.send + HTTP API paths).
 	if postTurn != nil {
@@ -393,6 +455,13 @@ func runGateway() {
 	channelMgr := channels.NewManager(msgBus)
 	deps.channelMgr = channelMgr
 
+	// Wire channel member resolver into permission grant paths (WS + HTTP) so
+	// file_writer grants coming from the Web UI auto-enrich their metadata.
+	cfgPermsMethods.SetMemberResolver(channelMgr)
+	if channelInstancesH != nil {
+		channelInstancesH.SetMemberResolver(channelMgr)
+	}
+
 	// Wire channel sender + tenant checker on message tool (now that channelMgr exists)
 	if t, ok := toolsReg.Get("message"); ok {
 		if cs, ok := t.(tools.ChannelSenderAware); ok {
@@ -415,12 +484,12 @@ func runGateway() {
 		instanceLoader = channels.NewInstanceLoader(pgStores.ChannelInstances, pgStores.Agents, channelMgr, msgBus, pgStores.Pairing)
 		instanceLoader.SetProviderRegistry(providerRegistry)
 		instanceLoader.SetPendingCompactionConfig(cfg.Channels.PendingCompaction)
-		instanceLoader.RegisterFactory(channels.TypeTelegram, telegram.FactoryWithStores(pgStores.Agents, pgStores.ConfigPermissions, pgStores.Teams, pgStores.SubagentTasks, pgStores.PendingMessages))
-		instanceLoader.RegisterFactory(channels.TypeDiscord, discord.FactoryWithStores(pgStores.Agents, pgStores.ConfigPermissions, pgStores.PendingMessages))
-		instanceLoader.RegisterFactory(channels.TypeFeishu, feishu.FactoryWithPendingStore(pgStores.PendingMessages))
+		instanceLoader.RegisterFactory(channels.TypeTelegram, telegram.FactoryWithStoresAndAudio(pgStores.Agents, pgStores.ConfigPermissions, pgStores.Teams, pgStores.SubagentTasks, pgStores.PendingMessages, audioMgr))
+		instanceLoader.RegisterFactory(channels.TypeDiscord, discord.FactoryWithStoresAndAudio(pgStores.Agents, pgStores.ConfigPermissions, pgStores.PendingMessages, audioMgr))
+		instanceLoader.RegisterFactory(channels.TypeFeishu, feishu.FactoryWithPendingStoreAndAudio(pgStores.PendingMessages, audioMgr))
 		instanceLoader.RegisterFactory(channels.TypeZaloOA, zalo.Factory)
 		instanceLoader.RegisterFactory(channels.TypeZaloPersonal, zalopersonal.FactoryWithPendingStore(pgStores.PendingMessages))
-		instanceLoader.RegisterFactory(channels.TypeWhatsApp, whatsapp.FactoryWithDB(pgStores.DB, pgStores.PendingMessages, "pgx"))
+		instanceLoader.RegisterFactory(channels.TypeWhatsApp, whatsapp.FactoryWithDBAudio(pgStores.DB, pgStores.PendingMessages, "pgx", audioMgr, pgStores.BuiltinTools))
 		instanceLoader.RegisterFactory(channels.TypeSlack, slackchannel.FactoryWithPendingStore(pgStores.PendingMessages))
 		instanceLoader.RegisterFactory(channels.TypeFacebook, facebook.Factory)
 		instanceLoader.RegisterFactory(channels.TypePancake, pancake.Factory)
@@ -430,7 +499,7 @@ func runGateway() {
 	}
 
 	// Register config-based channels as fallback when no DB instances loaded.
-	registerConfigChannels(cfg, channelMgr, msgBus, pgStores, instanceLoader)
+	registerConfigChannels(cfg, channelMgr, msgBus, pgStores, instanceLoader, audioMgr)
 
 	// Register channels/instances/links/teams RPC methods
 	wireChannelRPCMethods(server, pgStores, channelMgr, agentRouter, msgBus, workspace)

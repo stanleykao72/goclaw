@@ -19,13 +19,10 @@ func TestCallClassifyWithRetry_ResponseWhitespaceStripping(t *testing.T) {
 		errors:    []error{nil},
 	}
 
-	worker := &enrichWorker{
-		provider: provider,
-		model:    "test",
-	}
+	worker := &EnrichWorker{}
 
 	ctx := context.Background()
-	resp, err := worker.callClassifyWithRetry(ctx, "system", "user")
+	resp, err := worker.callClassifyWithRetry(ctx, provider, "test", "system", "user")
 
 	if err != nil {
 		t.Fatalf("callClassifyWithRetry failed: %v", err)
@@ -55,13 +52,10 @@ func TestCallClassifyWithRetry_SecondAttemptSucceeds(t *testing.T) {
 		},
 	}
 
-	worker := &enrichWorker{
-		provider: provider,
-		model:    "test",
-	}
+	worker := &EnrichWorker{}
 
 	ctx := context.Background()
-	resp, err := worker.callClassifyWithRetry(ctx, "system", "user")
+	resp, err := worker.callClassifyWithRetry(ctx, provider, "test", "system", "user")
 
 	if err != nil {
 		t.Fatalf("Should succeed on second attempt, got error: %v", err)
@@ -83,13 +77,10 @@ func TestCallClassifyWithRetry_EmptyResponse(t *testing.T) {
 		errors:    []error{nil, nil, nil},
 	}
 
-	worker := &enrichWorker{
-		provider: provider,
-		model:    "test",
-	}
+	worker := &EnrichWorker{}
 
 	ctx := context.Background()
-	resp, err := worker.callClassifyWithRetry(ctx, "system", "user")
+	resp, err := worker.callClassifyWithRetry(ctx, provider, "test", "system", "user")
 
 	// Empty response is still a successful LLM call, should return empty string
 	if err != nil {

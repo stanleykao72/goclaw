@@ -172,11 +172,12 @@ func TestResolveConfiguredProviderKeepsExplicitSingleAccountOverride(t *testing.
 	if err != nil {
 		t.Fatalf("ResolveConfiguredProvider() error = %v", err)
 	}
-	if _, ok := resolved.(*providers.ChatGPTOAuthRouter); ok {
-		t.Fatalf("ResolveConfiguredProvider() returned %T, want base Codex provider", resolved)
+	router, ok := resolved.(*providers.ChatGPTOAuthRouter)
+	if !ok {
+		t.Fatalf("ResolveConfiguredProvider() returned %T, want *providers.ChatGPTOAuthRouter", resolved)
 	}
-	if resolved.Name() != "openai-codex" {
-		t.Fatalf("resolved.Name() = %q, want %q", resolved.Name(), "openai-codex")
+	if router.Name() != "openai-codex" {
+		t.Fatalf("router.Name() = %q, want %q", router.Name(), "openai-codex")
 	}
 }
 
@@ -223,5 +224,39 @@ func TestResolveConfiguredProviderReturnsRouterEvenWhenPrimaryNeedsFailover(t *t
 	}
 	if _, ok := resolved.(*providers.ChatGPTOAuthRouter); !ok {
 		t.Fatalf("ResolveConfiguredProvider() returned %T, want *providers.ChatGPTOAuthRouter", resolved)
+	}
+}
+
+func TestResolveAgentProviderWrapsModelFallback(t *testing.T) {
+	tenantID := uuid.New()
+	registry := providers.NewRegistry(nil)
+	base := &stubProvider{name: "primary", model: "primary-model"}
+	backup := &stubProvider{name: "backup", model: "backup-default"}
+	registry.RegisterForTenant(tenantID, base)
+	registry.RegisterForTenant(tenantID, backup)
+
+	agent := &store.AgentData{
+		TenantID: tenantID,
+		Provider: "primary",
+		Model:    "primary-model",
+		ModelFallback: json.RawMessage(`{
+			"enabled": true,
+			"strategy": "priority_order",
+			"candidates": [
+				{"provider": "backup", "model": "backup-model"}
+			]
+		}`),
+	}
+
+	resolved, err := ResolveAgentProvider(registry, agent)
+	if err != nil {
+		t.Fatalf("ResolveAgentProvider() error = %v", err)
+	}
+	fallback, ok := resolved.(*providers.ModelFallbackProvider)
+	if !ok {
+		t.Fatalf("ResolveAgentProvider() returned %T, want *providers.ModelFallbackProvider", resolved)
+	}
+	if fallback.PrimaryProvider() != base {
+		t.Fatalf("PrimaryProvider() = %T, want original base provider", fallback.PrimaryProvider())
 	}
 }

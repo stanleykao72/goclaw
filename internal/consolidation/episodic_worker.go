@@ -8,18 +8,26 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/nextlevelbuilder/goclaw/internal/bgalert"
 	"github.com/nextlevelbuilder/goclaw/internal/eventbus"
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
+	"github.com/nextlevelbuilder/goclaw/internal/providerresolve"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
 
 // episodicWorker handles session.completed events → creates episodic summaries.
 type episodicWorker struct {
-	store    store.EpisodicStore
-	sessions store.SessionCoreStore // for reading session messages during summarization
-	provider providers.Provider
-	model    string
-	eventBus eventbus.DomainEventBus
+	store         store.EpisodicStore
+	sessions      store.SessionCoreStore      // for reading session messages during summarization
+	systemConfigs store.SystemConfigStore     // per-tenant provider config
+	registry      *providers.Registry         // provider resolution
+	eventBus      eventbus.DomainEventBus
+	alertDeps     bgalert.AlertDeps
+}
+
+// resolveProvider delegates to shared background provider resolution.
+func (w *episodicWorker) resolveProvider(ctx context.Context, tenantID uuid.UUID) (providers.Provider, string) {
+	return providerresolve.ResolveBackgroundProvider(ctx, tenantID, w.registry, w.systemConfigs)
 }
 
 // Handle processes a session.completed event into an episodic summary.
@@ -39,6 +47,8 @@ func (w *episodicWorker) Handle(ctx context.Context, event eventbus.DomainEvent)
 	if err != nil {
 		return fmt.Errorf("episodic: invalid tenant_id %q: %w", event.TenantID, err)
 	}
+	// Inject tenant context so store queries and bgalert scope correctly.
+	ctx = store.WithTenantID(ctx, tenantUUID)
 	agentUUID, err := uuid.Parse(event.AgentID)
 	if err != nil {
 		return fmt.Errorf("episodic: invalid agent_id %q: %w", event.AgentID, err)
@@ -46,7 +56,7 @@ func (w *episodicWorker) Handle(ctx context.Context, event eventbus.DomainEvent)
 
 	// Build source_id for idempotency
 	sourceID := fmt.Sprintf("%s:%d", payload.SessionKey, payload.CompactionCount)
-	exists, err := w.store.ExistsBySourceID(ctx, event.AgentID, event.UserID, sourceID)
+	exists, err := w.store.ExistsBySourceID(ctx, agentUUID.String(), event.UserID, sourceID)
 	if err != nil {
 		return fmt.Errorf("episodic: check source_id: %w", err)
 	}
@@ -57,15 +67,20 @@ func (w *episodicWorker) Handle(ctx context.Context, event eventbus.DomainEvent)
 
 	// Use compaction summary if available, else call LLM
 	summary := payload.Summary
-	if summary == "" && w.provider != nil {
-		summary, err = w.summarizeSession(ctx, payload)
-		if err != nil {
-			return fmt.Errorf("episodic: summarize: %w", err)
+	if summary == "" {
+		provider, model := w.resolveProvider(ctx, tenantUUID)
+		if provider != nil {
+			summary, err = w.summarizeSession(ctx, provider, model, payload)
+			if err != nil {
+				bgalert.ReportProviderError(ctx, w.alertDeps, "episodic", err)
+				return fmt.Errorf("episodic: summarize: %w", err)
+			}
 		}
 	}
 	if summary == "" {
+		provider, _ := w.resolveProvider(ctx, tenantUUID)
 		slog.Warn("episodic: no summary available, skipping", "session", payload.SessionKey,
-			"compaction_summary_empty", payload.Summary == "", "provider_nil", w.provider == nil)
+			"compaction_summary_empty", payload.Summary == "", "provider_nil", provider == nil)
 		return nil
 	}
 	slog.Debug("episodic: creating summary", "session", payload.SessionKey, "summary_len", len(summary))
@@ -113,12 +128,12 @@ func (w *episodicWorker) Handle(ctx context.Context, event eventbus.DomainEvent)
 }
 
 // summarizeSession reads actual session messages and calls LLM to summarize.
-func (w *episodicWorker) summarizeSession(ctx context.Context, payload *eventbus.SessionCompletedPayload) (string, error) {
+func (w *episodicWorker) summarizeSession(ctx context.Context, provider providers.Provider, model string, payload *eventbus.SessionCompletedPayload) (string, error) {
 	// Try reading session messages for a real summary.
 	if w.sessions != nil {
 		messages := w.sessions.GetHistory(ctx, payload.SessionKey)
 		if len(messages) > 0 {
-			return w.summarizeFromMessages(ctx, messages)
+			return w.summarizeFromMessages(ctx, provider, model, messages)
 		}
 		// Messages may have been compacted away — try existing session summary.
 		if summary := w.sessions.GetSummary(ctx, payload.SessionKey); summary != "" {
@@ -129,7 +144,7 @@ func (w *episodicWorker) summarizeSession(ctx context.Context, payload *eventbus
 }
 
 // summarizeFromMessages builds a conversation excerpt and calls LLM.
-func (w *episodicWorker) summarizeFromMessages(ctx context.Context, messages []providers.Message) (string, error) {
+func (w *episodicWorker) summarizeFromMessages(ctx context.Context, provider providers.Provider, model string, messages []providers.Message) (string, error) {
 	var sb strings.Builder
 	for _, m := range messages {
 		if m.Role == "system" {
@@ -153,12 +168,12 @@ func (w *episodicWorker) summarizeFromMessages(ctx context.Context, messages []p
 	sctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	resp, err := w.provider.Chat(sctx, providers.ChatRequest{
+	resp, err := provider.Chat(sctx, providers.ChatRequest{
 		Messages: []providers.Message{
 			{Role: "system", Content: summarizationPrompt},
 			{Role: "user", Content: sb.String()},
 		},
-		Model:   w.model,
+		Model:   model,
 		Options: map[string]any{"max_tokens": 1024, "temperature": 0.3},
 	})
 	if err != nil {

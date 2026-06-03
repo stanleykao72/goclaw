@@ -7,7 +7,11 @@ export interface ToolPolicyConfig {
   allow?: string[];
   deny?: string[];
   alsoAllow?: string[];
-  byProvider?: Record<string, { profile?: string; allow?: string[]; deny?: string[]; alsoAllow?: string[] }>;
+  byProvider?: Record<string, ToolPolicyConfig>;
+  wait?: {
+    min_ms?: number;
+    max_ms?: number;
+  };
   toolCallPrefix?: string; // prefix to strip from model's tool call names
 }
 
@@ -16,6 +20,7 @@ export interface SubagentsConfig {
   maxSpawnDepth?: number;
   maxChildrenPerAgent?: number;
   archiveAfterMinutes?: number;
+  maxRetries?: number;
   model?: string;
 }
 
@@ -31,6 +36,7 @@ export interface CompactionConfig {
 
 export interface ContextPruningConfig {
   mode?: "off" | "cache-ttl";
+  ttl?: string;             // cache TTL gate duration, e.g. "5m" (default). Only used when mode="cache-ttl"
   keepLastAssistants?: number;
   softTrimRatio?: number;
   hardClearRatio?: number;
@@ -89,16 +95,14 @@ export interface WorkspaceSharingConfig {
   shared_users?: string[];
   share_memory?: boolean;
   share_knowledge_graph?: boolean;
+  share_sessions?: boolean;
 }
 
 export type ChatGPTOAuthRoutingStrategy =
-  | "manual"
-  | "primary_first"
   | "round_robin"
   | "priority_order";
 
 export type EffectiveChatGPTOAuthRoutingStrategy =
-  | "primary_first"
   | "round_robin"
   | "priority_order";
 
@@ -115,6 +119,19 @@ export interface ChatGPTOAuthRoutingConfig {
   override_mode?: ChatGPTOAuthRoutingOverrideMode;
   strategy?: ChatGPTOAuthRoutingStrategy;
   extra_provider_names?: string[];
+}
+
+export interface ModelFallbackCandidate {
+  provider?: string;
+  model?: string;
+}
+
+export interface ModelFallbackConfig {
+  enabled?: boolean;
+  strategy?: "priority_order";
+  candidates?: ModelFallbackCandidate[];
+  max_attempts?: number;
+  cooldown_enabled?: boolean;
 }
 
 export interface KgDedupConfig {
@@ -156,6 +173,7 @@ export interface AgentData {
   reasoning_config?: AgentReasoningConfig | null;
   workspace_sharing?: WorkspaceSharingConfig | null;
   chatgpt_oauth_routing?: ChatGPTOAuthRoutingConfig | null;
+  model_fallback?: ModelFallbackConfig | null;
   shell_deny_groups?: ShellDenyGroups | null;
   kg_dedup_config?: KgDedupConfig | null;
 

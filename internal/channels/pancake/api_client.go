@@ -11,6 +11,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -63,6 +64,7 @@ func (c *APIClient) GetPage(ctx context.Context) (*PageInfo, error) {
 	}
 	req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	req.Header.Set("Content-Type", "application/json")
+	setAcceptJSONHeader(req)
 
 	res, err := c.httpClient.Do(req)
 	if err != nil {
@@ -163,6 +165,71 @@ func (c *APIClient) UploadMedia(ctx context.Context, filename string, data io.Re
 	return uploadResp.ID, nil
 }
 
+// ReplyComment sends a reply to a comment on a post (action: "reply_comment").
+// messageID is the ID of the comment being replied to — required by Pancake API.
+func (c *APIClient) ReplyComment(ctx context.Context, conversationID, messageID, content string) error {
+	body, _ := json.Marshal(SendMessageRequest{
+		Action:    "reply_comment",
+		Message:   content,
+		MessageID: messageID,
+	})
+	url := fmt.Sprintf("%s/pages/%s/conversations/%s/messages", c.pageV1BaseURL, c.pageID, conversationID)
+	if err := c.doRequest(ctx, http.MethodPost, url, bytes.NewReader(body)); err != nil {
+		return fmt.Errorf("pancake: reply comment: %w", err)
+	}
+	return nil
+}
+
+// PrivateReply sends a one-time DM to a commenter (first-inbox, action: "private_reply").
+func (c *APIClient) PrivateReply(ctx context.Context, conversationID, content string) error {
+	body, _ := json.Marshal(SendMessageRequest{
+		Action:  "private_reply",
+		Message: content,
+	})
+	url := fmt.Sprintf("%s/pages/%s/conversations/%s/messages", c.pageV1BaseURL, c.pageID, conversationID)
+	if err := c.doRequest(ctx, http.MethodPost, url, bytes.NewReader(body)); err != nil {
+		return fmt.Errorf("pancake: private reply: %w", err)
+	}
+	return nil
+}
+
+// GetPosts fetches recent posts for the page (used by PostFetcher for comment context enrichment).
+// Bypasses doRequest because it needs to parse a JSON response body (doRequest discards the body).
+// Connection reuse is preserved: defer res.Body.Close() + io.ReadAll drain the body fully.
+func (c *APIClient) GetPosts(ctx context.Context, limit int) ([]PancakePost, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	url := fmt.Sprintf("%s/pages/%s/posts?limit=%d", c.pageV2BaseURL, c.pageID, limit)
+	req, err := c.newPageRequest(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("pancake: build get-posts request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	res, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("pancake: get posts request failed: %w", err)
+	}
+	defer res.Body.Close()
+
+	respBody, err := io.ReadAll(res.Body)
+	if err != nil {
+		return nil, fmt.Errorf("pancake: read get-posts response: %w", err)
+	}
+	if res.StatusCode >= 400 {
+		return nil, fmt.Errorf("pancake: get posts HTTP %d", res.StatusCode)
+	}
+
+	var result struct {
+		Data []PancakePost `json:"data"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return nil, fmt.Errorf("pancake: parse get-posts response: %w", err)
+	}
+	return result.Data, nil
+}
+
 // doRequest executes an authenticated HTTP request using the page_access_token.
 // Always drains and closes the response body to enable connection reuse.
 func (c *APIClient) doRequest(ctx context.Context, method, url string, body io.Reader) error {
@@ -217,7 +284,54 @@ func (c *APIClient) newPageRequest(ctx context.Context, method, rawURL string, b
 
 	// Keep the header for compatibility; official docs require the query token.
 	req.Header.Set("Authorization", "Bearer "+c.pageAccessToken)
+	setAcceptJSONHeader(req)
 	return req, nil
+}
+
+// ReactComment toggles the page's like on a comment via Pancake user API:
+// POST {userAPI}/pages/{pageID}/conversations/{convID}/messages/{msgID}/likes
+// with multipart body (action=like_toggle, user_likes=false). Server flips the
+// current state, so call once per fresh comment (dedup prevents double-toggle).
+func (c *APIClient) ReactComment(ctx context.Context, conversationID, messageID string) error {
+	if conversationID == "" || messageID == "" {
+		return fmt.Errorf("pancake: react-comment requires conversation_id and message_id")
+	}
+	if strings.ContainsAny(conversationID, "/?#\\") || strings.ContainsAny(messageID, "/?#\\") {
+		return fmt.Errorf("pancake: invalid character in conversation_id or message_id")
+	}
+
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	_ = mw.WriteField("action", "like_toggle")
+	_ = mw.WriteField("user_likes", "false")
+	mw.Close()
+
+	url := fmt.Sprintf("%s/pages/%s/conversations/%s/messages/%s/likes",
+		c.userBaseURL, c.pageID, conversationID, messageID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, &buf)
+	if err != nil {
+		return fmt.Errorf("pancake: build react-comment request: %w", err)
+	}
+	q := req.URL.Query()
+	q.Set("access_token", c.apiKey)
+	req.URL.RawQuery = q.Encode()
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+
+	res, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("pancake: react-comment request failed: %w", err)
+	}
+	defer res.Body.Close()
+
+	body, _ := io.ReadAll(res.Body)
+	if res.StatusCode >= 400 {
+		snippet := string(body)
+		if len(snippet) > 300 {
+			snippet = snippet[:300]
+		}
+		return fmt.Errorf("pancake: react-comment HTTP %d: %s", res.StatusCode, snippet)
+	}
+	return nil
 }
 
 // isAuthError checks if an error is an authentication/authorization failure.
@@ -237,4 +351,10 @@ func isRateLimitError(err error) bool {
 		return false
 	}
 	return ae.Code == 429 || ae.Code == 4029
+}
+
+// setAcceptJSONHeader sets Accept: application/json for JSON response negotiation.
+// Without it, Pancake returns SPA HTML for Shopee GETs (verified 2026-04-20).
+func setAcceptJSONHeader(req *http.Request) {
+	req.Header.Set("Accept", "application/json")
 }

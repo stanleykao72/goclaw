@@ -52,13 +52,10 @@ func TestCallClassifyWithRetry_Success(t *testing.T) {
 		errors:    []error{nil},
 	}
 
-	worker := &enrichWorker{
-		provider: provider,
-		model:    "test",
-	}
+	worker := &EnrichWorker{}
 
 	ctx := context.Background()
-	resp, err := worker.callClassifyWithRetry(ctx, "system", "user")
+	resp, err := worker.callClassifyWithRetry(ctx, provider, "test", "system", "user")
 
 	if err != nil {
 		t.Fatalf("callClassifyWithRetry failed: %v", err)
@@ -89,13 +86,10 @@ func TestCallClassifyWithRetry_RetryThenSuccess(t *testing.T) {
 		},
 	}
 
-	worker := &enrichWorker{
-		provider: provider,
-		model:    "test",
-	}
+	worker := &EnrichWorker{}
 
 	ctx := context.Background()
-	resp, err := worker.callClassifyWithRetry(ctx, "system", "user")
+	resp, err := worker.callClassifyWithRetry(ctx, provider, "test", "system", "user")
 
 	if err != nil {
 		t.Fatalf("callClassifyWithRetry should succeed after retries, got error: %v", err)
@@ -122,13 +116,10 @@ func TestCallClassifyWithRetry_AllFail(t *testing.T) {
 		},
 	}
 
-	worker := &enrichWorker{
-		provider: provider,
-		model:    "test",
-	}
+	worker := &EnrichWorker{}
 
 	ctx := context.Background()
-	_, err := worker.callClassifyWithRetry(ctx, "system", "user")
+	_, err := worker.callClassifyWithRetry(ctx, provider, "test", "system", "user")
 
 	if err == nil {
 		t.Fatalf("callClassifyWithRetry should return error after exhausting retries")
@@ -154,15 +145,12 @@ func TestCallClassifyWithRetry_ContextCancellation(t *testing.T) {
 		},
 	}
 
-	worker := &enrichWorker{
-		provider: provider,
-		model:    "test",
-	}
+	worker := &EnrichWorker{}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // Cancel immediately
 
-	_, err := worker.callClassifyWithRetry(ctx, "system", "user")
+	_, err := worker.callClassifyWithRetry(ctx, provider, "test", "system", "user")
 
 	if err == nil {
 		t.Fatalf("callClassifyWithRetry should return error for cancelled context")

@@ -209,7 +209,7 @@ func (c *Conn) writeMessage(msg *jsonrpcMessage) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	slog.Debug("acp.jsonrpc: > WRITE", "data", string(data))
-		_, err = c.writer.Write(data)
+	_, err = c.writer.Write(data)
 	return err
 }
 

@@ -10,6 +10,9 @@ import (
 )
 
 func TestGeminiProtocolMapping(t *testing.T) {
+	if os.Getenv("ACP_GEMINI_E2E") == "" {
+		t.Skip("set ACP_GEMINI_E2E=1 to run this test (requires gemini binary)")
+	}
 	// Enable debug logging to stderr
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
 

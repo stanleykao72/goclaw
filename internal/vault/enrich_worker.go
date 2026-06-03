@@ -13,9 +13,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/nextlevelbuilder/goclaw/internal/bgalert"
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/eventbus"
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
+	"github.com/nextlevelbuilder/goclaw/internal/providerresolve"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 	"golang.org/x/sync/semaphore"
 )
@@ -38,45 +40,129 @@ var (
 
 // EnrichWorkerDeps bundles dependencies for the vault enrichment worker.
 type EnrichWorkerDeps struct {
-	VaultStore store.VaultStore
-	Provider   providers.Provider
-	Model      string
-	EventBus   eventbus.DomainEventBus
-	MsgBus     bus.EventPublisher        // for WS event broadcast
-	TeamStore  store.TaskCommentStore    // for Phase 2.5 task-based auto-linking (nil-safe)
+	VaultStore    store.VaultStore
+	SystemConfigs store.SystemConfigStore   // per-tenant provider config
+	Registry      *providers.Registry       // provider resolution
+	EventBus      eventbus.DomainEventBus
+	MsgBus        bus.EventPublisher        // for WS event broadcast
+	TeamStore     store.TaskCommentStore    // for Phase 2.5 task-based auto-linking (nil-safe)
+	AlertDeps     bgalert.AlertDeps         // for reporting non-retryable LLM errors
 }
 
 // RegisterEnrichWorker subscribes the enrichment worker to vault doc events.
-// Returns (unsubscribe func, progress tracker for WS broadcast).
-func RegisterEnrichWorker(deps EnrichWorkerDeps) (func(), *EnrichProgress) {
+// Returns (unsubscribe func, progress tracker, EnrichWorker for stop/enqueue).
+func RegisterEnrichWorker(deps EnrichWorkerDeps) (func(), *EnrichProgress, *EnrichWorker) {
 	progress := NewEnrichProgress(deps.MsgBus)
-	w := &enrichWorker{
-		vault:     deps.VaultStore,
-		teamStore: deps.TeamStore,
-		provider:  deps.Provider,
-		model:     deps.Model,
-		dedup:     make(map[string]string),
-		sem:       semaphore.NewWeighted(enrichMaxConcurrent),
-		progress:  progress,
+	w := &EnrichWorker{
+		vault:         deps.VaultStore,
+		teamStore:     deps.TeamStore,
+		systemConfigs: deps.SystemConfigs,
+		registry:      deps.Registry,
+		msgBus:        deps.MsgBus,
+		alertDeps:     deps.AlertDeps,
+		dedup:         make(map[string]string),
+		sem:           semaphore.NewWeighted(enrichMaxConcurrent),
+		progress:      progress,
+		cancelFuncs:   &sync.Map{},
 	}
 	unsub := deps.EventBus.Subscribe(eventbus.EventVaultDocUpserted, w.Handle)
-	return unsub, progress
+	return unsub, progress, w
 }
 
-// enrichWorker processes vault document upsert events to generate summaries,
+// EnrichWorker processes vault document upsert events to generate summaries,
 // embeddings, and semantic links between related documents.
-type enrichWorker struct {
-	vault     store.VaultStore
-	teamStore store.TaskCommentStore // nil-tolerant — Phase 2.5 disabled when nil
-	provider  providers.Provider
-	model     string
-	queue     enrichBatchQueue
-	progress  *EnrichProgress
+// Exported so HTTP handlers can call Stop/EnqueueUnenriched.
+type EnrichWorker struct {
+	vault         store.VaultStore
+	teamStore     store.TaskCommentStore      // nil-tolerant — Phase 2.5 disabled when nil
+	systemConfigs store.SystemConfigStore     // per-tenant provider config
+	registry      *providers.Registry         // provider resolution
+	msgBus        bus.EventPublisher          // for error event broadcast
+	alertDeps     bgalert.AlertDeps           // for reporting non-retryable LLM errors
+	queue         enrichBatchQueue
+	progress      *EnrichProgress
 
 	// Bounded dedup: docID → content_hash. Prevents re-processing unchanged files.
 	dedupMu sync.Mutex
 	dedup   map[string]string
 	sem     *semaphore.Weighted // limits concurrent LLM summarize calls
+
+	// Per-tenant cancel functions for stop capability
+	cancelFuncs *sync.Map // key: tenantID string, value: context.CancelFunc
+}
+
+// resolveProviderForTenant delegates to shared background provider resolution.
+func (w *EnrichWorker) resolveProviderForTenant(ctx context.Context, tenantID string) (providers.Provider, string) {
+	tid, err := uuid.Parse(tenantID)
+	if err != nil {
+		tid = providers.MasterTenantID
+	}
+	return providerresolve.ResolveBackgroundProvider(ctx, tid, w.registry, w.systemConfigs)
+}
+
+// Stop cancels in-flight enrichment for the given tenant.
+// Safe to call even if no enrichment is running.
+func (w *EnrichWorker) Stop(tenantID string) {
+	if cancel, ok := w.cancelFuncs.LoadAndDelete(tenantID); ok {
+		cancel.(context.CancelFunc)()
+	}
+	// Always finish progress — ensures UI resets even if cancelFuncs was empty.
+	w.progress.Finish()
+	slog.Info("vault.enrich: stopped by user", "tenant", tenantID)
+}
+
+// IsRunning returns true if enrichment is in progress for the tenant.
+func (w *EnrichWorker) IsRunning(tenantID string) bool {
+	if _, ok := w.cancelFuncs.Load(tenantID); ok {
+		return true
+	}
+	return w.progress.Status().Running
+}
+
+// EnqueueUnenriched fetches documents with empty summary and emits enrichment events.
+// Called after rescan when all files are unchanged but some still need enrichment.
+// Returns the number of documents enqueued.
+func (w *EnrichWorker) EnqueueUnenriched(ctx context.Context, tenantID, workspace string, bus eventbus.DomainEventBus, limit int) (int, error) {
+	docs, err := w.vault.ListUnenrichedDocs(ctx, tenantID, limit)
+	if err != nil {
+		return 0, err
+	}
+	if len(docs) == 0 {
+		return 0, nil
+	}
+
+	count := 0
+	for _, doc := range docs {
+		// Skip meaningless filenames — they create noise links.
+		if shouldSkipEnrichment(filepath.Base(doc.Path)) {
+			continue
+		}
+		agentID := ""
+		if doc.AgentID != nil {
+			agentID = *doc.AgentID
+		}
+		event := eventbus.DomainEvent{
+			ID:        uuid.Must(uuid.NewV7()).String(),
+			Type:      eventbus.EventVaultDocUpserted,
+			SourceID:  doc.ID + ":" + doc.ContentHash,
+			TenantID:  tenantID,
+			AgentID:   agentID,
+			Timestamp: time.Now(),
+			Payload: eventbus.VaultDocUpsertedPayload{
+				DocID:       doc.ID,
+				TenantID:    tenantID,
+				AgentID:     agentID,
+				Path:        doc.Path,
+				ContentHash: doc.ContentHash,
+				Workspace:   workspace,
+			},
+		}
+		bus.Publish(event)
+		count++
+	}
+
+	slog.Info("vault.enrich: enqueued unenriched", "tenant", tenantID, "count", count)
+	return count, nil
 }
 
 // enrichTaskSiblingCap bounds the number of auto-linked siblings per
@@ -92,9 +178,14 @@ var enrichTaskSiblingCap = func() int {
 }()
 
 // Handle is the EventBus handler for vault.doc_upserted events.
-func (w *enrichWorker) Handle(ctx context.Context, event eventbus.DomainEvent) error {
+func (w *EnrichWorker) Handle(ctx context.Context, event eventbus.DomainEvent) error {
 	payload, ok := event.Payload.(eventbus.VaultDocUpsertedPayload)
 	if !ok {
+		return nil
+	}
+
+	// Skip meaningless filenames — they create noise links.
+	if shouldSkipEnrichment(filepath.Base(payload.Path)) {
 		return nil
 	}
 
@@ -106,19 +197,25 @@ func (w *enrichWorker) Handle(ctx context.Context, event eventbus.DomainEvent) e
 	}
 	w.dedupMu.Unlock()
 
-	// Batch key: tenant + agent for agent-scoped docs.
-	// Team/shared docs (empty AgentID) batch together per tenant so bulk rescan
-	// benefits from chunked processing instead of 1-doc-per-queue.
-	batchScope := payload.AgentID
-	if batchScope == "" {
-		batchScope = "_shared"
-	}
-	key := payload.TenantID + ":" + batchScope
+	// Batch key: tenant-only. All docs for the same tenant share one queue
+	// so a single processBatch goroutine drains everything in order.
+	// Agent/team scope is carried in the payload for classify phase.
+	key := payload.TenantID
 	if !w.queue.Enqueue(key, payload) {
 		return nil // another goroutine already processing this agent's queue
 	}
 
-	w.processBatch(ctx, key)
+	// Inject tenant context so store queries and bgalert scope correctly.
+	if tid, parseErr := uuid.Parse(payload.TenantID); parseErr == nil {
+		ctx = store.WithTenantID(ctx, tid)
+	}
+
+	// Create per-tenant cancel context for stop capability.
+	cancelCtx, cancel := context.WithCancel(ctx)
+	w.cancelFuncs.Store(payload.TenantID, cancel)
+	w.processBatch(cancelCtx, key)
+	// Clean up after batch completes naturally.
+	w.cancelFuncs.Delete(payload.TenantID)
 	return nil
 }
 
@@ -132,33 +229,27 @@ type enriched struct {
 // processBatch drains and processes queued vault doc events in a loop.
 // Items are chunked into enrichBatchSize groups so bulk rescan doesn't
 // overwhelm the LLM provider with hundreds of concurrent requests.
-func (w *enrichWorker) processBatch(ctx context.Context, key string) {
-	var totalQueued int
-
+func (w *EnrichWorker) processBatch(ctx context.Context, key string) {
 	for {
+		if ctx.Err() != nil {
+			w.queue.TryFinish(key)
+			return
+		}
 		items := w.queue.Drain(key)
 		if len(items) == 0 {
 			if w.queue.TryFinish(key) {
-				if totalQueued > 0 {
-					w.progress.Finish()
-				}
 				return
 			}
 			continue
 		}
-
-		totalQueued += len(items)
-		tenantID := uuid.Nil
-		if len(items) > 0 {
-			tenantID, _ = uuid.Parse(items[0].TenantID)
-		}
-		w.progress.Start(totalQueued, tenantID)
 
 		// Process in chunks of enrichBatchSize, up to enrichMaxConcurrent in parallel.
 		var wg sync.WaitGroup
 		for start := 0; start < len(items); start += enrichBatchSize {
 			end := min(start+enrichBatchSize, len(items))
 			if err := w.sem.Acquire(ctx, 1); err != nil {
+				// Context cancelled — count remaining as done so progress completes.
+				w.progress.AddDone(len(items) - start)
 				break
 			}
 			wg.Add(1)
@@ -172,7 +263,6 @@ func (w *enrichWorker) processBatch(ctx context.Context, key string) {
 		wg.Wait()
 
 		if w.queue.TryFinish(key) {
-			w.progress.Finish()
 			return
 		}
 	}
@@ -180,7 +270,7 @@ func (w *enrichWorker) processBatch(ctx context.Context, key string) {
 
 // processChunk runs the 4-phase enrichment pipeline for a single chunk of docs.
 // Phase 1 batches all files into a single LLM call for summarization.
-func (w *enrichWorker) processChunk(ctx context.Context, items []eventbus.VaultDocUpsertedPayload) {
+func (w *EnrichWorker) processChunk(ctx context.Context, items []eventbus.VaultDocUpsertedPayload) {
 	// Phase 0 — Prepare: dedup check, batch-fetch existing docs, read file content.
 	type prepared struct {
 		payload eventbus.VaultDocUpsertedPayload
@@ -206,6 +296,13 @@ func (w *enrichWorker) processChunk(ctx context.Context, items []eventbus.VaultD
 
 	// Batch-fetch all existing docs in a single query.
 	tenantID := pending[0].TenantID
+
+	// Resolve provider once per chunk (all items share tenantID)
+	provider, model := w.resolveProviderForTenant(ctx, tenantID)
+	if provider == nil {
+		slog.Warn("vault.enrich: no provider available", "tenant", tenantID)
+		return
+	}
 	docIDs := make([]string, len(pending))
 	for i, item := range pending {
 		docIDs[i] = item.DocID
@@ -278,7 +375,7 @@ func (w *enrichWorker) processChunk(ctx context.Context, items []eventbus.VaultD
 			paths[i] = all[idx].payload.Path
 			contents[i] = all[idx].content
 		}
-		summaries := w.batchSummarize(ctx, paths, contents)
+		summaries := w.batchSummarize(ctx, provider, model, paths, contents)
 		for i, idx := range needLLM {
 			if i < len(summaries) && summaries[i] != "" {
 				all[idx].summary = summaries[i]
@@ -332,7 +429,7 @@ func (w *enrichWorker) processChunk(ctx context.Context, items []eventbus.VaultD
 	// Phase 3 — Classify links for this chunk.
 	if len(embedded) > 0 {
 		first := embedded[0].payload
-		w.classifyLinks(ctx, first.TenantID, first.AgentID, embedded)
+		w.classifyLinks(ctx, provider, model, first.TenantID, first.AgentID, embedded)
 	}
 
 	// Phase 4 — Record dedup + wikilinks.
@@ -347,22 +444,26 @@ Output a JSON array: [{"idx":1,"summary":"..."},{"idx":2,"summary":"..."}]
 idx is 1-based matching the document number. Output ONLY valid JSON, no preamble.`
 
 // batchSummarize sends multiple files in a single LLM call and parses JSON summaries.
-func (w *enrichWorker) batchSummarize(ctx context.Context, paths, contents []string) []string {
+func (w *EnrichWorker) batchSummarize(ctx context.Context, provider providers.Provider, model string, paths, contents []string) []string {
 	var b strings.Builder
 	for i := range paths {
 		fmt.Fprintf(&b, "[%d] File: %s\n%s\n\n", i+1, paths[i], contents[i])
 	}
 
-	raw, err := w.chatWithRetry(ctx, "vault.batch_summarize", providers.ChatRequest{
+	raw, err := w.chatWithRetry(ctx, provider, "vault.batch_summarize", providers.ChatRequest{
 		Messages: []providers.Message{
 			{Role: "system", Content: batchSummarizePrompt},
 			{Role: "user", Content: b.String()},
 		},
-		Model:   w.model,
-		Options: map[string]any{"max_tokens": 1536, "temperature": 0.2},
+		Model:   model,
+		Options: map[string]any{"max_tokens": 4096, "temperature": 0.2},
 	})
 	if err != nil {
 		slog.Warn("vault.enrich: batch_summarize", "count", len(paths), "err", err)
+		// Don't report context cancellation as enrichment error — expected during stop.
+		if w.progress != nil && ctx.Err() == nil {
+			w.progress.AddError(fmt.Sprintf("batch summarize failed: %v", err))
+		}
 		return nil
 	}
 	return parseBatchSummaries(raw, len(paths))
@@ -387,7 +488,7 @@ func parseBatchSummaries(raw string, expected int) []string {
 		Summary string `json:"summary"`
 	}
 	if err := json.Unmarshal([]byte(raw), &results); err != nil {
-		slog.Warn("vault.enrich: parse_batch_summaries", "err", err)
+		slog.Warn("vault.enrich: parse_batch_summaries", "err", err, "raw_len", len(raw), "raw", raw)
 		return nil
 	}
 
@@ -403,7 +504,7 @@ func parseBatchSummaries(raw string, expected int) []string {
 // chatWithRetry is the shared retry loop for all enrichment LLM calls.
 // Escalating timeouts and backoffs prevent transient provider failures
 // (e.g. 529 overloaded) from permanently skipping documents.
-func (w *enrichWorker) chatWithRetry(ctx context.Context, logPrefix string, req providers.ChatRequest) (string, error) {
+func (w *EnrichWorker) chatWithRetry(ctx context.Context, provider providers.Provider, logPrefix string, req providers.ChatRequest) (string, error) {
 	var lastErr error
 	for attempt := range enrichMaxRetries {
 		if attempt > 0 {
@@ -414,15 +515,19 @@ func (w *enrichWorker) chatWithRetry(ctx context.Context, logPrefix string, req 
 			}
 		}
 		cctx, cancel := context.WithTimeout(ctx, enrichRetryTimeouts[attempt])
-		resp, err := w.provider.Chat(cctx, req)
+		resp, err := provider.Chat(cctx, req)
 		cancel()
 		if err != nil {
 			lastErr = err
 			slog.Warn(logPrefix+": retry", "attempt", attempt+1, "err", err)
 			continue
 		}
+		if resp.FinishReason == "length" {
+			slog.Warn(logPrefix+": truncated", "finish_reason", "length", "model", req.Model, "content_len", len(resp.Content), "max_tokens", req.Options["max_tokens"])
+		}
 		return strings.TrimSpace(resp.Content), nil
 	}
+	bgalert.ReportProviderError(ctx, w.alertDeps, "vault_enrich", lastErr)
 	return "", fmt.Errorf("%s exhausted %d retries: %w", logPrefix, enrichMaxRetries, lastErr)
 }
 
@@ -430,7 +535,7 @@ func (w *enrichWorker) chatWithRetry(ctx context.Context, logPrefix string, req 
 // Skips binary/media/document files to avoid parsing garbage data as wikilinks
 // (PDFs and office docs are binary and would produce garbage [[...]] matches
 // while wasting a 4MB read buffer).
-func (w *enrichWorker) syncWikilinks(ctx context.Context, p eventbus.VaultDocUpsertedPayload) {
+func (w *EnrichWorker) syncWikilinks(ctx context.Context, p eventbus.VaultDocUpsertedPayload) {
 	doc, err := w.vault.GetDocumentByID(ctx, p.TenantID, p.DocID)
 	if err != nil || doc == nil {
 		return
@@ -460,7 +565,7 @@ func (w *enrichWorker) syncWikilinks(ctx context.Context, p eventbus.VaultDocUps
 
 
 // recordDedup stores a processed hash and evicts ~25% entries if over capacity.
-func (w *enrichWorker) recordDedup(docID, hash string) {
+func (w *EnrichWorker) recordDedup(docID, hash string) {
 	w.dedupMu.Lock()
 	defer w.dedupMu.Unlock()
 	w.dedup[docID] = hash

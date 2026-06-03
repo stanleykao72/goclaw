@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -13,9 +14,10 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/config"
 	"github.com/nextlevelbuilder/goclaw/internal/eventbus"
-	"github.com/nextlevelbuilder/goclaw/internal/memory"
+	"github.com/nextlevelbuilder/goclaw/internal/hooks"
 	mcpbridge "github.com/nextlevelbuilder/goclaw/internal/mcp"
 	"github.com/nextlevelbuilder/goclaw/internal/media"
+	"github.com/nextlevelbuilder/goclaw/internal/memory"
 	"github.com/nextlevelbuilder/goclaw/internal/providerresolve"
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
 	"github.com/nextlevelbuilder/goclaw/internal/sandbox"
@@ -78,6 +80,9 @@ type ResolverDeps struct {
 	// Shared MCP connection pool — eliminates duplicate connections across agents
 	MCPPool *mcpbridge.Pool
 
+	// MCP grant checker — for runtime grant verification at BridgeTool.Execute
+	MCPGrantChecker mcpbridge.GrantChecker
+
 	// Skill access store — for per-agent skill visibility filtering
 	SkillAccessStore store.SkillAccessStore
 
@@ -109,14 +114,23 @@ type ResolverDeps struct {
 	BuiltinToolTenantCfgs store.BuiltinToolTenantConfigStore
 	SkillTenantCfgs       store.SkillTenantConfigStore
 
+	// System config store for tenant-scoped settings (allowed_paths, etc.)
+	SystemConfigs store.SystemConfigStore
+
 	// Global workspace root (GOCLAW_WORKSPACE)
 	Workspace string
+
+	// TTS auto mode from config: "off", "always", "inbound", "tagged"
+	TTSAutoMode string
 
 	// V3 auto-inject: episodic memory injection into system prompt (nil = disabled)
 	AutoInjector memory.AutoInjector
 
 	// V3 domain event bus for consolidation pipeline (nil = disabled)
 	DomainBus eventbus.DomainEventBus
+
+	// HookDispatcher fires lifecycle hook events (Issue #875). Nil = noop.
+	HookDispatcher hooks.Dispatcher
 
 	// Vault hook: called when a text file is uploaded by user (nil = no vault registration)
 	OnTextUploaded func(ctx context.Context, path, content string)
@@ -144,7 +158,7 @@ func NewManagedResolver(deps ResolverDeps) ResolverFunc {
 		}
 
 		// Resolve provider (tenant-aware: tries tenant-specific first, falls back to master)
-		provider, err := providerresolve.ResolveConfiguredProvider(deps.ProviderReg, ag)
+		provider, err := providerresolve.ResolveAgentProvider(deps.ProviderReg, ag)
 		if err != nil {
 			// Fallback to any available provider for this tenant
 			names := deps.ProviderReg.ListForTenant(ag.TenantID)
@@ -296,11 +310,20 @@ func NewManagedResolver(deps ResolverDeps) ResolverFunc {
 			if deps.MCPPool != nil {
 				mcpOpts = append(mcpOpts, mcpbridge.WithPool(deps.MCPPool))
 			}
+			if deps.MCPGrantChecker != nil {
+				mcpOpts = append(mcpOpts, mcpbridge.WithGrantChecker(deps.MCPGrantChecker))
+			}
 			mcpMgr := mcpbridge.NewManager(toolsReg, mcpOpts...)
 			if err := mcpMgr.LoadForAgent(ctx, ag.ID, ""); err != nil {
 				slog.Warn("failed to load MCP servers for agent", "agent", agentKey, "error", err)
 			} else {
 				mcpUserCredSrvs = mcpMgr.UserCredServers()
+				// User-credential servers (Notion, etc.) are deferred at startup
+				// but will produce tools per-request via getUserMCPTools.
+				// Set flag so agentToolPolicyWithMCP injects "group:mcp" into alsoAllow.
+				if len(mcpUserCredSrvs) > 0 {
+					hasMCPTools = true
+				}
 				if mcpMgr.IsSearchMode() {
 					// Search mode: too many tools — register mcp_tool_search meta-tool.
 					// Also wire lazy activator so deferred tools can be called by name directly.
@@ -368,6 +391,22 @@ func NewManagedResolver(deps ResolverDeps) ResolverFunc {
 			}
 		}
 
+		// Load tenant-specific allowed paths (from system_configs['allowed_paths']).
+		// These extend filesystem tool access beyond the agent's workspace.
+		var tenantAllowedPaths []string
+		if deps.SystemConfigs != nil && ag.TenantID != uuid.Nil {
+			tenantCtx := store.WithTenantID(ctx, ag.TenantID)
+			if raw, err := deps.SystemConfigs.Get(tenantCtx, "allowed_paths"); err == nil && raw != "" {
+				if json.Unmarshal([]byte(raw), &tenantAllowedPaths) == nil && len(tenantAllowedPaths) > 0 {
+					// Expand home directory in paths
+					for i, p := range tenantAllowedPaths {
+						tenantAllowedPaths[i] = config.ExpandHome(p)
+					}
+					slog.Debug("tenant allowed paths loaded", "agent", agentKey, "tenant", ag.TenantID, "paths", len(tenantAllowedPaths))
+				}
+			}
+		}
+
 		// Filter skills by visibility + agent grants.
 		// Only public skills and explicitly granted internal skills appear in the system prompt.
 		var skillAllowList []string
@@ -425,9 +464,10 @@ func NewManagedResolver(deps ResolverDeps) ResolverFunc {
 			DisplayName:            ag.DisplayName,
 			AgentUUID:              ag.ID,
 			TenantID:               ag.TenantID,
+			AgentOtherConfig:       ag.OtherConfig,
 			AgentType:              ag.AgentType,
 			IsTeamLead:             isTeamLead,
-			AutoInjector:          deps.AutoInjector,
+			AutoInjector:           deps.AutoInjector,
 			Provider:               provider,
 			Model:                  ag.Model,
 			ModelRegistry:          deps.ModelRegistry,
@@ -442,6 +482,7 @@ func NewManagedResolver(deps ResolverDeps) ResolverFunc {
 			SandboxCfg:             sandboxCfgOverride,
 			Bus:                    deps.Bus,
 			DomainBus:              deps.DomainBus,
+			HookDispatcher:         deps.HookDispatcher,
 			Sessions:               deps.Sessions,
 			Tools:                  toolsReg,
 			ToolPolicy:             deps.ToolPolicy,
@@ -467,11 +508,14 @@ func NewManagedResolver(deps ResolverDeps) ResolverFunc {
 			SandboxWorkspaceAccess: sandboxWorkspaceAccess,
 			BuiltinToolSettings:    builtinSettings,
 			TenantToolSettings:     tenantToolSettings,
+			TenantAllowedPaths:     tenantAllowedPaths,
 			DisabledTools:          disabledTools,
 			ReasoningConfig:        store.ResolveEffectiveReasoningConfig(providerReasoningDefaults, ag.ParseReasoningConfig()),
 			PromptMode:             PromptMode(ag.ParsePromptMode()),
 			PinnedSkills:           ag.ParsePinnedSkills(),
 			SelfEvolve:             ag.ParseSelfEvolve(),
+			AllowImageGeneration:   ag.ParseAllowImageGeneration(),
+			TTSAutoMode:            deps.TTSAutoMode,
 			SkillEvolve:            ag.AgentType == store.AgentTypePredefined && ag.ParseSkillEvolve(),
 			SkillNudgeInterval:     ag.ParseSkillNudgeInterval(),
 			WorkspaceSharing:       ag.ParseWorkspaceSharing(),
@@ -488,6 +532,7 @@ func NewManagedResolver(deps ResolverDeps) ResolverFunc {
 			MCPStore:               deps.MCPStore,
 			MCPPool:                deps.MCPPool,
 			MCPUserCredSrvs:        mcpUserCredSrvs,
+			MCPGrantChecker:        deps.MCPGrantChecker,
 			OrchMode:               orchMode,
 			DelegateTargets:        delegateTargets,
 			EvolutionMetricsStore:  evoMetricsStore,

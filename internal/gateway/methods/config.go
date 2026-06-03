@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"log/slog"
 
-	"github.com/google/uuid"
 	"github.com/titanous/json5"
 
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
@@ -41,6 +40,10 @@ func (m *ConfigMethods) Register(router *gateway.MethodRouter) {
 	router.Register(protocol.MethodConfigApply, m.requireMasterScope(m.requireOwner(m.handleApply)))
 	router.Register(protocol.MethodConfigPatch, m.requireMasterScope(m.requireOwner(m.handlePatch)))
 	router.Register(protocol.MethodConfigSchema, m.requireMasterScope(m.requireOwner(m.handleSchema)))
+	// config.defaults is read-only + secret-free (Go consts + agents.defaults overlay),
+	// so it only needs requireMasterScope — owner gating would spam auth errors for
+	// operators viewing agent detail pages.
+	router.Register(protocol.MethodConfigDefaults, m.requireMasterScope(m.handleDefaults))
 }
 
 // requireOwner wraps a handler to only allow owner-role users.
@@ -65,9 +68,12 @@ func (m *ConfigMethods) requireOwner(next gateway.MethodHandler) gateway.MethodH
 // on-disk config.json. A non-master tenant admin calling config.patch would
 // corrupt master state + leak master config to other tenants. This guard keeps
 // config.* strictly master-scoped until a tenant-aware refactor lands.
+//
+// Shares the predicate with store.IsMasterScope so HTTP and WS layers can't
+// drift — same rule, one source of truth.
 func (m *ConfigMethods) requireMasterScope(next gateway.MethodHandler) gateway.MethodHandler {
 	return func(ctx context.Context, client *gateway.Client, req *protocol.RequestFrame) {
-		if !isMasterScopeContext(ctx) {
+		if !store.IsMasterScope(ctx) {
 			locale := store.LocaleFromContext(ctx)
 			client.SendResponse(protocol.NewErrorResponse(
 				req.ID,
@@ -78,18 +84,6 @@ func (m *ConfigMethods) requireMasterScope(next gateway.MethodHandler) gateway.M
 		}
 		next(ctx, client, req)
 	}
-}
-
-// isMasterScopeContext returns true when ctx should be treated as master-scope:
-// (a) system owner role (bypass-all), or
-// (b) tenant id is unset (uuid.Nil — legacy / system callers), or
-// (c) tenant id equals store.MasterTenantID.
-func isMasterScopeContext(ctx context.Context) bool {
-	if store.IsOwnerRole(ctx) {
-		return true
-	}
-	tid := store.TenantIDFromContext(ctx)
-	return tid == uuid.Nil || tid == store.MasterTenantID
 }
 
 func (m *ConfigMethods) handleGet(_ context.Context, client *gateway.Client, req *protocol.RequestFrame) {

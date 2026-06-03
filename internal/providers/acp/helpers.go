@@ -29,11 +29,20 @@ func goclawSessionFromCtx(ctx context.Context) string {
 var sensitiveEnvPrefixes = []string{
 	"GOCLAW", "CLAUDE", "ANTHROPIC", "OPENAI",
 	"DATABASE", "POSTGRES", "MYSQL", "REDIS", "MONGO",
-	"AWS_", "AZURE_",
+	"AWS_", "AZURE_", "GOOGLE_", "GCP_",
 	"GITHUB_", "GH_", "GITLAB_", "BITBUCKET_",
 	"DOCKER_", "REGISTRY_",
 	"STRIPE_", "TWILIO_", "SENDGRID_",
 	"SSH_", "GPG_",
+}
+
+// allowedEnvExact lists env vars explicitly allowed even if they match sensitive prefixes.
+// These are required for Google/GCP authentication in ACP subprocesses (e.g., Gemini).
+var allowedEnvExact = map[string]bool{
+	"GOOGLE_API_KEY":                 true,
+	"GOOGLE_APPLICATION_CREDENTIALS": true,
+	"GOOGLE_CLOUD_PROJECT":           true,
+	"GCP_PROJECT":                    true,
 }
 
 // sensitiveEnvExact lists exact env var names stripped from ACP subprocesses.
@@ -47,11 +56,16 @@ var sensitiveEnvExact = map[string]bool{
 }
 
 // filterACPEnv strips sensitive env vars from the subprocess environment.
+// Explicitly allowed vars (allowedEnvExact) pass through even if they match sensitive prefixes.
 func filterACPEnv(environ []string) []string {
 	var filtered []string
 	for _, e := range environ {
 		key, _, _ := strings.Cut(e, "=")
 		upper := strings.ToUpper(key)
+		if allowedEnvExact[upper] {
+			filtered = append(filtered, e)
+			continue
+		}
 		if sensitiveEnvExact[upper] {
 			continue
 		}

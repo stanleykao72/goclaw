@@ -21,6 +21,7 @@ export class WsClient {
   private reconnectAttempts = 0;
   private authenticated = false;
   private intentionalClose = false;
+  private pairingInProgress = false;
   private connectGeneration = 0;
 
   /** Server-assigned role from connect response. */
@@ -31,6 +32,10 @@ export class WsClient {
   tenantName = "";
   tenantSlug = "";
   isOwner = false;
+  /** Server-derived: caller qualifies for master-only actions (owner OR on master tenant). Advisory UI hint only — backend still enforces. */
+  isMasterScope = false;
+  /** Server edition, drives UI feature gating. */
+  edition: "standard" | "lite" = "standard";
   serverVersion = "";
 
   private readonly maxReconnectDelay = 30_000;
@@ -90,6 +95,7 @@ export class WsClient {
 
   disconnect(): void {
     this.intentionalClose = true;
+    this.pairingInProgress = false;
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -207,6 +213,8 @@ export class WsClient {
         tenant_name?: string;
         tenant_slug?: string;
         is_owner?: boolean;
+        is_master_scope?: boolean;
+        edition?: "standard" | "lite";
         server?: { name?: string; version?: string };
       }>("connect", {
         token: this.getToken(),
@@ -221,10 +229,14 @@ export class WsClient {
 
       // Browser pairing: server requires approval
       if (res?.status === "pending_pairing" && res.pairing_code && res.sender_id) {
-        this.onPairingRequired?.(res.pairing_code, res.sender_id);
+        if (!this.pairingInProgress) {
+          this.pairingInProgress = true;
+          this.onPairingRequired?.(res.pairing_code, res.sender_id);
+        }
         // Keep connection alive for polling browser.pairing.status
         return;
       }
+      this.pairingInProgress = false;
 
       // Server accepted connection but assigned viewer role → token is invalid
       if (this.getToken() && res?.role === "viewer") {
@@ -240,6 +252,8 @@ export class WsClient {
       this.tenantName = res?.tenant_name ?? "";
       this.tenantSlug = res?.tenant_slug ?? "";
       this.isOwner = res?.is_owner ?? false;
+      this.isMasterScope = res?.is_master_scope ?? false;
+      this.edition = res?.edition ?? "standard";
       this.serverVersion = res?.server?.version ?? "";
       this.onStateChange("connected");
     } catch (e) {
@@ -251,6 +265,7 @@ export class WsClient {
           this.onAuthFailure?.();
           return;
         }
+        this.intentionalClose = true;
         this.ws?.close();
       }
     }
@@ -329,11 +344,11 @@ export class WsClient {
   private scheduleReconnect(): void {
     if (this.reconnectTimer) return;
 
+    this.reconnectAttempts++;
     const delay = Math.min(
       this.baseReconnectDelay * Math.pow(2, this.reconnectAttempts),
       this.maxReconnectDelay,
     );
-    this.reconnectAttempts++;
 
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;

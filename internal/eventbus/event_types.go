@@ -16,6 +16,9 @@ const (
 	EventRunCompleted   EventType = "run.completed"
 	EventToolExecuted     EventType = "tool.executed"
 
+	// Context pruning observability (Phase 05)
+	EventContextPruned EventType = "context.pruned"
+
 	// Vault events (v3 enrichment pipeline)
 	EventVaultDocUpserted EventType = "vault.doc_upserted"
 
@@ -24,6 +27,12 @@ const (
 	EventDelegateCompleted EventType = "delegate.completed"
 	EventDelegateFailed    EventType = "delegate.failed"
 
+	// Workstation lifecycle events (triggers BackendCache invalidation).
+	EventWorkstationUpdated EventType = "workstation.updated"
+	EventWorkstationDeleted EventType = "workstation.deleted"
+	// EventWorkstationPermChanged triggers AllowlistChecker cache invalidation (Phase 6).
+	// SourceID = workstation UUID.
+	EventWorkstationPermChanged EventType = "workstation.perm.changed"
 )
 
 // DomainEvent is a typed event with metadata for the consolidation pipeline.
@@ -109,6 +118,19 @@ type DelegateFailedPayload struct {
 	FromAgent    string
 	ToAgent      string
 	Error        string
+}
+
+// ContextPrunedPayload is emitted when pruning mutates context messages.
+// Payload intentionally excludes raw message content (counts + tokens only).
+type ContextPrunedPayload struct {
+	SessionKey     string
+	TokensBefore   int
+	TokensAfter    int
+	Budget         int
+	ResultsTrimmed int    // soft-trimmed count
+	ResultsCleared int    // hard-cleared count
+	Compacted      bool
+	Trigger        string // "soft" | "hard" | "compact"
 }
 
 // VaultDocUpsertedPayload is emitted after a vault document is registered/updated.

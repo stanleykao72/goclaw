@@ -10,6 +10,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/nextlevelbuilder/goclaw/internal/cache"
+	"github.com/nextlevelbuilder/goclaw/internal/config"
+	"github.com/nextlevelbuilder/goclaw/internal/edition"
 	httpapi "github.com/nextlevelbuilder/goclaw/internal/http"
 	"github.com/nextlevelbuilder/goclaw/internal/i18n"
 	"github.com/nextlevelbuilder/goclaw/internal/permissions"
@@ -66,26 +68,45 @@ func (r *MethodRouter) Handle(ctx context.Context, client *Client, req *protocol
 	if req.Method != protocol.MethodConnect && req.Method != protocol.MethodHealth && req.Method != protocol.MethodBrowserPairingStatus {
 		if pe := r.server.policyEngine; pe != nil {
 			if !pe.CanAccess(client.role, req.Method) {
-				slog.Warn("permission denied", "method", req.Method, "role", client.role, "client", client.id)
+				required := permissions.MethodRole(req.Method)
+				slog.Warn("security.permission_denied",
+					"method", req.Method,
+					"role", client.role,
+					"required", string(required),
+					"client", client.id,
+				)
 				locale := i18n.Normalize(client.locale)
+				var msg string
+				if required == permissions.RoleNone {
+					// Unclassified method — fail-closed (issue #866 fix).
+					msg = i18n.T(locale, i18n.MsgPermissionDenied, req.Method+" is not permitted for this session")
+				} else {
+					msg = i18n.T(locale, i18n.MsgPermissionDenied, req.Method+" requires "+string(required)+" role")
+				}
 				client.SendResponse(protocol.NewErrorResponse(
 					req.ID,
 					protocol.ErrUnauthorized,
-					i18n.T(locale, i18n.MsgPermissionDenied, req.Method+" requires "+string(permissions.MethodRole(req.Method))+" role"),
+					msg,
 				))
 				return
 			}
 		}
 	}
 
-	// Inject locale + tenant into context.
+	// Inject locale + tenant + role into context.
 	// All connect paths guarantee client.tenantID is set (owner defaults to MasterTenantID).
+	// Role injection is required so store.IsOwnerRole / store.IsMasterScope work
+	// from WS handlers — without it, ctx-based permission helpers silently
+	// evaluate as non-owner. HTTP layer does the same via enrichContext.
 	ctx = store.WithLocale(ctx, i18n.Normalize(client.locale))
 	if client.TenantID() != uuid.Nil {
 		ctx = store.WithTenantID(ctx, client.TenantID())
 	}
 	if slug := client.TenantSlug(); slug != "" {
 		ctx = store.WithTenantSlug(ctx, slug)
+	}
+	if role := client.Role(); role != "" {
+		ctx = store.WithRole(ctx, string(role))
 	}
 
 	slog.Debug("handling method", "method", req.Method, "client", client.id, "req_id", req.ID)
@@ -213,7 +234,7 @@ func (r *MethodRouter) handleConnect(ctx context.Context, client *Client, req *p
 	}
 
 	// Path 2: No token configured → operator (backward compat)
-	if configToken == "" {
+	if configToken == "" && config.GatewayNoAuthFallbackAllowed(r.server.cfg.Gateway) {
 		client.role = permissions.RoleOperator
 		client.authenticated = true
 		client.userID = params.UserID
@@ -240,7 +261,7 @@ func (r *MethodRouter) handleConnect(ctx context.Context, client *Client, req *p
 		if paired {
 			client.role = permissions.RoleOperator
 			client.authenticated = true
-		client.userID = params.UserID
+			client.userID = params.UserID
 			client.pairedSenderID = params.SenderID
 			client.pairedChannel = "browser"
 			tid, errCode := r.resolveTenantHint(ctx, params.TenantHint, params.UserID)
@@ -279,26 +300,40 @@ func (r *MethodRouter) handleConnect(ctx context.Context, client *Client, req *p
 		}
 	}
 
-	// Path 4: Fallback → viewer (wrong token or pairing not available)
-	client.role = permissions.RoleViewer
-	client.authenticated = true
-		client.userID = params.UserID
-	tid, errCode := r.resolveTenantHint(ctx, params.TenantHint, params.UserID)
-	if errCode != "" {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, errCode, "tenant access revoked"))
-		return
-	}
-	client.tenantID = tid
-	r.sendConnectResponse(ctx, client, req.ID)
+	// Path 4: Fail-closed — no valid token, no valid pairing → reject.
+	// Previously fell back to viewer+authenticated=true, which allowed any
+	// unauthenticated client to exercise the default-permit policy (CVE #866).
+	slog.Warn("security.ws_connect_rejected",
+		"reason", "no_valid_credentials",
+		"client", client.id,
+		"has_token", params.Token != "",
+		"has_sender_id", params.SenderID != "",
+	)
+	client.authenticated = false
+	locale := i18n.Normalize(client.locale)
+	client.SendResponse(protocol.NewErrorResponse(
+		req.ID,
+		protocol.ErrUnauthorized,
+		i18n.T(locale, i18n.MsgPermissionDenied, "valid token or active pairing required"),
+	))
 }
 
 func (r *MethodRouter) sendConnectResponse(ctx context.Context, client *Client, reqID string) {
+	// Build scoped ctx that store.IsMasterScope expects: role + tenant.
+	// Owner role short-circuits regardless of tenant; non-owner relies on
+	// tenant_id == MasterTenantID. See store.IsMasterScope at context.go:346.
+	scopedCtx := store.WithTenantID(ctx, client.tenantID)
+	if client.IsOwner() {
+		scopedCtx = store.WithRole(scopedCtx, store.RoleOwner)
+	}
 	resp := map[string]any{
-		"protocol":  protocol.ProtocolVersion,
-		"role":      string(client.role),
-		"user_id":   client.userID,
-		"tenant_id": client.tenantID.String(),
-		"is_owner":  client.IsOwner(),
+		"protocol":        protocol.ProtocolVersion,
+		"role":            string(client.role),
+		"user_id":         client.userID,
+		"tenant_id":       client.tenantID.String(),
+		"is_owner":        client.IsOwner(),
+		"is_master_scope": store.IsMasterScope(scopedCtx),
+		"edition":         edition.Current().Name,
 		"server": map[string]any{
 			"name":    "goclaw",
 			"version": r.server.version,

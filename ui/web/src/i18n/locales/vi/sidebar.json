@@ -19,6 +19,7 @@
     "contacts": "Liên hệ",
     "skills": "Skill",
     "cron": "Tác vụ định kỳ",
+    "hooks": "Hooks",
     "customTools": "Công cụ tùy chỉnh",
     "builtinTools": "Công cụ tích hợp",
     "mcpServers": "Máy chủ MCP",
@@ -41,6 +42,7 @@
     "apiDocs": "Tài liệu API",
     "packages": "Gói phần mềm",
     "tenants": "Tổ chức",
-    "backupRestore": "Sao lưu & Khôi phục"
+    "backupRestore": "Sao lưu & Khôi phục",
+    "workstations": "Workstations"
   }
 }

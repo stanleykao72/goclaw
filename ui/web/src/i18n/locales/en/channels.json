@@ -316,7 +316,17 @@
       "label": "Tool Allowlist",
       "help": "Restrict which tools the agent can use in this group"
     },
-    "system_prompt": { "label": "System Prompt" }
+    "system_prompt": { "label": "System Prompt" },
+    "platform": { "label": "Platform", "help": "Select the platform this Pancake page serves." },
+    "tiktok_type": { "label": "TikTok Type", "help": "Select the TikTok account type for this page" },
+    "features.private_reply": {
+      "label": "Private Reply (Comment → DM)",
+      "help": "Send a one-time DM to commenters after the public reply. Facebook/Instagram only. Meta allows DM within 7 days of the comment."
+    },
+    "private_reply_message": {
+      "label": "DM Message",
+      "help": "Supports the placeholders commenter_name and post_title. Empty = default English text."
+    }
   },
   "fieldOptions": {
     "block_reply": {
@@ -361,6 +371,19 @@
       "auto": "Auto",
       "raw": "Raw",
       "card": "Card"
+    },
+    "platform": {
+      "facebook":    "Facebook",
+      "instagram":   "Instagram",
+      "threads":     "Threads (Beta)",
+      "tiktok":      "TikTok",
+      "youtube":     "YouTube (Beta)",
+      "shopee":      "Shopee",
+      "line":        "Line",
+      "google":      "Google",
+      "chat_plugin": "Chat Plugin",
+      "lazada":      "Lazada",
+      "tokopedia":   "Tokopedia"
     }
   },
   "groupOverrides": {

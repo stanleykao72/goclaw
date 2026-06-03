@@ -11,6 +11,7 @@ type VaultDocument struct {
 	TenantID     string         `json:"tenant_id" db:"tenant_id"`
 	AgentID      *string        `json:"agent_id,omitempty" db:"agent_id"`
 	TeamID       *string        `json:"team_id,omitempty" db:"team_id"`
+	ChatID       *string        `json:"chat_id,omitempty" db:"chat_id"` // nil = team-wide (shared / legacy); non-nil = scoped to specific chat in isolated teams
 	Scope        string         `json:"scope" db:"scope"` // personal, team, shared
 	CustomScope  *string        `json:"custom_scope,omitempty" db:"custom_scope"`
 	Path         string         `json:"path" db:"path"`                             // workspace-relative path
@@ -58,6 +59,8 @@ type VaultSearchOptions struct {
 	TenantID   string
 	TeamID     *string  // nil = no filter, ptr-to-empty = personal (NULL team_id), ptr-to-uuid = specific team
 	TeamIDs    []string // non-nil = personal (NULL) + these team UUIDs (used for "all accessible" view)
+	ChatID     *string  // isolated-team scope: when non-nil + TeamIsolated, filter (chat_id = ChatID OR chat_id IS NULL)
+	TeamIsolated bool   // true = apply ChatID filter; false = shared/no-team mode (ignore ChatID)
 	Scope      string   // empty = all scopes
 	DocTypes   []string // empty = all types
 	MaxResults int      // default 10
@@ -74,6 +77,29 @@ type VaultListOptions struct {
 	Offset   int
 }
 
+// VaultTreeEntry represents a file or virtual folder in the vault tree.
+type VaultTreeEntry struct {
+	Name        string     `json:"name"`
+	Path        string     `json:"path"`
+	IsDir       bool       `json:"isDir"`
+	HasChildren bool       `json:"hasChildren,omitempty"`
+	DocID       string     `json:"docId,omitempty"`
+	DocType     string     `json:"docType,omitempty"`
+	Scope       string     `json:"scope,omitempty"`
+	Title       string     `json:"title,omitempty"`
+	UpdatedAt   *time.Time `json:"updatedAt,omitempty"`
+}
+
+// VaultTreeOptions configures a vault tree listing query.
+type VaultTreeOptions struct {
+	Path     string
+	AgentID  string   // optional agent filter
+	TeamID   *string
+	TeamIDs  []string
+	Scope    string
+	DocTypes []string
+}
+
 // VaultStore manages the Knowledge Vault document registry and links.
 type VaultStore interface {
 	// Document CRUD
@@ -84,6 +110,9 @@ type VaultStore interface {
 	ListDocuments(ctx context.Context, tenantID, agentID string, opts VaultListOptions) ([]VaultDocument, error)
 	CountDocuments(ctx context.Context, tenantID, agentID string, opts VaultListOptions) (int, error)
 	UpdateHash(ctx context.Context, tenantID, id, newHash string) error
+
+	// ListTreeEntries returns immediate children (files + virtual folders) under the given path prefix.
+	ListTreeEntries(ctx context.Context, tenantID string, opts VaultTreeOptions) ([]VaultTreeEntry, error)
 
 	// GetDocumentsByIDs returns documents matching the given IDs with tenant isolation.
 	GetDocumentsByIDs(ctx context.Context, tenantID string, docIDs []string) ([]VaultDocument, error)
@@ -113,6 +142,9 @@ type VaultStore interface {
 	DeleteLinksBySource(ctx context.Context, tenantID, source string) (int64, error)
 
 	// Enrichment
+	// ListUnenrichedDocs returns documents with empty summary for re-enrichment.
+	// Used after rescan to retry failed enrichments.
+	ListUnenrichedDocs(ctx context.Context, tenantID string, limit int) ([]VaultDocument, error)
 	// UpdateSummaryAndReembed updates summary text and re-generates embedding from title+path+summary.
 	UpdateSummaryAndReembed(ctx context.Context, tenantID, docID, summary string) error
 	// FindSimilarDocs finds documents with similar embeddings to the given docID.

@@ -7,6 +7,12 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/nextlevelbuilder/goclaw/internal/bus"
+	"github.com/nextlevelbuilder/goclaw/internal/store"
+	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
 )
 
 // Matching TS src/agents/tools/web-search.ts constants.
@@ -15,8 +21,24 @@ const (
 	maxSearchCount       = 10
 	searchTimeoutSeconds = 30
 	braveSearchEndpoint  = "https://api.search.brave.com/res/v1/web/search"
+	exaSearchEndpoint    = "https://api.exa.ai/search"
+	tavilySearchEndpoint = "https://api.tavily.com/search"
 	webSearchUserAgent   = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
+
+const (
+	searchProviderExa        = "exa"
+	searchProviderTavily     = "tavily"
+	searchProviderBrave      = "brave"
+	searchProviderDuckDuckGo = "duckduckgo"
+)
+
+var defaultSearchProviderOrder = []string{
+	searchProviderExa,
+	searchProviderTavily,
+	searchProviderBrave,
+	searchProviderDuckDuckGo,
+}
 
 // SearchProvider abstracts a web search backend.
 type SearchProvider interface {
@@ -66,46 +88,43 @@ func normalizeFreshness(value string) string {
 
 // --- WebSearchTool ---
 
-// WebSearchTool implements the web_search tool matching TS src/agents/tools/web-search.ts.
+// WebSearchTool implements the web_search tool with per-tenant provider chain
+// resolution. Providers are resolved per-request from config_secrets and
+// builtin_tool_tenant_configs.settings, cached per tenant for 60 seconds.
 type WebSearchTool struct {
-	providers []SearchProvider
-	cache     *webCache
+	secrets    store.ConfigSecretsStore
+	cache      *webCache
+	chainCache *tenantChainCache
 }
 
-// WebSearchConfig holds configuration for the web search tool.
-type WebSearchConfig struct {
-	BraveAPIKey     string
-	BraveEnabled    bool
-	BraveMaxResults int
-	DDGEnabled      bool
-	DDGMaxResults   int
-	CacheTTL        time.Duration
-}
-
-func NewWebSearchTool(cfg WebSearchConfig) *WebSearchTool {
-	var providers []SearchProvider
-
-	// Priority: Brave > DuckDuckGo (matching TS)
-	if cfg.BraveEnabled && cfg.BraveAPIKey != "" {
-		providers = append(providers, newBraveSearchProvider(cfg.BraveAPIKey))
-	}
-	if cfg.DDGEnabled {
-		providers = append(providers, newDuckDuckGoSearchProvider())
+// NewWebSearchTool constructs a WebSearchTool. msgBus may be nil (e.g. desktop
+// edition) — cache invalidation then relies on TTL alone.
+func NewWebSearchTool(secrets store.ConfigSecretsStore, msgBus *bus.MessageBus) *WebSearchTool {
+	t := &WebSearchTool{
+		secrets:    secrets,
+		cache:      newWebCache(defaultCacheMaxEntries, defaultCacheTTL),
+		chainCache: newTenantChainCache(),
 	}
 
-	if len(providers) == 0 {
-		return nil
+	if msgBus != nil {
+		msgBus.Subscribe("web_search:cache_invalidate", func(event bus.Event) {
+			if event.Name != protocol.EventCacheInvalidate {
+				return
+			}
+			payload, ok := event.Payload.(bus.CacheInvalidatePayload)
+			if !ok || payload.Kind != bus.CacheKindBuiltinTools || payload.Key != "web_search" {
+				return
+			}
+			if payload.TenantID == uuid.Nil {
+				// Master admin write — wipe all tenants.
+				t.chainCache.InvalidateAll()
+			} else {
+				t.chainCache.Invalidate(payload.TenantID)
+			}
+		})
 	}
 
-	ttl := cfg.CacheTTL
-	if ttl <= 0 {
-		ttl = defaultCacheTTL
-	}
-
-	return &WebSearchTool{
-		providers: providers,
-		cache:     newWebCache(defaultCacheMaxEntries, ttl),
-	}
+	return t
 }
 
 func (t *WebSearchTool) Name() string { return "web_search" }
@@ -182,10 +201,8 @@ func (t *WebSearchTool) Execute(ctx context.Context, args map[string]any) *Resul
 		return NewResult(cached)
 	}
 
-	// Resolve per-request provider chain (tenant may reorder / disable providers
-	// via builtin_tool_tenant_configs.settings → ctx → ResolveWebSearchChain).
-	// Defaults preserved when no override — backward-compat.
-	chain := ResolveWebSearchChain(ctx, t.providers)
+	// Resolve per-request provider chain from tenant config_secrets + settings overlay.
+	chain := t.resolveChain(ctx)
 
 	// Try providers in order (first success wins)
 	var lastErr error
@@ -244,11 +261,4 @@ func formatSearchResults(query string, results []searchResult, provider string) 
 		sb.WriteByte('\n')
 	}
 	return sb.String()
-}
-
-func truncateStr(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	return s[:max] + "..."
 }

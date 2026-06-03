@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"strings"
 
 	"github.com/google/uuid"
@@ -80,6 +81,7 @@ type AgentData struct {
 	ReasoningConfig     json.RawMessage `json:"reasoning_config,omitempty" db:"reasoning_config"`
 	WorkspaceSharing    json.RawMessage `json:"workspace_sharing,omitempty" db:"workspace_sharing"`
 	ChatGPTOAuthRouting json.RawMessage `json:"chatgpt_oauth_routing,omitempty" db:"chatgpt_oauth_routing"`
+	ModelFallback       json.RawMessage `json:"model_fallback,omitempty" db:"model_fallback"`
 	ShellDenyGroups     json.RawMessage `json:"shell_deny_groups,omitempty" db:"shell_deny_groups"`
 	KGDedupConfig       json.RawMessage `json:"kg_dedup_config,omitempty" db:"kg_dedup_config"`
 }
@@ -229,6 +231,28 @@ func (a *AgentData) ParseSelfEvolve() bool { return a.SelfEvolve }
 // ParseSkillEvolve returns whether the agent's skill learning loop is enabled.
 func (a *AgentData) ParseSkillEvolve() bool { return a.SkillEvolve }
 
+// ParseAllowImageGeneration returns whether the native image_generation tool
+// is allowed for this agent. Defaults to true (enabled) when not set in
+// other_config, so existing agents automatically get image generation with
+// Codex providers. Operators can explicitly disable it by setting
+// other_config.allow_image_generation = false.
+// No DB column — code-only default to avoid a migration for a feature flag.
+func (a *AgentData) ParseAllowImageGeneration() bool {
+	if len(a.OtherConfig) <= 2 {
+		return true // default: enabled
+	}
+	var bag struct {
+		AllowImageGeneration *bool `json:"allow_image_generation"`
+	}
+	if json.Unmarshal(a.OtherConfig, &bag) != nil {
+		return true // malformed config → default: enabled
+	}
+	if bag.AllowImageGeneration == nil {
+		return true // not set → default: enabled
+	}
+	return *bag.AllowImageGeneration
+}
+
 // validPromptModes is the set of allowed prompt_mode values.
 var validPromptModes = map[string]bool{
 	"full": true, "task": true, "minimal": true, "none": true,
@@ -317,13 +341,14 @@ type WorkspaceSharingConfig struct {
 	SharedUsers         []string `json:"shared_users,omitempty" db:"-"`
 	ShareMemory         bool     `json:"share_memory" db:"-"`
 	ShareKnowledgeGraph bool     `json:"share_knowledge_graph" db:"-"`
+	ShareSessions       bool     `json:"share_sessions" db:"-"`
 }
 
 const (
-	ReasoningSourceUnset             = "unset"
-	ReasoningSourceLegacy            = "thinking_level"
-	ReasoningSourceAdvanced          = "reasoning"
-	ReasoningSourceProviderDefault   = "provider_default"
+	ReasoningSourceUnset           = "unset"
+	ReasoningSourceLegacy          = "thinking_level"
+	ReasoningSourceAdvanced        = "reasoning"
+	ReasoningSourceProviderDefault = "provider_default"
 	// Reasoning fallback constants — canonical definitions in providers package.
 	ReasoningFallbackDowngrade       = providers.ReasoningFallbackDowngrade
 	ReasoningFallbackDisable         = providers.ReasoningFallbackDisable
@@ -406,7 +431,7 @@ func (a *AgentData) ParseWorkspaceSharing() *WorkspaceSharingConfig {
 	if json.Unmarshal(a.WorkspaceSharing, &ws) != nil {
 		return nil
 	}
-	if !ws.SharedDM && !ws.SharedGroup && len(ws.SharedUsers) == 0 && !ws.ShareMemory && !ws.ShareKnowledgeGraph {
+	if !ws.SharedDM && !ws.SharedGroup && len(ws.SharedUsers) == 0 && !ws.ShareMemory && !ws.ShareKnowledgeGraph && !ws.ShareSessions {
 		return nil
 	}
 	return &ws
@@ -434,11 +459,18 @@ func (a *AgentData) ParseChatGPTOAuthRouting() *ChatGPTOAuthRoutingConfig {
 		if explicitOverrideMode {
 			overrideMode = normalizeChatGPTOAuthOverrideMode(raw.OverrideMode)
 		}
+		extraProviderNames := normalizeProviderNames(raw.ExtraProviderNames)
+		if explicitExtras && extraProviderNames == nil {
+			extraProviderNames = []string{}
+		}
 		return &ChatGPTOAuthRoutingConfig{
 			OverrideMode:       overrideMode,
 			Strategy:           normalizeChatGPTOAuthStrategy(raw.Strategy),
-			ExtraProviderNames: normalizeProviderNames(raw.ExtraProviderNames),
+			ExtraProviderNames: extraProviderNames,
 		}
+	}
+	if explicitExtras && routing.ExtraProviderNames == nil {
+		routing.ExtraProviderNames = []string{}
 	}
 	if explicitOverrideMode {
 		return routing
@@ -448,10 +480,78 @@ func (a *AgentData) ParseChatGPTOAuthRouting() *ChatGPTOAuthRoutingConfig {
 		return routing
 	}
 	routing.OverrideMode = ""
-	if routing.Strategy == ChatGPTOAuthStrategyPrimaryFirst && len(routing.ExtraProviderNames) == 0 {
+	if routing.Strategy == ChatGPTOAuthStrategyPriority && len(routing.ExtraProviderNames) == 0 {
 		return nil
 	}
 	return routing
+}
+
+const (
+	ModelFallbackStrategyPriority = "priority_order"
+)
+
+type ModelFallbackCandidate struct {
+	Provider string `json:"provider,omitempty" db:"-"`
+	Model    string `json:"model,omitempty" db:"-"`
+}
+
+type ModelFallbackConfig struct {
+	Enabled         bool                     `json:"enabled,omitempty" db:"-"`
+	Strategy        string                   `json:"strategy,omitempty" db:"-"`
+	Candidates      []ModelFallbackCandidate `json:"candidates,omitempty" db:"-"`
+	MaxAttempts     int                      `json:"max_attempts,omitempty" db:"-"`
+	CooldownEnabled *bool                    `json:"cooldown_enabled,omitempty" db:"-"`
+}
+
+func (a *AgentData) ParseModelFallback() *ModelFallbackConfig {
+	if len(a.ModelFallback) <= 2 {
+		return nil
+	}
+	var raw ModelFallbackConfig
+	if json.Unmarshal(a.ModelFallback, &raw) != nil || !raw.Enabled {
+		return nil
+	}
+	cfg := NormalizeModelFallbackConfig(&raw)
+	if cfg == nil || len(cfg.Candidates) == 0 {
+		return nil
+	}
+	return cfg
+}
+
+func NormalizeModelFallbackConfig(cfg *ModelFallbackConfig) *ModelFallbackConfig {
+	if cfg == nil {
+		return nil
+	}
+	out := &ModelFallbackConfig{
+		Enabled:         cfg.Enabled,
+		Strategy:        cfg.Strategy,
+		MaxAttempts:     cfg.MaxAttempts,
+		CooldownEnabled: cfg.CooldownEnabled,
+	}
+	if out.Strategy == "" {
+		out.Strategy = ModelFallbackStrategyPriority
+	}
+	if out.Strategy != ModelFallbackStrategyPriority {
+		out.Strategy = ModelFallbackStrategyPriority
+	}
+	seen := make(map[string]bool, len(cfg.Candidates))
+	for _, c := range cfg.Candidates {
+		c.Provider = strings.TrimSpace(c.Provider)
+		c.Model = strings.TrimSpace(c.Model)
+		if c.Provider == "" || c.Model == "" {
+			continue
+		}
+		key := c.Provider + "\x00" + c.Model
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out.Candidates = append(out.Candidates, c)
+	}
+	if out.MaxAttempts < 0 {
+		out.MaxAttempts = 0
+	}
+	return out
 }
 
 func normalizeChatGPTOAuthRoutingConfig(cfg *ChatGPTOAuthRoutingConfig) *ChatGPTOAuthRoutingConfig {
@@ -463,7 +563,10 @@ func normalizeChatGPTOAuthRoutingConfig(cfg *ChatGPTOAuthRoutingConfig) *ChatGPT
 		Strategy:           normalizeChatGPTOAuthStrategy(cfg.Strategy),
 		ExtraProviderNames: normalizeProviderNames(cfg.ExtraProviderNames),
 	}
-	if routing.OverrideMode == "" && routing.Strategy == ChatGPTOAuthStrategyPrimaryFirst && len(routing.ExtraProviderNames) == 0 {
+	if cfg.ExtraProviderNames != nil && routing.ExtraProviderNames == nil {
+		routing.ExtraProviderNames = []string{}
+	}
+	if routing.OverrideMode == "" && routing.Strategy == ChatGPTOAuthStrategyPriority && len(routing.ExtraProviderNames) == 0 {
 		return nil
 	}
 	return routing
@@ -491,12 +594,28 @@ func normalizeChatGPTOAuthStrategy(value string) string {
 	}
 }
 
+func PublicChatGPTOAuthStrategy(value string) string {
+	if value == ChatGPTOAuthStrategyRoundRobin {
+		return ChatGPTOAuthStrategyRoundRobin
+	}
+	return ChatGPTOAuthStrategyPriority
+}
+
+func PublicChatGPTOAuthRouting(cfg *ChatGPTOAuthRoutingConfig) *ChatGPTOAuthRoutingConfig {
+	if cfg == nil {
+		return nil
+	}
+	clone := CloneChatGPTOAuthRoutingConfig(cfg)
+	clone.Strategy = PublicChatGPTOAuthStrategy(clone.Strategy)
+	return clone
+}
+
 func CloneChatGPTOAuthRoutingConfig(cfg *ChatGPTOAuthRoutingConfig) *ChatGPTOAuthRoutingConfig {
 	if cfg == nil {
 		return nil
 	}
 	clone := *cfg
-	clone.ExtraProviderNames = append([]string(nil), cfg.ExtraProviderNames...)
+	clone.ExtraProviderNames = slices.Clone(cfg.ExtraProviderNames)
 	return &clone
 }
 
@@ -515,14 +634,15 @@ func ResolveEffectiveChatGPTOAuthRouting(defaults, agentRouting *ChatGPTOAuthRou
 	}
 	effective.OverrideMode = ""
 	if normalizedDefaults != nil && len(normalizedDefaults.ExtraProviderNames) > 0 {
-		if effective.Strategy == ChatGPTOAuthStrategyPrimaryFirst &&
-			len(normalizedAgent.ExtraProviderNames) == 0 {
-			effective.ExtraProviderNames = nil
+		if normalizedAgent.ExtraProviderNames != nil &&
+			len(normalizedAgent.ExtraProviderNames) == 0 &&
+			effective.Strategy != ChatGPTOAuthStrategyRoundRobin {
+			effective.ExtraProviderNames = slices.Clone(normalizedAgent.ExtraProviderNames)
 		} else {
-			effective.ExtraProviderNames = append([]string(nil), normalizedDefaults.ExtraProviderNames...)
+			effective.ExtraProviderNames = slices.Clone(normalizedDefaults.ExtraProviderNames)
 		}
 	}
-	if effective.Strategy == ChatGPTOAuthStrategyPrimaryFirst &&
+	if effective.Strategy == ChatGPTOAuthStrategyPriority &&
 		len(effective.ExtraProviderNames) == 0 &&
 		normalizedAgent.OverrideMode != ChatGPTOAuthOverrideCustom {
 		return nil
@@ -607,6 +727,9 @@ type AgentCRUDStore interface {
 	Delete(ctx context.Context, id uuid.UUID) error
 	List(ctx context.Context, ownerID string) ([]AgentData, error)
 	GetDefault(ctx context.Context) (*AgentData, error) // agent with is_default=true, or first available
+	// ResetStuckSummoning flips rows with status='summoning' to 'summon_failed'.
+	// Called at startup to recover from crashes where summon goroutine died mid-flight.
+	ResetStuckSummoning(ctx context.Context) (int64, error)
 }
 
 // AgentAccessStore manages agent sharing and access control.

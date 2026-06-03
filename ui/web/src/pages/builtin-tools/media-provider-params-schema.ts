@@ -12,6 +12,18 @@ export type ParamField = {
 
 export const MEDIA_PARAMS_SCHEMA: Record<string, Record<string, ParamField[]>> = {
   create_image: {
+    chatgpt_oauth: [
+      {
+        key: "image_model",
+        label: "Image model",
+        type: "select",
+        default: "gpt-image-2",
+        options: [
+          { value: "gpt-image-2", label: "Default · gpt-image-2 (recommended)" },
+          { value: "gpt-image-1.5", label: "Legacy · gpt-image-1.5" },
+        ],
+      },
+    ],
     minimax_native: [],
     bailian: [
       {
@@ -109,26 +121,6 @@ export const MEDIA_PARAMS_SCHEMA: Record<string, Record<string, ParamField[]>> =
           { value: "64000", label: "64kbps" },
           { value: "128000", label: "128kbps" },
           { value: "256000", label: "256kbps" },
-        ],
-      },
-    ],
-    suno: [
-      {
-        key: "style",
-        label: "Style",
-        type: "text",
-        default: "",
-        description: "e.g. Pop, Classical, Jazz",
-      },
-      {
-        key: "vocal_gender",
-        label: "Vocal Gender",
-        type: "select",
-        default: "",
-        options: [
-          { value: "", label: "Any" },
-          { value: "m", label: "Male" },
-          { value: "f", label: "Female" },
         ],
       },
     ],

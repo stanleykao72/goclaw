@@ -34,6 +34,11 @@ func verifyHMAC(body []byte, secret, signature string) bool {
 	return hmac.Equal(got, expected)
 }
 
+func webhookReplayKey(body []byte) string {
+	sum := sha256.Sum256(body)
+	return "webhook:" + hex.EncodeToString(sum[:])
+}
+
 // --- Global webhook router for multi-page support ---
 
 // webhookRouter routes incoming Pancake webhook events to the correct channel instance by page_id.
@@ -52,12 +57,18 @@ func (r *webhookRouter) register(ch *Channel) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.instances[ch.pageID] = ch
+	if ch.webhookPageID != "" && ch.webhookPageID != ch.pageID {
+		r.instances[ch.webhookPageID] = ch
+	}
 }
 
-func (r *webhookRouter) unregister(pageID string) {
+func (r *webhookRouter) unregister(pageID string, webhookPageID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.instances, pageID)
+	if webhookPageID != "" && webhookPageID != pageID {
+		delete(r.instances, webhookPageID)
+	}
 }
 
 // webhookRoute returns the path+handler on first call; ("", nil) for subsequent calls.
@@ -113,19 +124,16 @@ func (r *webhookRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// Resolve page_id: try top-level first, then data-level, then extract from conversation ID.
+	// Resolve page_id: top-level field takes priority, then data-level, then conv ID parse.
 	pageID := event.PageID
 	if pageID == "" {
 		pageID = data.PageID
 	}
 	if pageID == "" {
-		// Conversation ID format: "pageID_senderID" — extract page portion.
-		if idx := strings.Index(data.Conversation.ID, "_"); idx > 0 {
-			pageID = data.Conversation.ID[:idx]
-		}
+		pageID = resolvePageIDFromConvID(data.Conversation.ID)
 	}
 
-	// Resolve conversation type — only process INBOX messages.
+	// Resolve conversation type.
 	convType := strings.ToUpper(data.Conversation.Type)
 
 	if event.EventType != "" && !strings.EqualFold(event.EventType, "messaging") {
@@ -138,34 +146,25 @@ func (r *webhookRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	slog.Debug("pancake: webhook event parsed",
 		"event_type", event.EventType,
-		"page_id", pageID,
+		"resolved_page_id", pageID,
 		"conv_id", data.Conversation.ID,
 		"conv_type", convType,
 		"sender_id", data.Conversation.From.ID,
-		"sender_name", data.Conversation.From.Name,
 		"msg_id", data.Message.ID)
 
 	if pageID == "" {
-		slog.Warn("pancake: could not determine page_id from webhook payload")
+		slog.Warn("pancake: could not determine page_id from webhook payload",
+			"event_page_id", event.PageID,
+			"data_page_id", data.PageID,
+			"conv_id", data.Conversation.ID)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-	if convType != "INBOX" {
-		slog.Info("pancake: skipping non-inbox conversation event",
-			"page_id", pageID,
-			"conv_id", data.Conversation.ID,
-			"conv_type", convType,
-			"msg_id", data.Message.ID)
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
 	r.mu.RLock()
 	target := r.instances[pageID]
 	r.mu.RUnlock()
 
 	if target == nil {
-		// Log all registered page IDs for debugging.
 		r.mu.RLock()
 		var registered []string
 		for pid := range r.instances {
@@ -174,21 +173,33 @@ func (r *webhookRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		r.mu.RUnlock()
 		slog.Warn("pancake: no channel instance for page_id",
 			"page_id", pageID,
+			"event_page_id", event.PageID,
+			"data_page_id", data.PageID,
+			"conv_id", data.Conversation.ID,
 			"registered_pages", registered)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 
-	// HMAC signature verification — skip if webhook_secret not configured.
-	if target.webhookSecret != "" {
-		sig := req.Header.Get("X-Pancake-Signature")
-		if !verifyHMAC(body, target.webhookSecret, sig) {
-			slog.Warn("security.pancake_webhook_signature_mismatch",
-				"page_id", pageID,
-				"remote_addr", req.RemoteAddr)
-			w.WriteHeader(http.StatusOK)
-			return
-		}
+	if target.webhookSecret == "" {
+		slog.Warn("security.pancake_webhook_missing_secret",
+			"page_id", pageID,
+			"remote_addr", req.RemoteAddr)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	sig := req.Header.Get("X-Pancake-Signature")
+	if !verifyHMAC(body, target.webhookSecret, sig) {
+		slog.Warn("security.pancake_webhook_signature_mismatch",
+			"page_id", pageID,
+			"remote_addr", req.RemoteAddr)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if target.isDup(webhookReplayKey(body)) {
+		slog.Info("pancake: duplicate webhook skipped", "page_id", pageID)
+		w.WriteHeader(http.StatusOK)
+		return
 	}
 
 	// Build normalized MessagingData from actual Pancake payload.
@@ -217,6 +228,7 @@ func (r *webhookRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	normalized := MessagingData{
 		PageID:         pageID,
 		ConversationID: data.Conversation.ID,
+		PostID:         data.Conversation.PostID, // present for COMMENT events
 		Type:           convType,
 		Platform:       target.platform,
 		AssigneeIDs:    append([]string(nil), data.Conversation.AssigneeIDs...),
@@ -229,7 +241,16 @@ func (r *webhookRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		},
 	}
 
-	target.handleMessagingEvent(normalized)
+	// Route by conversation type.
+	switch convType {
+	case "INBOX":
+		target.handleMessagingEvent(normalized)
+	case "COMMENT":
+		target.handleCommentEvent(normalized)
+	default:
+		slog.Debug("pancake: skipping unknown conversation type",
+			"page_id", pageID, "conv_type", convType)
+	}
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -239,4 +260,69 @@ func truncateBody(body []byte, maxLen int) string {
 		return string(body)
 	}
 	return string(body[:maxLen]) + "..."
+}
+
+// platformPrefixes lists marketplace platform tokens where convID uses a
+// 2-segment page identifier (e.g. "spo_25409726_senderID").
+//
+// Default: "spo" (Shopee) only. "lzd" (Lazada) and "tpd" (Tokopedia) are
+// NOT added by default because neither has been verified against a live
+// Pancake payload. Use RegisterPlatformPrefix to add verified platforms.
+//
+// Guarded by platformPrefixesMu so RegisterPlatformPrefix can be called
+// concurrently with webhook handling without data races.
+var (
+	platformPrefixesMu sync.RWMutex
+	platformPrefixes   = map[string]struct{}{
+		"spo": {}, // Shopee — verified via curl 2026-04-20
+		"tt":  {}, // TikTok Livestream AIO
+		"ttm": {}, // TikTok Business Messaging
+		"tts": {}, // TikTok Shop
+	}
+)
+
+// RegisterPlatformPrefix registers a marketplace prefix for convID parsing.
+// Use this to add verified platforms (e.g. "lzd" for Lazada) after capturing
+// live webhook payloads. Safe to call from any goroutine at any time.
+//
+// NOTE: Currently unused — kept as an extension point for future marketplace
+// platforms (Lazada, Tokopedia, etc.) that may be added in a follow-up PR
+// once their convID shape is verified against live Pancake payloads.
+func RegisterPlatformPrefix(prefix string) {
+	platformPrefixesMu.Lock()
+	defer platformPrefixesMu.Unlock()
+	platformPrefixes[prefix] = struct{}{}
+}
+
+// isKnownPlatformPrefix reports whether prefix is registered as a marketplace
+// platform with a 2-segment page identifier. Read-locked for concurrent safety.
+func isKnownPlatformPrefix(prefix string) bool {
+	platformPrefixesMu.RLock()
+	defer platformPrefixesMu.RUnlock()
+	_, ok := platformPrefixes[prefix]
+	return ok
+}
+
+// resolvePageIDFromConvID extracts the page identifier from a Pancake
+// conversation ID. Facebook/IG use "{pageID}_{senderID}"; Shopee uses
+// "{prefix}_{pageNumeric}_{senderID}" for buyer DMs and possibly
+// "{prefix}_{pageNumeric}" for system events without a sender.
+func resolvePageIDFromConvID(convID string) string {
+	if convID == "" {
+		return ""
+	}
+	parts := strings.Split(convID, "_")
+	if len(parts) < 2 {
+		return ""
+	}
+	knownPrefix := isKnownPlatformPrefix(parts[0])
+	// M2: 2-segment convID with known prefix is a full pageID (system event
+	// without sender). Return as-is — do NOT drop the event.
+	if knownPrefix && len(parts) == 2 {
+		return convID
+	}
+	if knownPrefix && len(parts) >= 3 {
+		return parts[0] + "_" + parts[1]
+	}
+	return parts[0]
 }

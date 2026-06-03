@@ -1,9 +1,11 @@
 package http
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/google/uuid"
 
@@ -20,12 +22,24 @@ type BuiltinToolsHandler struct {
 	store          store.BuiltinToolStore
 	tenantCfgStore store.BuiltinToolTenantConfigStore
 	tenantStore    store.TenantStore
+	secretsStore   store.ConfigSecretsStore
 	msgBus         *bus.MessageBus
 }
 
 // NewBuiltinToolsHandler creates a handler for built-in tool management endpoints.
-func NewBuiltinToolsHandler(s store.BuiltinToolStore, tenantCfgs store.BuiltinToolTenantConfigStore, tenantStore store.TenantStore, msgBus *bus.MessageBus) *BuiltinToolsHandler {
-	return &BuiltinToolsHandler{store: s, tenantCfgStore: tenantCfgs, tenantStore: tenantStore, msgBus: msgBus}
+func NewBuiltinToolsHandler(s store.BuiltinToolStore, tenantCfgs store.BuiltinToolTenantConfigStore, tenantStore store.TenantStore, secretsStore store.ConfigSecretsStore, msgBus *bus.MessageBus) *BuiltinToolsHandler {
+	return &BuiltinToolsHandler{store: s, tenantCfgStore: tenantCfgs, tenantStore: tenantStore, secretsStore: secretsStore, msgBus: msgBus}
+}
+
+// toolSecretKeys maps (tool_name, settings field path) → config_secrets key.
+// When saving settings, if a settings blob contains these fields, they are
+// extracted, saved to config_secrets, and stripped from the persisted settings.
+var toolSecretKeys = map[string]map[string]string{
+	"web_search": {
+		"exa.api_key":    "tools.web.exa.api_key",
+		"tavily.api_key": "tools.web.tavily.api_key",
+		"brave.api_key":  "tools.web.brave.api_key",
+	},
 }
 
 // RegisterRoutes registers all built-in tool routes on the given mux.
@@ -63,6 +77,95 @@ func (h *BuiltinToolsHandler) emitCacheInvalidate(key string, tenantID uuid.UUID
 	})
 }
 
+// extractAndSaveSecrets extracts secret fields from a tool settings blob,
+// saves them to config_secrets, and returns the cleaned settings with
+// secrets stripped. Secret fields are identified by toolSecretKeys.
+func (h *BuiltinToolsHandler) extractAndSaveSecrets(ctx context.Context, toolName string, raw json.RawMessage) json.RawMessage {
+	if h.secretsStore == nil {
+		return raw
+	}
+	mapping, ok := toolSecretKeys[toolName]
+	if !ok || len(raw) == 0 {
+		return raw
+	}
+
+	var settings map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &settings); err != nil {
+		return raw
+	}
+
+	modified := false
+	for settingsPath, secretKey := range mapping {
+		parts := strings.SplitN(settingsPath, ".", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		section, field := parts[0], parts[1]
+
+		sectionRaw, ok := settings[section]
+		if !ok {
+			continue
+		}
+
+		var sectionMap map[string]json.RawMessage
+		if err := json.Unmarshal(sectionRaw, &sectionMap); err != nil {
+			continue
+		}
+
+		keyRaw, ok := sectionMap[field]
+		if !ok {
+			continue
+		}
+
+		var keyValue string
+		if err := json.Unmarshal(keyRaw, &keyValue); err != nil {
+			continue
+		}
+
+		// Strip field regardless; save only non-empty, non-masked values
+		delete(sectionMap, field)
+		if rebuilt, err := json.Marshal(sectionMap); err == nil {
+			settings[section] = rebuilt
+		}
+		modified = true
+
+		if keyValue == "" || keyValue == "***" {
+			continue
+		}
+
+		if err := h.secretsStore.Set(ctx, secretKey, keyValue); err != nil {
+			slog.Warn("failed to save tool secret", "tool", toolName, "key", secretKey, "error", err)
+		}
+	}
+
+	if !modified {
+		return raw
+	}
+	cleaned, err := json.Marshal(settings)
+	if err != nil {
+		return raw
+	}
+	return cleaned
+}
+
+// getSecretsStatus returns which secret keys are set for a tool (boolean only, never raw values).
+func (h *BuiltinToolsHandler) getSecretsStatus(ctx context.Context, toolName string) map[string]bool {
+	if h.secretsStore == nil {
+		return nil
+	}
+	mapping, ok := toolSecretKeys[toolName]
+	if !ok {
+		return nil
+	}
+
+	status := make(map[string]bool, len(mapping))
+	for _, secretKey := range mapping {
+		val, err := h.secretsStore.Get(ctx, secretKey)
+		status[secretKey] = err == nil && val != ""
+	}
+	return status
+}
+
 func (h *BuiltinToolsHandler) handleList(w http.ResponseWriter, r *http.Request) {
 	result, err := h.store.List(r.Context())
 	if err != nil {
@@ -78,19 +181,23 @@ func (h *BuiltinToolsHandler) handleList(w http.ResponseWriter, r *http.Request)
 		enabledOverrides, _ := h.tenantCfgStore.ListAll(r.Context(), tid)
 		settingsOverrides, _ := h.tenantCfgStore.ListAllSettings(r.Context(), tid)
 		if len(enabledOverrides) > 0 || len(settingsOverrides) > 0 {
-			type toolWithTenant struct {
+			type toolWithTenantAndSecrets struct {
 				store.BuiltinToolDef
 				TenantEnabled  *bool           `json:"tenant_enabled"`
 				TenantSettings json.RawMessage `json:"tenant_settings,omitempty"`
+				SecretsSet     map[string]bool `json:"secrets_set,omitempty"`
 			}
-			enriched := make([]toolWithTenant, len(result))
+			enriched := make([]toolWithTenantAndSecrets, len(result))
 			for i, t := range result {
-				enriched[i] = toolWithTenant{BuiltinToolDef: t}
+				enriched[i] = toolWithTenantAndSecrets{BuiltinToolDef: t}
 				if enabled, ok := enabledOverrides[t.Name]; ok {
 					enriched[i].TenantEnabled = &enabled
 				}
 				if raw, ok := settingsOverrides[t.Name]; ok {
 					enriched[i].TenantSettings = raw
+				}
+				if _, hasSecrets := toolSecretKeys[t.Name]; hasSecrets {
+					enriched[i].SecretsSet = h.getSecretsStatus(r.Context(), t.Name)
 				}
 			}
 			writeJSON(w, http.StatusOK, map[string]any{"tools": enriched})
@@ -98,7 +205,19 @@ func (h *BuiltinToolsHandler) handleList(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{"tools": result})
+	// Non-tenant path: include secrets_set for tools that have secrets
+	type toolWithSecrets struct {
+		store.BuiltinToolDef
+		SecretsSet map[string]bool `json:"secrets_set,omitempty"`
+	}
+	enriched := make([]toolWithSecrets, len(result))
+	for i, t := range result {
+		enriched[i] = toolWithSecrets{BuiltinToolDef: t}
+		if _, hasSecrets := toolSecretKeys[t.Name]; hasSecrets {
+			enriched[i].SecretsSet = h.getSecretsStatus(r.Context(), t.Name)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"tools": enriched})
 }
 
 func (h *BuiltinToolsHandler) handleGet(w http.ResponseWriter, r *http.Request) {
@@ -119,6 +238,13 @@ func (h *BuiltinToolsHandler) handleGet(w http.ResponseWriter, r *http.Request) 
 }
 
 func (h *BuiltinToolsHandler) handleUpdate(w http.ResponseWriter, r *http.Request) {
+	// Phase 0b hotfix: builtin_tools is a global table with no tenant_id column,
+	// so this write must be restricted to master-scope callers. Non-master tenant
+	// admins must go through PUT /v1/tools/builtin/{name}/tenant-config instead.
+	// See plans/reports/debugger-260412-0922-tenant-scope-audit.md CRITICAL-1.
+	if !requireMasterScope(w, r) {
+		return
+	}
 	locale := extractLocale(r)
 	name := r.PathValue("name")
 	if name == "" {
@@ -138,7 +264,18 @@ func (h *BuiltinToolsHandler) handleUpdate(w http.ResponseWriter, r *http.Reques
 		allowed["enabled"] = v
 	}
 	if v, ok := updates["settings"]; ok {
-		allowed["settings"] = v
+		// Extract secrets before saving settings
+		if settingsRaw, err := json.Marshal(v); err == nil {
+			cleaned := h.extractAndSaveSecrets(r.Context(), name, settingsRaw)
+			var cleanedMap any
+			if err2 := json.Unmarshal(cleaned, &cleanedMap); err2 == nil {
+				allowed["settings"] = cleanedMap
+			} else {
+				allowed["settings"] = v
+			}
+		} else {
+			allowed["settings"] = v
+		}
 	}
 
 	if len(allowed) == 0 {
@@ -267,7 +404,7 @@ func (h *BuiltinToolsHandler) handleSetTenantConfig(w http.ResponseWriter, r *ht
 	if body.Settings != nil {
 		var payload json.RawMessage
 		if string(body.Settings) != "null" {
-			payload = body.Settings
+			payload = h.extractAndSaveSecrets(r.Context(), name, body.Settings)
 		}
 		if err := h.tenantCfgStore.SetSettings(r.Context(), tid, name, payload); err != nil {
 			slog.Warn("set tenant tool settings failed", "tool", name, "tenant", tid, "error", err)

@@ -40,6 +40,7 @@ export function WsProvider({ children }: { children: React.ReactNode }) {
           const client = wsRef.current;
           store.setRole(client.role || "");
           store.setTenant(client.tenantId, client.tenantName, client.tenantSlug, client.isOwner);
+          store.setConnectInfo({ isMasterScope: client.isMasterScope, edition: client.edition });
           // Fetch tenant memberships asynchronously
           client.call<{ tenants: TenantMembership[] }>(Methods.TENANTS_MINE)
             .then((res) => {
@@ -53,14 +54,14 @@ export function WsProvider({ children }: { children: React.ReactNode }) {
                 store.setTenantSelected(true);
               } else if (!client.isOwner && tenants.length === 1) {
                 // Non-owner with single tenant — auto-select
-                // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+                 
                 localStorage.setItem(LOCAL_STORAGE_KEYS.TENANT_ID, tenants[0]!.slug);
                 store.setTenantSelected(true);
               } else if (!client.isOwner && tenants.length === 0) {
                 // No tenants — leave tenantSelected=false (blocked)
               } else if (client.isOwner && !savedScope && tenants.length > 0) {
                 // Owner without scope — auto-select first tenant
-                // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+                 
                 localStorage.setItem(LOCAL_STORAGE_KEYS.TENANT_ID, tenants[0]!.slug);
                 window.location.reload();
                 return;
@@ -76,7 +77,9 @@ export function WsProvider({ children }: { children: React.ReactNode }) {
             });
         }
         if (state === "disconnected") {
+          store.setRole("");
           store.setTenant("", "", "", false);
+          store.setConnectInfo({ isMasterScope: false, edition: "standard" });
           store.setAvailableTenants([]);
           store.setTenantSelected(false);
         }

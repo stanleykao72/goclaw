@@ -8,6 +8,33 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
 
+// ListUnenrichedDocs returns documents with empty summary for re-enrichment.
+// limit=0 means no limit.
+func (s *PGVaultStore) ListUnenrichedDocs(ctx context.Context, tenantID string, limit int) ([]store.VaultDocument, error) {
+	tid, err := parseUUID(tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("vault list unenriched: tenant: %w", err)
+	}
+
+	q := `SELECT id, tenant_id, agent_id, team_id, chat_id, scope, custom_scope, path, path_basename, title, doc_type,
+			content_hash, summary, metadata, created_at, updated_at
+		FROM vault_documents
+		WHERE tenant_id = $1 AND (summary IS NULL OR summary = '')
+		ORDER BY created_at ASC`
+	args := []any{tid}
+
+	if limit > 0 {
+		q += " LIMIT $2"
+		args = append(args, limit)
+	}
+
+	var rows []vaultDocRow
+	if err := pkgSqlxDB.SelectContext(ctx, &rows, q, args...); err != nil {
+		return nil, fmt.Errorf("vault.list_unenriched: %w", err)
+	}
+	return vaultDocRowsToDocs(rows), nil
+}
+
 // UpdateSummaryAndReembed updates the document summary and re-embeds the combined text.
 func (s *PGVaultStore) UpdateSummaryAndReembed(ctx context.Context, tenantID, docID, summary string) error {
 	tid, err := parseUUID(tenantID)
@@ -75,7 +102,7 @@ func (s *PGVaultStore) FindSimilarDocs(ctx context.Context, tenantID, agentID, d
 		return nil, nil // no embedding = no neighbors
 	}
 
-	q := `SELECT id, tenant_id, agent_id, team_id, scope, custom_scope, path, path_basename, title, doc_type,
+	q := `SELECT id, tenant_id, agent_id, team_id, chat_id, scope, custom_scope, path, path_basename, title, doc_type,
 			content_hash, summary, metadata, created_at, updated_at,
 			1 - (embedding <=> $1::vector) AS score
 		FROM vault_documents

@@ -1,6 +1,11 @@
 package tools
 
-import "testing"
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func TestDetectShellOperators(t *testing.T) {
 	tests := []struct {
@@ -118,5 +123,174 @@ func TestParseCommandBinary(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestMatchesBinaryVerbose verifies start-anchored per-arg matching for
+// deny_verbose patterns. Regression guard: `-v` must NOT false-positive on
+// `--version` (used by the system to probe CLI availability), but MUST still
+// block real verbose flags (`-v`, `-vv`, `-v=1`, `--verbose=true`) to prevent
+// leakage of tokens/request bodies via verbose output.
+func TestMatchesBinaryVerbose(t *testing.T) {
+	ghPatterns, _ := json.Marshal([]string{"--verbose", "-v"})
+	gcloudPatterns, _ := json.Marshal([]string{"--verbosity=debug", "--log-http"})
+	awsPatterns, _ := json.Marshal([]string{"--debug"})
+
+	tests := []struct {
+		name     string
+		patterns json.RawMessage
+		args     []string
+		wantHit  bool
+	}{
+		// --- regression: safe flags must pass ---
+		{"gh --version not blocked", ghPatterns, []string{"--version"}, false},
+		{"gh version subcmd not blocked", ghPatterns, []string{"version"}, false},
+		{"gh --help not blocked", ghPatterns, []string{"--help"}, false},
+		{"gh api repos/x not blocked", ghPatterns, []string{"api", "repos/x"}, false},
+
+		// --- real verbose flags still blocked ---
+		{"gh -v blocked", ghPatterns, []string{"-v"}, true},
+		{"gh --verbose blocked", ghPatterns, []string{"--verbose"}, true},
+		{"gh -vv blocked (escalation)", ghPatterns, []string{"-vv"}, true},
+		{"gh -vvv blocked (escalation)", ghPatterns, []string{"-vvv"}, true},
+		{"gh --verbose=true blocked (equals form)", ghPatterns, []string{"--verbose=true"}, true},
+		{"gh -v in middle of args blocked", ghPatterns, []string{"api", "-v", "repos/x"}, true},
+
+		// --- gcloud patterns: exact flag=value ---
+		{"gcloud --verbosity=debug blocked", gcloudPatterns, []string{"--verbosity=debug"}, true},
+		{"gcloud --verbosity=info not blocked", gcloudPatterns, []string{"--verbosity=info"}, false},
+		{"gcloud --log-http blocked", gcloudPatterns, []string{"--log-http"}, true},
+		{"gcloud version not blocked", gcloudPatterns, []string{"version"}, false},
+
+		// --- aws ---
+		{"aws --debug blocked", awsPatterns, []string{"--debug"}, true},
+		{"aws --debugger not blocked-worthy (prefix match)", awsPatterns, []string{"--debugger"}, true}, // acceptable: still debug family
+		{"aws --version not blocked", awsPatterns, []string{"--version"}, false},
+
+		// --- empty / no patterns ---
+		{"empty patterns", json.RawMessage(nil), []string{"--verbose"}, false},
+		{"empty args", ghPatterns, []string{}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := matchesBinaryVerbose(tt.args, tt.patterns)
+			if (got != "") != tt.wantHit {
+				t.Errorf("matchesBinaryVerbose(%v) = %q, wantHit=%v", tt.args, got, tt.wantHit)
+			}
+		})
+	}
+}
+
+// TestMatchesBinaryDenyJoinedArgs verifies deny_args keeps joined-string
+// matching so multi-token patterns like `auth\s+login` and `repo\s+delete`
+// still work.
+func TestMatchesBinaryDenyJoinedArgs(t *testing.T) {
+	ghPatterns, _ := json.Marshal([]string{`auth\s+`, `repo\s+delete`, `secret\s+`})
+
+	tests := []struct {
+		name    string
+		args    []string
+		wantHit bool
+	}{
+		{"gh auth login blocked", []string{"auth", "login"}, true},
+		{"gh repo delete blocked", []string{"repo", "delete", "foo/bar"}, true},
+		{"gh secret set blocked", []string{"secret", "set", "TOKEN"}, true},
+		{"gh api repos allowed", []string{"api", "repos/x"}, false},
+		{"gh repo view allowed", []string{"repo", "view", "foo/bar"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := matchesBinaryDeny(tt.args, ghPatterns)
+			if (got != "") != tt.wantHit {
+				t.Errorf("matchesBinaryDeny(%v) = %q, wantHit=%v", tt.args, got, tt.wantHit)
+			}
+		})
+	}
+}
+
+func TestResolveAndMatchBinaryUsesConfiguredExecutablePath(t *testing.T) {
+	t.Setenv("PATH", "/usr/bin")
+	binDir := t.TempDir()
+	binaryPath := filepath.Join(binDir, "openrouter")
+	if err := os.WriteFile(binaryPath, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := resolveAndMatchBinary("openrouter", &binaryPath)
+	if err != nil {
+		t.Fatalf("resolveAndMatchBinary returned error: %v", err)
+	}
+	if got != binaryPath {
+		t.Fatalf("path = %q, want %q", got, binaryPath)
+	}
+}
+
+func TestResolveAndMatchBinaryAllowsConfiguredAliasPath(t *testing.T) {
+	runtimeDir := t.TempDir()
+	t.Setenv("RUNTIME_DIR", runtimeDir)
+	t.Setenv("NPM_CONFIG_PREFIX", "")
+	t.Setenv("PATH", "/usr/bin")
+
+	pkgDir := filepath.Join(runtimeDir, "npm-global", "lib", "node_modules", "openrouter-cli")
+	if err := os.MkdirAll(pkgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := []byte(`{"name":"openrouter-cli","bin":{"orc":"dist/index.js"}}`)
+	if err := os.WriteFile(filepath.Join(pkgDir, "package.json"), manifest, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	binDir := filepath.Join(runtimeDir, "npm-global", "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	binaryPath := filepath.Join(binDir, "orc")
+	if err := os.WriteFile(binaryPath, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := resolveAndMatchBinary("openrouter", &binaryPath)
+	if err != nil {
+		t.Fatalf("resolveAndMatchBinary returned error: %v", err)
+	}
+	if got != binaryPath {
+		t.Fatalf("path = %q, want %q", got, binaryPath)
+	}
+}
+
+func TestResolveAndMatchBinaryRejectsArbitraryConfiguredPath(t *testing.T) {
+	t.Setenv("PATH", "/usr/bin")
+	binDir := t.TempDir()
+	binaryPath := filepath.Join(binDir, "sh")
+	if err := os.WriteFile(binaryPath, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := resolveAndMatchBinary("openrouter", &binaryPath); err == nil {
+		t.Fatalf("resolveAndMatchBinary accepted arbitrary mismatched path")
+	}
+}
+
+func TestResolveAndMatchBinaryFallsBackToRuntimeExecutableDirs(t *testing.T) {
+	runtimeDir := t.TempDir()
+	t.Setenv("RUNTIME_DIR", runtimeDir)
+	t.Setenv("NPM_CONFIG_PREFIX", "")
+	t.Setenv("PATH", "/usr/bin")
+
+	binDir := filepath.Join(runtimeDir, "npm-global", "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	binaryPath := filepath.Join(binDir, "openrouter")
+	if err := os.WriteFile(binaryPath, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := resolveAndMatchBinary("openrouter", nil)
+	if err != nil {
+		t.Fatalf("resolveAndMatchBinary returned error: %v", err)
+	}
+	if got != binaryPath {
+		t.Fatalf("path = %q, want %q", got, binaryPath)
 	}
 }

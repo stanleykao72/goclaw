@@ -301,15 +301,14 @@ func TestEpisodicWorkerHandle_WithSummary(t *testing.T) {
 
 	worker := &episodicWorker{
 		store:    mockStore,
-		provider: mockProvider,
-		model:    "test-model",
+		registry: testRegistry(mockProvider),
 		eventBus: mockEventBus,
 	}
 
 	ctx := context.Background()
 	event := eventbus.DomainEvent{
 		Type:     eventbus.EventSessionCompleted,
-		TenantID: uuid.New().String(),
+		TenantID: providers.MasterTenantID.String(),
 		AgentID:  uuid.New().String(),
 		UserID:   "test-user",
 		Payload: &eventbus.SessionCompletedPayload{
@@ -695,8 +694,7 @@ func TestDreamingWorkerHandle_MeetsThreshold(t *testing.T) {
 	worker := &dreamingWorker{
 		episodicStore: mockEpisodic,
 		memoryStore:   mockMemory,
-		provider:      mockProvider,
-		model:         "test-model",
+		registry:      testRegistry(mockProvider),
 		threshold:     5,
 		debounce:      1 * time.Second,
 	}
@@ -704,7 +702,7 @@ func TestDreamingWorkerHandle_MeetsThreshold(t *testing.T) {
 	ctx := context.Background()
 	event := eventbus.DomainEvent{
 		Type:     eventbus.EventEpisodicCreated,
-		TenantID: uuid.New().String(),
+		TenantID: providers.MasterTenantID.String(),
 		AgentID:  "agent-123",
 		UserID:   "user-123",
 		Payload:  &eventbus.EpisodicCreatedPayload{},
@@ -752,8 +750,7 @@ func TestDreamingWorkerHandle_DebounceSkip(t *testing.T) {
 	worker := &dreamingWorker{
 		episodicStore: mockEpisodic,
 		memoryStore:   mockMemory,
-		provider:      mockProvider,
-		model:         "test-model",
+		registry:      testRegistry(mockProvider),
 		threshold:     5,
 		debounce:      10 * time.Second,
 	}
@@ -763,7 +760,7 @@ func TestDreamingWorkerHandle_DebounceSkip(t *testing.T) {
 	// First run should succeed
 	event1 := eventbus.DomainEvent{
 		Type:     eventbus.EventEpisodicCreated,
-		TenantID: uuid.New().String(),
+		TenantID: providers.MasterTenantID.String(),
 		AgentID:  "agent-123",
 		UserID:   "user-123",
 		Payload: &eventbus.EpisodicCreatedPayload{
@@ -828,8 +825,7 @@ func TestRegister_WiresAllWorkers(t *testing.T) {
 		KGStore:       mockKG,
 		SessionStore:  mockSession,
 		EventBus:      mockEventBus,
-		Provider:      mockProvider,
-		Model:         "test-model",
+		Registry:      testRegistry(mockProvider),
 		Extractor:     mockExtractor,
 	}
 

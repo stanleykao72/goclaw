@@ -129,6 +129,7 @@ func (h *VaultHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	var results []uploadResult
 	var created int
+	var pendingEvents []eventbus.DomainEvent
 
 	for _, fh := range files {
 		// Sanitize filename — basename only, no path traversal.
@@ -208,13 +209,13 @@ func (h *VaultHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// Publish enrichment event (same pattern as rescan.go).
+		// Collect enrichment events — published after Start() to avoid race.
 		if h.eventBus != nil {
 			agentForEvent := ""
 			if agentIDStr != "" {
 				agentForEvent = agentIDStr
 			}
-			h.eventBus.Publish(eventbus.DomainEvent{
+			pendingEvents = append(pendingEvents, eventbus.DomainEvent{
 				ID:        uuid.Must(uuid.NewV7()).String(),
 				Type:      eventbus.EventVaultDocUpserted,
 				SourceID:  doc.ID + ":" + hash,
@@ -236,9 +237,12 @@ func (h *VaultHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 		created++
 	}
 
-	// Signal enrichment progress for WS subscribers.
+	// Start progress BEFORE publishing events to avoid race with workers.
 	if h.enrichProgress != nil && created > 0 {
 		h.enrichProgress.Start(created, tenantID)
+	}
+	for _, event := range pendingEvents {
+		h.eventBus.Publish(event)
 	}
 
 	slog.Info("vault.upload", "tenant", tenantIDStr, "uploaded", created, "errors", len(files)-created)

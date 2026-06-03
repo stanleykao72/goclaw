@@ -34,6 +34,7 @@ type Channel struct {
 	config        pancakeInstanceConfig
 	apiClient     *APIClient
 	pageID        string
+	webhookPageID string // native platform ID used in webhook event.page_id (may differ from Pancake internal pageID)
 	pageName      string // resolved from Pancake page metadata at Start()
 	platform      string // resolved from Pancake page metadata at Start()
 	webhookSecret string // optional HMAC-SHA256 secret for webhook verification
@@ -43,6 +44,16 @@ type Channel struct {
 
 	// recentOutbound suppresses short-lived webhook echoes of our own text replies.
 	recentOutbound sync.Map // conversationID + "\x00" + normalized content → time.Time
+
+	// postFetcher fetches and caches page post content for comment context enrichment.
+	postFetcher *PostFetcher
+
+	// commentReplyDisabledOnce prevents repeated info logs when COMMENT webhooks
+	// arrive but the feature is disabled in channel config.
+	commentReplyDisabledOnce sync.Once
+
+	// reactSem bounds concurrent Facebook comment-like calls (cap 10).
+	reactSem chan struct{}
 
 	stopCh  chan struct{}
 	stopCtx context.Context
@@ -66,17 +77,22 @@ func New(cfg pancakeInstanceConfig, creds pancakeCreds,
 	base := channels.NewBaseChannel(channels.TypePancake, msgBus, cfg.AllowFrom)
 	stopCtx, stopFn := context.WithCancel(context.Background())
 
+	apiClient := NewAPIClient(creds.APIKey, creds.PageAccessToken, cfg.PageID)
 	ch := &Channel{
 		BaseChannel:   base,
 		config:        cfg,
-		apiClient:     NewAPIClient(creds.APIKey, creds.PageAccessToken, cfg.PageID),
+		apiClient:     apiClient,
 		pageID:        cfg.PageID,
+		webhookPageID: cfg.WebhookPageID,
 		platform:      cfg.Platform,
 		webhookSecret: creds.WebhookSecret,
+		postFetcher:   NewPostFetcher(apiClient, cfg.PostContextCacheTTL),
+		reactSem:      make(chan struct{}, 10),
 		stopCh:        make(chan struct{}),
 		stopCtx:       stopCtx,
 		stopFn:        stopFn,
 	}
+	ch.postFetcher.stopCtx = stopCtx
 
 	return ch, nil
 }
@@ -121,6 +137,8 @@ func (ch *Channel) Start(ctx context.Context) error {
 			slog.Warn("pancake: could not resolve platform from page metadata", "page_id", ch.pageID, "err", err)
 		} else {
 			if page.Platform != "" {
+				slog.Debug("pancake: platform auto-detected; set platform explicitly in config to avoid startup API call",
+					"page_id", ch.pageID, "platform", page.Platform)
 				ch.platform = page.Platform
 			}
 			if page.Name != "" {
@@ -132,7 +150,15 @@ func (ch *Channel) Start(ctx context.Context) error {
 	if ch.webhookSecret == "" {
 		slog.Warn("security.pancake_webhook_no_secret",
 			"page_id", ch.pageID,
-			"note", "webhook_secret not configured; incoming webhook requests will not be authenticated")
+			"note", "webhook_secret not configured; incoming webhook requests will be ignored until configured")
+	}
+
+	// Without HMAC, any actor reaching the webhook endpoint can trigger Pancake API calls.
+	if ch.config.Features.AutoReact && ch.webhookSecret == "" {
+		slog.Warn("security.pancake_auto_react_without_hmac: auto_react is enabled but "+
+			"webhook_secret is not set; configure webhook_secret to prevent "+
+			"unauthenticated like-comment triggers",
+			"page_id", ch.pageID)
 	}
 
 	globalRouter.register(ch)
@@ -151,7 +177,7 @@ func (ch *Channel) Start(ctx context.Context) error {
 
 // Stop gracefully shuts down the channel.
 func (ch *Channel) Stop(_ context.Context) error {
-	globalRouter.unregister(ch.pageID)
+	globalRouter.unregister(ch.pageID, ch.webhookPageID)
 	ch.stopFn()
 	close(ch.stopCh)
 	ch.SetRunning(false)
@@ -161,6 +187,7 @@ func (ch *Channel) Stop(_ context.Context) error {
 }
 
 // Send delivers an outbound message via Pancake API.
+// Routes to sendCommentReply or sendInboxReply based on metadata["pancake_mode"].
 func (ch *Channel) Send(ctx context.Context, msg bus.OutboundMessage) error {
 	slog.Debug("pancake: Send called",
 		"page_id", ch.pageID,
@@ -169,11 +196,28 @@ func (ch *Channel) Send(ctx context.Context, msg bus.OutboundMessage) error {
 		"platform", ch.platform,
 		"channel_name", ch.Name())
 
-	conversationID := msg.ChatID
-	if conversationID == "" {
+	if msg.ChatID == "" {
 		return fmt.Errorf("pancake: chat_id (conversation_id) is required for outbound message")
 	}
 
+	// NO_REPLY / suppressed-error path: empty content with no media means the
+	// caller wants downstream cleanup only. Pancake API rejects empty payloads,
+	// so short-circuit before dispatch.
+	if msg.Content == "" && len(msg.Media) == 0 {
+		return nil
+	}
+
+	switch msg.Metadata["pancake_mode"] {
+	case "comment":
+		return ch.sendCommentReply(ctx, msg)
+	default: // "inbox" or unset — existing behavior
+		return ch.sendInboxReply(ctx, msg)
+	}
+}
+
+// sendInboxReply handles outbound inbox messages (existing logic extracted from Send).
+func (ch *Channel) sendInboxReply(ctx context.Context, msg bus.OutboundMessage) error {
+	conversationID := msg.ChatID
 	text := FormatOutbound(msg.Content, ch.platform)
 
 	// Handle media attachments.
@@ -183,7 +227,6 @@ func (ch *Channel) Send(ctx context.Context, msg bus.OutboundMessage) error {
 			"page_id", ch.pageID, "err", err)
 	}
 
-	// Pancake's official contract makes `message` and `content_ids` mutually exclusive.
 	// Deliver uploaded media first, then follow with text chunks if needed.
 	if len(attachmentIDs) > 0 {
 		if err := ch.apiClient.SendAttachmentMessage(ctx, conversationID, attachmentIDs); err != nil {
@@ -205,13 +248,85 @@ func (ch *Channel) Send(ctx context.Context, msg bus.OutboundMessage) error {
 	for _, part := range parts {
 		if err := ch.apiClient.SendMessage(ctx, conversationID, part); err != nil {
 			ch.handleAPIError(err)
-			// Remove pre-stored echo fingerprints for unsent parts so they
-			// don't suppress genuine customer messages that happen to match.
 			ch.forgetOutboundEcho(conversationID, part)
 			return err
 		}
 	}
 	return nil
+}
+
+// sendCommentReply posts a public reply to a comment and optionally sends a
+// one-time private DM to the commenter (best-effort). Stateless — no GoClaw
+// dedup state; webhook-level comment_id dedup + FB platform per-comment
+// idempotency prevent duplicates.
+func (ch *Channel) sendCommentReply(ctx context.Context, msg bus.OutboundMessage) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	conversationID := msg.ChatID
+
+	commentID := msg.Metadata["reply_to_comment_id"]
+	if commentID == "" {
+		return fmt.Errorf("pancake: reply_to_comment_id missing in outbound metadata for comment reply")
+	}
+
+	text := FormatOutbound(msg.Content, ch.platform)
+	parts := splitMessage(text, ch.maxMessageLength())
+	for _, part := range parts {
+		ch.rememberOutboundEcho(conversationID, part)
+	}
+	for _, part := range parts {
+		if err := ch.apiClient.ReplyComment(ctx, conversationID, commentID, part); err != nil {
+			ch.handleAPIError(err)
+			ch.forgetOutboundEcho(conversationID, part)
+			return err
+		}
+	}
+
+	if ch.config.Features.PrivateReply {
+		senderID := msg.Metadata["sender_id"]
+		if senderID != "" {
+			ch.sendPrivateReply(
+				ctx,
+				senderID,
+				conversationID,
+				msg.Metadata["post_id"],
+				msg.Metadata["display_name"],
+			)
+		}
+	}
+
+	return nil
+}
+
+// sendPrivateReply sends a one-time DM to a commenter (best-effort,
+// fire-and-forget). Idempotency relies on the caller-side webhook dedup +
+// Facebook's per-comment private_replies endpoint returning an error when a
+// DM was already sent — we log the warn and move on.
+func (ch *Channel) sendPrivateReply(ctx context.Context, senderID, conversationID, postID, commenterName string) {
+	if !ch.config.Features.PrivateReply || senderID == "" {
+		return
+	}
+
+	postTitle := ""
+	if postID != "" && ch.postFetcher != nil {
+		if post, perr := ch.postFetcher.GetPost(ctx, postID); perr == nil && post != nil {
+			postTitle = post.Message
+		}
+	}
+
+	message := renderPrivateReplyMessage(ch.config.PrivateReplyMessage, map[string]string{
+		"commenter_name": commenterName,
+		"post_title":     postTitle,
+	})
+
+	if err := ch.apiClient.PrivateReply(ctx, conversationID, message); err != nil {
+		slog.Warn("pancake: private_reply send failed",
+			"page_id", ch.pageID, "sender_id", senderID, "conv_id", conversationID, "err", err)
+		return
+	}
+	slog.Debug("pancake: private_reply sent",
+		"page_id", ch.pageID, "sender_id", senderID, "conv_id", conversationID)
 }
 
 // BlockReplyEnabled returns the per-channel block_reply override (nil = inherit gateway default).
@@ -241,7 +356,7 @@ func (ch *Channel) handleAPIError(err error) {
 // maxMessageLength returns the platform-specific character limit.
 func (ch *Channel) maxMessageLength() int {
 	switch ch.platform {
-	case "tiktok":
+	case "tiktok", "shopee":
 		return 500
 	case "instagram":
 		return 1000
@@ -255,4 +370,3 @@ func (ch *Channel) maxMessageLength() int {
 		return 2000
 	}
 }
-

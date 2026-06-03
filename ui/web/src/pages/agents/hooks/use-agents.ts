@@ -21,7 +21,7 @@ export function useAgents() {
   const connected = useAuthStore((s) => s.connected);
   const queryClient = useQueryClient();
 
-  const { data: agents = [], isPending: loading, error: queryError } = useQuery({
+  const { data: agents = [], isPending: loading, error: queryError, refetch } = useQuery({
     queryKey: queryKeys.agents.all,
     queryFn: async () => {
       // Try HTTP first (returns full agent data, filtered by user access)
@@ -47,9 +47,9 @@ export function useAgents() {
         max_tool_iterations: 0,
         workspace: "",
         restrict_to_workspace: false,
-        agent_type: "open" as const,
+        agent_type: (a as unknown as { agentType?: string }).agentType === "predefined" ? "predefined" as const : "open" as const,
         is_default: false,
-        status: a.isRunning ? "running" : "idle",
+        status: a.isRunning ? "active" : "inactive",
       }));
     },
     staleTime: 60_000,
@@ -59,8 +59,11 @@ export function useAgents() {
   const error = queryError instanceof Error ? queryError.message : queryError ? "Failed to load agents" : null;
 
   const invalidate = useCallback(
-    () => queryClient.invalidateQueries({ queryKey: queryKeys.agents.all }),
-    [queryClient],
+    async () => {
+      await queryClient.invalidateQueries({ queryKey: queryKeys.agents.all });
+      await refetch();
+    },
+    [queryClient, refetch],
   );
 
   const createAgent = useCallback(
@@ -113,5 +116,12 @@ export function useAgents() {
     [http],
   );
 
-  return { agents, loading, error, refresh: invalidate, createAgent, updateAgent, deleteAgent, resummonAgent };
+  const cancelSummonAgent = useCallback(
+    async (id: string) => {
+      await http.post(`/v1/agents/${id}/cancel-summon`);
+    },
+    [http],
+  );
+
+  return { agents, loading, error, refresh: invalidate, createAgent, updateAgent, deleteAgent, resummonAgent, cancelSummonAgent };
 }
