@@ -430,6 +430,7 @@ func runGateway() {
 		instanceLoader.RegisterFactory(channels.TypeWhatsApp, whatsapp.FactoryWithDB(pgStores.DB, pgStores.PendingMessages, "pgx"))
 		instanceLoader.RegisterFactory(channels.TypeSlack, slackchannel.FactoryWithPendingStore(pgStores.PendingMessages))
 		instanceLoader.RegisterFactory(channels.TypeLine, makeLineFactoryWithEsmithKm(server))
+		instanceLoader.RegisterFactory(channels.TypeLineWorks, makeLineWorksFactory(server))
 		instanceLoader.RegisterFactory(channels.TypeFacebook, facebook.Factory)
 		instanceLoader.RegisterFactory(channels.TypePancake, pancake.Factory)
 		if err := instanceLoader.LoadAll(context.Background()); err != nil {

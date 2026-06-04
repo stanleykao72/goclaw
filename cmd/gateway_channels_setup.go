@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/channels/discord"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/feishu"
 	linechannel "github.com/nextlevelbuilder/goclaw/internal/channels/line"
+	lineworkschannel "github.com/nextlevelbuilder/goclaw/internal/channels/lineworks"
 	slackchannel "github.com/nextlevelbuilder/goclaw/internal/channels/slack"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/telegram"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/whatsapp"
@@ -26,7 +28,9 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/config"
 	"github.com/nextlevelbuilder/goclaw/internal/gateway"
 	"github.com/nextlevelbuilder/goclaw/internal/gateway/methods"
+	lw "github.com/nextlevelbuilder/goclaw/internal/lineworks"
 	esmithkm "github.com/nextlevelbuilder/goclaw/internal/plugins/esmith-km"
+	lineworksworkflow "github.com/nextlevelbuilder/goclaw/internal/plugins/lineworks-workflow"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
 )
@@ -189,6 +193,172 @@ func makeLineFactoryWithEsmithKm(srv *gateway.Server) channels.ChannelFactory {
 			if hook := registerEsmithKmHook(lc); hook != nil {
 				registerEsmithKmLiffOnGateway(srv, lc)
 			}
+		}
+		return ch, nil
+	}
+}
+
+// lineWorksFactoryCreds is the cmd-local view of the decrypted LINE WORKS
+// credentials JSON. It mirrors the channel package's (unexported) cred struct
+// just enough to build the Directory resolver's own SDK client — the channel
+// factory parses the same JSON independently for the outbound/send path. Two
+// distinct secrets exist: client_secret authenticates the OAuth token
+// exchange, bot_secret keys the X-WORKS-Signature HMAC.
+type lineWorksFactoryCreds struct {
+	BotID          string   `json:"bot_id"`
+	ServiceAccount string   `json:"service_account"`
+	ClientID       string   `json:"client_id"`
+	ClientSecret   string   `json:"client_secret"`
+	PrivateKey     string   `json:"private_key"`
+	Scopes         []string `json:"scopes,omitempty"`
+}
+
+// lineWorksFactoryConfig is the cmd-local view of the non-secret config JSONB,
+// limited to the fields the workflow plugin needs at wiring time.
+type lineWorksFactoryConfig struct {
+	DirectoryExternalKeyPrefix string   `json:"directory_external_key_prefix,omitempty"`
+	Scopes                     []string `json:"scopes,omitempty"`
+}
+
+// lineWorksDirectoryAdapter bridges the lineworks SDK Client.GetUser to the
+// workflow plugin's DirectoryResolver (UserExternalKey). The plugin stays
+// decoupled from the concrete SDK; this adapter lives in cmd wiring.
+type lineWorksDirectoryAdapter struct {
+	client *lw.Client
+}
+
+func (d lineWorksDirectoryAdapter) UserExternalKey(ctx context.Context, userID string) (string, error) {
+	u, err := d.client.GetUser(ctx, userID)
+	if err != nil {
+		return "", err
+	}
+	return u.UserExternalKey, nil
+}
+
+// registerLineWorksWorkflowHook reads the lineworks-workflow env vars and, if
+// present, constructs a lineworksworkflow.Hook and registers it on the given
+// LINE WORKS channel. Mirrors registerEsmithKmHook's three-case env handling
+// (both set → register; both unset → skip at Info; partial → skip at Error).
+//
+// The hook's Sender is the channel itself (it satisfies the channel's Sender
+// interface). The DirectoryResolver wraps a dedicated SDK client built from the
+// same per-instance credentials, scoped with directory.read so externalKey
+// lookups succeed regardless of the channel's send-only scopes.
+//
+// creds/cfg are the raw per-instance JSON the factory received; they carry the
+// service-account key material needed to mint a directory-scoped token. A nil
+// returned hook means the plugin was not wired (env missing or creds invalid)
+// — channel startup proceeds regardless, exactly like esmith-km on LINE.
+func registerLineWorksWorkflowHook(ch *lineworkschannel.Channel, creds json.RawMessage, cfg json.RawMessage) *lineworksworkflow.Hook {
+	mcpURL := os.Getenv("ODOO_STAGE38_MCP_URL")
+	mcpToken := os.Getenv("ODOO_STAGE38_MCP_TOKEN")
+
+	switch {
+	case mcpURL == "" && mcpToken == "":
+		slog.Info("lineworks-workflow: MCP env not set, skipping hook registration (non-lineworks deployment)")
+		return nil
+	case mcpURL == "" || mcpToken == "":
+		slog.Error("lineworks-workflow: partial MCP config detected, HOOK WILL NOT BE REGISTERED",
+			"url_set", mcpURL != "",
+			"token_set", mcpToken != "",
+			"action", "Set both ODOO_STAGE38_MCP_URL and ODOO_STAGE38_MCP_TOKEN, or neither")
+		return nil
+	}
+
+	var cr lineWorksFactoryCreds
+	if len(creds) > 0 {
+		if err := json.Unmarshal(creds, &cr); err != nil {
+			slog.Error("lineworks-workflow: cannot decode credentials, HOOK WILL NOT BE REGISTERED", "error", err)
+			return nil
+		}
+	}
+	var ic lineWorksFactoryConfig
+	if len(cfg) > 0 {
+		if err := json.Unmarshal(cfg, &ic); err != nil {
+			slog.Error("lineworks-workflow: cannot decode config, HOOK WILL NOT BE REGISTERED", "error", err)
+			return nil
+		}
+	}
+
+	// Directory lookups need directory.read; ensure it is present on the
+	// token the resolver's client mints, without mutating the channel's own
+	// send scopes.
+	scopes := cr.Scopes
+	if len(scopes) == 0 {
+		scopes = ic.Scopes
+	}
+	scopes = ensureScope(scopes, "directory.read")
+
+	ts, err := lw.NewTokenSource(lw.AuthConfig{
+		ClientID:       cr.ClientID,
+		ClientSecret:   cr.ClientSecret,
+		ServiceAccount: cr.ServiceAccount,
+		PrivateKeyPEM:  cr.PrivateKey,
+		Scopes:         scopes,
+	})
+	if err != nil {
+		slog.Error("lineworks-workflow: directory token source failed, HOOK WILL NOT BE REGISTERED", "error", err)
+		return nil
+	}
+	dirClient, err := lw.NewClient(lw.ClientConfig{BotID: cr.BotID, Tokens: ts})
+	if err != nil {
+		slog.Error("lineworks-workflow: directory client failed, HOOK WILL NOT BE REGISTERED", "error", err)
+		return nil
+	}
+
+	prefix := ic.DirectoryExternalKeyPrefix // empty → plugin default "odoo-emp-"
+	hook := lineworksworkflow.New(lineworksworkflow.Config{
+		Sender:            ch,
+		Directory:         lineWorksDirectoryAdapter{client: dirClient},
+		MCPURL:            mcpURL,
+		MCPToken:          mcpToken,
+		OdooBaseURL:       os.Getenv("ODOO_STAGE38_BASE_URL"),
+		ExternalKeyPrefix: prefix,
+		TodoProjectID:     atoiOrZero(os.Getenv("LINEWORKS_WORKFLOW_TODO_PROJECT_ID")),
+	})
+	ch.RegisterHook(hook)
+	slog.Info("lineworks-workflow: hook registered on LINE WORKS channel",
+		"external_key_prefix_set", prefix != "")
+	return hook
+}
+
+// ensureScope appends scope to scopes if not already present. A nil/empty
+// input yields a single-element slice — the SDK then uses an explicit scope set
+// instead of its send-only default, which directory lookups require.
+func ensureScope(scopes []string, scope string) []string {
+	for _, s := range scopes {
+		if s == scope {
+			return scopes
+		}
+	}
+	return append(append([]string{}, scopes...), scope)
+}
+
+// atoiOrZero parses a base-10 int from s, returning 0 on any error / empty
+// input. Used for optional numeric env vars whose absence means "unset".
+func atoiOrZero(s string) int {
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// makeLineWorksFactory closes over the gateway server (kept for signature
+// parity with makeLineFactoryWithEsmithKm and future LIFF/HTTP surfaces) and
+// returns a ChannelFactory that builds the LINE WORKS channel via the channel
+// package's own Factory, then registers the lineworks-workflow plugin hook on
+// the resulting channel instance. The workflow plugin needs no HTTP surface in
+// v1, so srv is not used to mount any handler here.
+func makeLineWorksFactory(_ *gateway.Server) channels.ChannelFactory {
+	return func(name string, creds json.RawMessage, cfg json.RawMessage,
+		msgBus *bus.MessageBus, pairingSvc store.PairingStore) (channels.Channel, error) {
+		ch, err := lineworkschannel.Factory(name, creds, cfg, msgBus, pairingSvc)
+		if err != nil {
+			return nil, err
+		}
+		if lc, ok := ch.(*lineworkschannel.Channel); ok {
+			registerLineWorksWorkflowHook(lc, creds, cfg)
 		}
 		return ch, nil
 	}

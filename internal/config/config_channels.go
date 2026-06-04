@@ -21,6 +21,7 @@ type ChannelsConfig struct {
 	ZaloPersonal      ZaloPersonalConfig       `json:"zalo_personal"`
 	Feishu            FeishuConfig             `json:"feishu"`
 	Line              LineConfig               `json:"line"`
+	LineWorks         LineWorksConfig          `json:"lineworks"`
 	PendingCompaction *PendingCompactionConfig `json:"pending_compaction,omitempty"` // global pending message compaction settings
 }
 
@@ -546,4 +547,27 @@ type LineConfig struct {
 	AllowFrom          FlexibleStringSlice `json:"allow_from"`
 	DMPolicy           string              `json:"dm_policy,omitempty"`
 	GroupPolicy        string              `json:"group_policy,omitempty"`
+}
+
+// LineWorksConfig defines configuration for the LINE WORKS Bot channel. It is
+// deliberately independent from LineConfig — LINE WORKS is a separate platform
+// with a JWT (RS256) service-account auth model, its own webhook signature
+// (X-WORKS-Signature, keyed by the Bot Secret), and distinct send endpoints.
+//
+// Two distinct secrets are required: ClientSecret authenticates the OAuth token
+// exchange, while BotSecret is the HMAC key for callback signature
+// verification — they are NOT interchangeable.
+type LineWorksConfig struct {
+	Enabled        bool                `json:"enabled"`
+	BotID          string              `json:"bot_id"`
+	BotSecret      string              `json:"bot_secret"`      // HMAC key for X-WORKS-Signature
+	ServiceAccount string              `json:"service_account"` // [id]@domain
+	ClientID       string              `json:"client_id"`
+	ClientSecret   string              `json:"client_secret"` // OAuth token-exchange secret
+	PrivateKey     string              `json:"private_key"`   // RSA private key, PEM
+	DomainID       string              `json:"domain_id,omitempty"`
+	Scopes         FlexibleStringSlice `json:"scopes,omitempty"` // empty → SDK default {bot, bot.message}
+	AllowFrom      FlexibleStringSlice `json:"allow_from"`
+	DMPolicy       string              `json:"dm_policy,omitempty"`
+	GroupPolicy    string              `json:"group_policy,omitempty"`
 }
