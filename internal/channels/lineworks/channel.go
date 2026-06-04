@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	lw "github.com/nextlevelbuilder/goclaw/internal/lineworks"
@@ -76,7 +77,23 @@ type Channel struct {
 	// asked. Best-effort: in a busy group the "last sender" may differ from the
 	// exact triggering message, but conversations are typically sequential.
 	groupLastSender sync.Map
+
+	// ackPending tracks chats awaiting an agent reply (chatID → generation int64).
+	// LINE WORKS has no streaming / typing indicator and bot messages cannot be
+	// edited, so for a slow turn we send a one-off "processing" ack only if the
+	// real reply has not arrived within ackDelay. A newer inbound (higher gen)
+	// or the reply (Send clears the entry) cancels a pending ack.
+	ackPending sync.Map
+	ackCounter int64 // monotonic generation source (atomic)
 }
+
+const (
+	// defaultAckDelay is how long to wait for the agent's reply before sending a
+	// "processing" ack. Tuned so fast replies never trigger an ack.
+	defaultAckDelay = 4 * time.Second
+	// defaultAckMessage is the one-off ack sent for a slow turn.
+	defaultAckMessage = "⏳ 收到,正在為你處理中,請稍候…"
+)
 
 // compile-time assertions: Channel satisfies the channel + webhook + sender
 // contracts.
@@ -192,6 +209,39 @@ func (c *Channel) SendText(ctx context.Context, userID, channelID, text string) 
 		}
 	}
 	return nil
+}
+
+// scheduleAck arms a delayed "processing" ack for an agent-bound message. If
+// the agent's reply has not reached the chat within defaultAckDelay (Send
+// clears the pending entry) and no newer inbound has superseded it, a single
+// ack is sent so the user knows a slow turn (e.g. an Odoo query) is in flight.
+// No-op without a client (unit tests).
+func (c *Channel) scheduleAck(userID, channelID, chatID string) {
+	if c.client == nil {
+		return
+	}
+	gen := atomic.AddInt64(&c.ackCounter, 1)
+	c.ackPending.Store(chatID, gen)
+	c.hookWG.Add(1)
+	go func() {
+		defer c.hookWG.Done()
+		ctx := c.hookContext()
+		t := time.NewTimer(defaultAckDelay)
+		defer t.Stop()
+		select {
+		case <-t.C:
+		case <-ctx.Done():
+			return
+		}
+		// Send the ack only if this is still the latest pending turn for the
+		// chat (no reply cleared it, no newer inbound replaced the generation).
+		if v, ok := c.ackPending.Load(chatID); ok && v.(int64) == gen {
+			c.ackPending.Delete(chatID)
+			if err := c.SendText(ctx, userID, channelID, defaultAckMessage); err != nil {
+				slog.Warn("LINEWORKS: processing-ack send failed", "chatID", chatID, "err", err)
+			}
+		}
+	}()
 }
 
 // WebhookHandler returns the HTTP path and handler for LINE WORKS callbacks.
