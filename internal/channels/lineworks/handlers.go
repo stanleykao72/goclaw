@@ -132,6 +132,26 @@ func (c *Channel) handleMessageEvent(ev callbackEvent) {
 
 	text := ev.Content.Text
 
+	// Gate: a synchronous access check that runs before plugins and the agent.
+	// A deny blocks the message entirely and (optionally) replies a hint, so an
+	// unrecognized sender reaches neither the workflow hooks nor the agent.
+	if c.gate != nil {
+		gateEv := TextEvent{UserID: ev.Source.UserID, ChatID: chatID, ChannelID: ev.Source.ChannelID, Text: text}
+		allow, reply := c.gate.Gate(c.hookContext(), gateEv)
+		// A reply (block hint, DM-bind prompt, or bind-success confirmation) is
+		// sent whenever present — including when allow=true (success → still
+		// proceeds to the agent).
+		if reply != "" {
+			if err := c.SendText(c.hookContext(), ev.Source.UserID, ev.Source.ChannelID, reply); err != nil {
+				slog.Error("LINEWORKS: gate reply send failed", "sender", senderID, "err", err)
+			}
+		}
+		if !allow {
+			slog.Info("LINEWORKS: message blocked by gate", "sender", senderID, "peerKind", peerKind)
+			return
+		}
+	}
+
 	// Fan out to hooks (workflow plugin) in parallel with the agent path,
 	// mirroring line.handleEvent. The hook event carries UserID + ChannelID so
 	// the hook can reply to the right peer (1:1 vs group) without re-deriving.

@@ -31,6 +31,7 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/gateway/methods"
 	lw "github.com/nextlevelbuilder/goclaw/internal/lineworks"
 	esmithkm "github.com/nextlevelbuilder/goclaw/internal/plugins/esmith-km"
+	lineworksautobind "github.com/nextlevelbuilder/goclaw/internal/plugins/lineworks-autobind"
 	lineworksworkflow "github.com/nextlevelbuilder/goclaw/internal/plugins/lineworks-workflow"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
@@ -236,6 +237,22 @@ func (d lineWorksDirectoryAdapter) UserExternalKey(ctx context.Context, userID s
 	return u.UserExternalKey, nil
 }
 
+// ResolveUser returns the LINE WORKS directory identity the autobind hook needs
+// from a single lookup. Satisfies lineworksautobind.DirectoryResolver.
+func (d lineWorksDirectoryAdapter) ResolveUser(ctx context.Context, userID string) (*lineworksautobind.DirUser, error) {
+	u, err := d.client.GetUser(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	return &lineworksautobind.DirUser{
+		UserID:       u.UserID,
+		Name:         u.DisplayName(),
+		Email:        u.Email,
+		PrivateEmail: u.PrivateEmail,
+		ExternalKey:  u.UserExternalKey,
+	}, nil
+}
+
 // registerLineWorksWorkflowHook reads the lineworks-workflow env vars and, if
 // present, constructs a lineworksworkflow.Hook and registers it on the given
 // LINE WORKS channel. Mirrors registerEsmithKmHook's three-case env handling
@@ -345,13 +362,149 @@ func atoiOrZero(s string) int {
 	return n
 }
 
+// lineWorksOdooToken extracts the bearer token from a decrypted MCP server
+// row: the api_key column if set, otherwise the Authorization header (stripped
+// of its "Bearer " prefix). Returns "" when neither carries a token.
+func lineWorksOdooToken(srv *store.MCPServerData) string {
+	if srv == nil {
+		return ""
+	}
+	if t := strings.TrimSpace(srv.APIKey); t != "" {
+		return t
+	}
+	if len(srv.Headers) > 0 {
+		var hm map[string]string
+		if err := json.Unmarshal(srv.Headers, &hm); err == nil {
+			for k, v := range hm {
+				if strings.EqualFold(k, "Authorization") {
+					v = strings.TrimSpace(v)
+					if strings.HasPrefix(strings.ToLower(v), "bearer ") {
+						v = strings.TrimSpace(v[len("bearer "):])
+					}
+					return v
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// registerLineWorksAutobindHook wires the per-user Odoo credential provisioner
+// onto the LINE WORKS channel. It resolves the odoo MCP server row (name from
+// LINEWORKS_AUTOBIND_SERVER, default "odoo-prod") for its URL + decrypted
+// token, builds a directory-scoped SDK client from the channel's
+// service-account creds, and registers the autobind hook. Any missing piece
+// (no MCP store, server not found, no token, bad creds) is logged and skipped
+// — channel startup proceeds regardless. Set LINEWORKS_AUTOBIND_DISABLE to opt
+// out entirely.
+func registerLineWorksAutobindHook(ch *lineworkschannel.Channel, name string, creds, cfg json.RawMessage, mcpStore store.MCPServerStore, chanStore store.ChannelInstanceStore, agentStore store.AgentStore) {
+	if os.Getenv("LINEWORKS_AUTOBIND_DISABLE") != "" {
+		slog.Info("lineworks-autobind: disabled via LINEWORKS_AUTOBIND_DISABLE, skipping")
+		return
+	}
+	if mcpStore == nil {
+		slog.Warn("lineworks-autobind: no MCP store available, HOOK WILL NOT BE REGISTERED")
+		return
+	}
+	serverName := os.Getenv("LINEWORKS_AUTOBIND_SERVER")
+	if serverName == "" {
+		serverName = "odoo-prod"
+	}
+	// GetServerByName requires a tenant in context (no master fallback); the
+	// mcp_servers rows live under MasterTenantID. Use a cross-tenant lookup so
+	// the odoo server resolves regardless of the (tenant-less) factory context.
+	// Per-user credential writes still default to MasterTenantID via
+	// tenantIDForInsert, matching the tenant the agent reads under.
+	srv, err := mcpStore.GetServerByName(store.WithCrossTenant(context.Background()), serverName)
+	if err != nil || srv == nil {
+		slog.Warn("lineworks-autobind: odoo MCP server not found, HOOK WILL NOT BE REGISTERED",
+			"server", serverName, "error", err)
+		return
+	}
+	token := lineWorksOdooToken(srv)
+	if token == "" {
+		slog.Warn("lineworks-autobind: MCP server has no usable token, HOOK WILL NOT BE REGISTERED", "server", serverName)
+		return
+	}
+
+	var cr lineWorksFactoryCreds
+	if len(creds) > 0 {
+		if err := json.Unmarshal(creds, &cr); err != nil {
+			slog.Error("lineworks-autobind: cannot decode credentials, HOOK WILL NOT BE REGISTERED", "error", err)
+			return
+		}
+	}
+	var ic lineWorksFactoryConfig
+	if len(cfg) > 0 {
+		if err := json.Unmarshal(cfg, &ic); err != nil {
+			slog.Error("lineworks-autobind: cannot decode config, HOOK WILL NOT BE REGISTERED", "error", err)
+			return
+		}
+	}
+
+	scopes := cr.Scopes
+	if len(scopes) == 0 {
+		scopes = ic.Scopes
+	}
+	scopes = ensureScope(scopes, "directory.read")
+	ts, err := lw.NewTokenSource(lw.AuthConfig{
+		ClientID:       cr.ClientID,
+		ClientSecret:   cr.ClientSecret,
+		ServiceAccount: cr.ServiceAccount,
+		PrivateKeyPEM:  cr.PrivateKey,
+		Scopes:         scopes,
+	})
+	if err != nil {
+		slog.Error("lineworks-autobind: directory token source failed, HOOK WILL NOT BE REGISTERED", "error", err)
+		return
+	}
+	dirClient, err := lw.NewClient(lw.ClientConfig{BotID: cr.BotID, Tokens: ts})
+	if err != nil {
+		slog.Error("lineworks-autobind: directory client failed, HOOK WILL NOT BE REGISTERED", "error", err)
+		return
+	}
+
+	// Resolve the channel instance's agent so the hook can write the per-user
+	// identity context file the agent loads. Best-effort: if it can't be
+	// resolved, the hook still provisions credentials, just skips identity
+	// injection.
+	var agentCtx lineworksautobind.AgentContextStore
+	var agentID uuid.UUID
+	if chanStore != nil && agentStore != nil {
+		if inst, ierr := chanStore.GetByName(store.WithCrossTenant(context.Background()), name); ierr == nil && inst != nil {
+			agentID = inst.AgentID
+			agentCtx = agentStore
+		} else {
+			slog.Warn("lineworks-autobind: cannot resolve channel agent, identity injection disabled",
+				"channel", name, "error", ierr)
+		}
+	}
+
+	hook := lineworksautobind.New(lineworksautobind.Config{
+		Directory:         lineWorksDirectoryAdapter{client: dirClient},
+		Creds:             mcpStore,
+		ServerID:          srv.ID,
+		MCPURL:            srv.URL,
+		MCPToken:          token,
+		ExternalKeyPrefix: ic.DirectoryExternalKeyPrefix,
+		Agents:            agentCtx,
+		AgentID:           agentID,
+		HintMessage:       os.Getenv("LINEWORKS_AUTOBIND_HINT"), // empty → plugin default
+	})
+	ch.SetGate(hook)
+	slog.Info("lineworks-autobind: gate registered",
+		"server", serverName, "server_id", srv.ID, "mcp_url", srv.URL,
+		"identity_injection", agentID != uuid.Nil)
+}
+
 // makeLineWorksFactory closes over the gateway server (kept for signature
 // parity with makeLineFactoryWithEsmithKm and future LIFF/HTTP surfaces) and
-// returns a ChannelFactory that builds the LINE WORKS channel via the channel
-// package's own Factory, then registers the lineworks-workflow plugin hook on
-// the resulting channel instance. The workflow plugin needs no HTTP surface in
-// v1, so srv is not used to mount any handler here.
-func makeLineWorksFactory(_ *gateway.Server) channels.ChannelFactory {
+// the MCP server store (needed by the autobind hook to read the odoo-prod
+// token and write per-user credentials). It returns a ChannelFactory that
+// builds the LINE WORKS channel via the channel package's own Factory, then
+// registers the lineworks-workflow and autobind plugin hooks on the resulting
+// channel instance.
+func makeLineWorksFactory(_ *gateway.Server, mcpStore store.MCPServerStore, chanStore store.ChannelInstanceStore, agentStore store.AgentStore) channels.ChannelFactory {
 	return func(name string, creds json.RawMessage, cfg json.RawMessage,
 		msgBus *bus.MessageBus, pairingSvc store.PairingStore) (channels.Channel, error) {
 		ch, err := lineworkschannel.Factory(name, creds, cfg, msgBus, pairingSvc)
@@ -360,6 +513,7 @@ func makeLineWorksFactory(_ *gateway.Server) channels.ChannelFactory {
 		}
 		if lc, ok := ch.(*lineworkschannel.Channel); ok {
 			registerLineWorksWorkflowHook(lc, creds, cfg)
+			registerLineWorksAutobindHook(lc, name, creds, cfg, mcpStore, chanStore, agentStore)
 		}
 		return ch, nil
 	}
@@ -622,4 +776,3 @@ func wireChannelEventSubscribers(
 		})
 	}
 }
-

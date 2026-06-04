@@ -57,6 +57,11 @@ type Channel struct {
 	// hookWG tracks in-flight fan-out goroutines so Stop can wait briefly for
 	// them to drain (bounded by a 3s timeout).
 	hookWG sync.WaitGroup
+
+	// gate, when set via SetGate, runs synchronously before hook fan-out and the
+	// agent path; a deny result blocks the message (the agent never sees it). At
+	// most one gate per channel.
+	gate MessageGate
 }
 
 // compile-time assertions: Channel satisfies the channel + webhook + sender
@@ -95,6 +100,13 @@ func (c *Channel) RegisterHook(h MessageHook) {
 		return
 	}
 	c.hooks = append(c.hooks, h)
+}
+
+// SetGate installs the channel's message gate (replacing any previous one).
+// Must be called before Start(); not safe for concurrent use. A nil gate means
+// no gating — every policy-passing message proceeds to the agent.
+func (c *Channel) SetGate(g MessageGate) {
+	c.gate = g
 }
 
 // Start begins listening (webhook mode). It creates the fan-out parent context
