@@ -62,6 +62,13 @@ type Channel struct {
 	// agent path; a deny result blocks the message (the agent never sees it). At
 	// most one gate per channel.
 	gate MessageGate
+
+	// groupChats remembers which chat ids are group/room conversations (chatID →
+	// struct{}), recorded on every inbound group event. The agent's outbound
+	// reply arrives via the bus without the inbound peer metadata, so routePeer
+	// consults this set to route group replies to the channel endpoint instead
+	// of mis-sending the channelId to the 1:1 user endpoint.
+	groupChats sync.Map
 }
 
 // compile-time assertions: Channel satisfies the channel + webhook + sender

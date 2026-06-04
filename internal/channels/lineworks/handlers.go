@@ -100,7 +100,10 @@ func peerOf(src callbackSource) (chatID, peerKind string) {
 // interpret ev.Data (TOP-LEVEL per the callback contract) and drive their own
 // state machine (待辦/日報 flow).
 func (c *Channel) handlePostback(ev callbackEvent) {
-	chatID, _ := peerOf(ev.Source)
+	chatID, peerKind := peerOf(ev.Source)
+	if peerKind == peerGroup {
+		c.groupChats.Store(chatID, struct{}{})
+	}
 	c.fanOutPostback(PostbackEvent{
 		UserID:    ev.Source.UserID,
 		ChatID:    chatID,
@@ -113,6 +116,9 @@ func (c *Channel) handlePostback(ev callbackEvent) {
 // for text, then forward to the bus via HandleMessage for the agent path.
 func (c *Channel) handleMessageEvent(ev callbackEvent) {
 	chatID, peerKind := peerOf(ev.Source)
+	if peerKind == peerGroup {
+		c.groupChats.Store(chatID, struct{}{})
+	}
 	senderID := senderPrefix + ev.Source.UserID
 
 	// Policy check — same gate as the line channel (DM allowlist / group

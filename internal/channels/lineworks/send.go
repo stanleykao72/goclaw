@@ -133,5 +133,12 @@ func (c *Channel) routePeer(chatID string, metadata map[string]string) (userID, 
 			return uid, ""
 		}
 	}
+	// No inbound metadata (the common agent-reply path: the bus delivers an
+	// OutboundMessage carrying only ChatID). Fall back to the remembered peer
+	// kind so group replies route to the channel endpoint — without this a
+	// group chatID is mis-sent to /users/{id} and rejected (HTTP 400).
+	if _, ok := c.groupChats.Load(chatID); ok {
+		return "", chatID
+	}
 	return chatID, ""
 }
