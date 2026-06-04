@@ -118,6 +118,9 @@ func (c *Channel) handleMessageEvent(ev callbackEvent) {
 	chatID, peerKind := peerOf(ev.Source)
 	if peerKind == peerGroup {
 		c.groupChats.Store(chatID, struct{}{})
+		if ev.Source.UserID != "" {
+			c.groupLastSender.Store(chatID, ev.Source.UserID)
+		}
 	}
 	senderID := senderPrefix + ev.Source.UserID
 

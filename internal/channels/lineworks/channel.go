@@ -69,6 +69,13 @@ type Channel struct {
 	// consults this set to route group replies to the channel endpoint instead
 	// of mis-sending the channelId to the 1:1 user endpoint.
 	groupChats sync.Map
+
+	// groupLastSender remembers the most recent asker per group chat (chatID →
+	// LINE WORKS userId). The agent's group reply is prefixed with a mention of
+	// that user (<m userId="...">) so the reply notifies + addresses whoever
+	// asked. Best-effort: in a busy group the "last sender" may differ from the
+	// exact triggering message, but conversations are typically sequential.
+	groupLastSender sync.Map
 }
 
 // compile-time assertions: Channel satisfies the channel + webhook + sender
