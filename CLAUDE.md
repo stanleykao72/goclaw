@@ -44,7 +44,7 @@ internal/
 ├── orchestration/            Orchestration primitives: BatchQueue[T] generic, ChildResult, media conversion (v3)
 ├── permissions/              RBAC (admin/operator/viewer)
 ├── pipeline/                 8-stage agent pipeline (context→history→prompt→think→act→observe→memory→summarize)
-├── providers/                LLM providers: Anthropic (native HTTP+SSE), OpenAI-compat (HTTP+SSE), DashScope (Alibaba Qwen), Claude CLI (stdio+MCP bridge), ACP (Anthropic Console Proxy), Codex (OpenAI)
+├── providers/                LLM providers: Anthropic (native HTTP+SSE), OpenAI-compat (HTTP+SSE), DashScope (Alibaba Qwen), Claude CLI (stdio+MCP bridge), ACP (Anthropic Console Proxy), Codex (OpenAI), Vertex AI (GCP OAuth2 + OpenAI-compat)
 ├── providerresolve/          Provider adapter + model registry with forward-compat resolver
 ├── sandbox/                  Docker-based code execution sandbox
 ├── scheduler/                Lane-based concurrency (main/subagent/cron)
@@ -76,7 +76,7 @@ ui/desktop/                   Wails v2 desktop app (React frontend + embedded ga
 - **Agent types:** `open` (per-user context, 7 files) vs `predefined` (shared context + USER.md per-user)
 - **Agent identity:** Dual-identity pattern (agent_key vs UUID) applies to agents, teams, tenants. Rule: UUID for DB/FK/events, agent_key for logs/paths/UI. See `docs/agent-identity-conventions.md`
 - **Context files:** `agent_context_files` (agent-level) + `user_context_files` (per-user), routed via `ContextFileInterceptor`
-- **Providers:** Anthropic (native HTTP+SSE), OpenAI-compat (HTTP+SSE), DashScope (Alibaba Qwen), Claude CLI (stdio+MCP bridge), ACP (Anthropic Console Proxy), Codex (OpenAI). All use `RetryDo()` for retries. Loads from `llm_providers` table with encrypted API keys. ProviderAdapter enables pluggable implementations with ModelRegistry forward-compat resolver. Shared SSEScanner in `providers/sse_reader.go` for streaming providers
+- **Providers:** Anthropic (native HTTP+SSE), OpenAI-compat (HTTP+SSE), DashScope (Alibaba Qwen), Claude CLI (stdio+MCP bridge), ACP (Anthropic Console Proxy), Codex (OpenAI), Vertex AI (GCP OAuth2 service account or ADC + OpenAI-compat endpoint, `internal/providers/vertex.go`). All use `RetryDo()` for retries. Loads from `llm_providers` table with encrypted API keys. ProviderAdapter enables pluggable implementations with ModelRegistry forward-compat resolver. Shared SSEScanner in `providers/sse_reader.go` for streaming providers
 - **Pipeline:** 8-stage loop (context→history→prompt→think→act→observe→memory→summarize) with pluggable callbacks, always-on execution path
 - **DomainEventBus:** Typed events with worker pool, dedup, retry. Used by consolidation pipeline and memory workers
 - **3-tier memory:** Working (conversation) → Episodic (session summaries) → Semantic (KG). Progressive loading L0/L1/L2 with auto-inject for L0
@@ -123,6 +123,7 @@ make desktop-dmg VERSION=0.1.0               # Create .dmg installer (macOS only
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
 | `ci.yaml` | push main, PR→main/dev | Go build+test+vet, Web build |
+| `dev-beta-release.yaml` | push dev | Go build+test+vet, Web build, semantic beta prerelease, beta Docker |
 | `release.yaml` | tag `v[0-9]+.[0-9]+.[0-9]+` | Binaries + Docker (4 variants + web) + Discord |
 | `release-beta.yaml` | tag `v*-beta*` / `v*-rc*` | Beta binaries + Docker + GitHub prerelease |
 | `release-desktop.yaml` | tag `lite-v*` | Desktop app (macOS+Windows), auto prerelease for `-beta`/`-rc` tags |
@@ -136,7 +137,8 @@ git tag v3.0.0 && git push origin v3.0.0
 
 **Beta release** (from dev):
 ```bash
-git tag v2.67.0-beta.1 && git push origin v2.67.0-beta.1   # standard beta
+git push origin dev                                         # auto beta via CI
+git tag v2.67.0-beta.1 && git push origin v2.67.0-beta.1   # manual/backfill beta
 git tag lite-v1.2.0-beta.1 && git push origin lite-v1.2.0-beta.1  # lite beta
 ```
 
@@ -155,16 +157,18 @@ Published to GHCR (`ghcr.io/nextlevelbuilder/goclaw`) and Docker Hub (`digitop/g
 | latest | `:latest`, `:vX.Y.Z` | Backend + web UI + Python |
 | base | `:base`, `:vX.Y.Z-base` | Backend only, no UI/runtimes |
 | full | `:full`, `:vX.Y.Z-full` | All runtimes + skills pre-installed |
-| otel | `:otel`, `:vX.Y.Z-otel` | Latest + OpenTelemetry tracing |
 | web | `-web:latest` | Standalone web UI (Nginx) |
 | beta | `:beta`, `:vX.Y.Z-beta.N` | Beta builds from dev |
+
+OTel and Tailscale variants are not pre-built — build from source with the appropriate `--build-arg ENABLE_OTEL=true` or `-tags tsnet` flag if needed.
 
 ### Tag Pattern Safety
 
 - `release.yaml`: tag-triggered (`v[0-9]+.[0-9]+.[0-9]+`) — clean semver only, no beta/rc
+- `dev-beta-release.yaml`: branch-triggered on `dev`; creates `vX.Y.Z-beta.N` tags after CI passes
 - `release-beta.yaml`: tag-triggered (`v*-beta*`, `v*-rc*`) — never matches clean semver
 - `release-desktop.yaml`: tag-triggered (`lite-v*`) — `lite-` prefix prevents overlap
-- No workflow triggers overlap — each tag pattern is distinct. Merging to `main` only triggers CI, not release
+- Stable and desktop tag patterns remain distinct. `dev` branch pushes create beta releases only after CI passes
 
 ## Desktop Edition (Lite)
 
@@ -183,6 +187,44 @@ Published to GHCR (`ghcr.io/nextlevelbuilder/goclaw`) and Docker Hub (`digitop/g
 - **Lite limits:** 5 agents, 1 team, 5 members, 50 sessions. No channels, heartbeat, file storage UI, skill self-manage, KG, RBAC, multi-tenant
 - **Tool gating:** `TeamActionPolicy` in `internal/tools/team_action_policy.go` — lite blocks comment/review/approve/reject/attach/ask_user. `skill_manage`/`publish_skill` not registered in lite
 - **File serving:** 2-layer path isolation in `internal/http/files.go` — workspace boundary (all editions) + tenant scope (standard only with RBAC)
+
+## Plan Verification Rules
+
+Apply before finalizing any multi-phase plan. Trust-but-verify between scout → planner → final plan.
+
+### Verification discipline (what to verify)
+
+1. **Verify factual claims against code** — re-grep/re-count every number, path, endpoint. Don't copy from scout summaries.
+2. **Trace semantics, not just cite lines** — when plan references existing/upstream code, identify WHEN each field mutates and under WHAT conditions. Line-range citation without control-flow trace = how ports silently invert behavior. Check: every call, or specific branches only?
+3. **No fabricated identifiers / API families** — every symbol in plan must cite `file:line`. RED FLAGS: plausible-sounding wrappers (`Keyring`, `Validator`, `Manager`), centralized packages (`internal/security`, `internal/auth`) that may be scattered, OTel-style (`StartSpan/EndSpan`) when codebase is emit-based. When unsure, `go doc <pkg>` lists actual exported surface. Apply especially when plan says "reuse existing X".
+4. **Struct scope audit before adding state** — verify lifetime (per-request/session/agent/process) before adding a field to an existing struct. "Plausibly per-X" is a red flag — grep construction + ownership. Shared-instance state leaks across isolation boundaries.
+5. **Gate-premise test math** — before asserting "feature X triggers independently of Y", list all early-returns from function entry to X. Math-verify any fixture claiming "X without Y".
+6. **Port = config-shape match** — "faithful port" divergences in config field name/type are silent breaking changes for users copying upstream config. Match upstream shape, or explicitly flag each divergence with rationale in the phase file.
+7. **Verify external API endpoints via `docs-seeker`** — before writing endpoint into plan. Sibling APIs often use different roots.
+
+### Scope & coverage (where to look)
+
+8. **Grep delete scope deep** — `grep -rn '<symbol>' .` whole repo. Stubs often have refs in catalogs/routing/switch cases. Enumerate ALL sites in todo.
+9. **Signature-change callers enumeration** — grep + list all callers explicitly. "Update all callers" insufficient.
+10. **Alias/shim coverage** — enumerate ALL exported symbols via `go doc <pkg>`. Add compile-time signature guards.
+11. **Scout desktop and web separately** — `ui/desktop/frontend/` ≠ `ui/web/`. Different structure, i18n namespaces, test framework presence.
+
+### Phasing & ordering (when)
+
+12. **Re-scout on scope change** — if phase promotes from deferred → active, re-scout. Don't reuse brainstorm summary.
+13. **Cross-phase gates explicit** — "Phase N-1 merged + tests green" in phase Context. Execution order alone ≠ enforcement.
+14. **Zero-coverage characterization test = blocker step** — write byte/request-body fixture test BEFORE migration. Not "recommended".
+15. **i18n keys ordering** — add key + 3 catalogs as explicit todo step BEFORE handler code. Missing key = runtime crash.
+
+### Conventions & finalization
+
+16. **Context key style convention** — check existing `context.go` pattern before introducing new key types. Mixed = code smell.
+17. **Verify pass MANDATORY after rewrite** — spawn fresh Explore/grep to audit planner output. Don't trust self-validation.
+
+**Pattern to avoid:** user asks → planner writes → report "done".
+**Safer pattern:** user asks → scout → planner writes → audit-verify → report.
+
+**Red-team practice:** After planner completes, run `code-reviewer`/`brainstormer` in audit mode: "spot-check 15+ claims vs live codebase". Past catches: fabricated `crypto.Keyring`/`tracing.StartSpan` (agent-hooks plan); inverted TS-port semantics + wrong struct scope + misread early-return gate (context-pruning plan). See `plans/*/reports/audit-*.md` for concrete examples.
 
 ## Post-Implementation Checklist
 
@@ -207,6 +249,7 @@ Go conventions to follow:
 - **DB query reuse:** Before adding a new DB query for key entities (teams, agents, sessions, users), check if the same data is already fetched earlier in the current flow/pipeline. Prefer passing resolved data through context, event payloads, or function params rather than re-querying. Duplicate queries waste DB resources and add latency
 - **Solution design:** When designing a fix or feature, identify the root cause first — don't just patch symptoms. Think through production scenarios (high concurrency, multi-tenant isolation, failure cascades, long-running sessions) to ensure the solution holds up. Prefer explicit configuration over runtime heuristics. Prefer the simplest solution that addresses the root cause directly
 - **Tenant-scope guards on admin writes:** `RoleAdmin` is not a tenant check. Writes to **global** tables (no `tenant_id` column — e.g. `builtin_tools`, disk config, package mgmt) must gate with `http.requireMasterScope` / WS `requireMasterScope(requireOwner(...))`. Writes to **tenant-scoped** tables must gate with `http.requireTenantAdmin` + SQL `WHERE tenant_id = $N`. Shared predicate: `store.IsMasterScope(ctx)`. See `CONTRIBUTING.md` → "Tenant-scope guards" for the full decision table and anti-patterns.
+- **Skip load / stress / benchmark tests.** Do NOT write throughput benchmarks, p95/p99 latency assertions, or `runtime.ReadMemStats`-based memory-leak tests for regular feature work. They flake on shared CI runners, waste runner time, and rarely catch real bugs. Only add load tests when explicitly requested for a specific investigation. For normal "prove it works" coverage, use unit + integration + chaos tests.
 
 ## Mobile UI/UX Rules
 

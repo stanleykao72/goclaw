@@ -126,6 +126,7 @@ CREATE TABLE IF NOT EXISTS agents (
     reasoning_config      TEXT NOT NULL DEFAULT '{}',
     workspace_sharing     TEXT NOT NULL DEFAULT '{}',
     chatgpt_oauth_routing TEXT NOT NULL DEFAULT '{}',
+    model_fallback        TEXT NOT NULL DEFAULT '{}',
     shell_deny_groups     TEXT NOT NULL DEFAULT '{}',
     kg_dedup_config       TEXT NOT NULL DEFAULT '{}',
     is_default            BOOLEAN NOT NULL DEFAULT 0,
@@ -407,6 +408,7 @@ CREATE TABLE IF NOT EXISTS skill_agent_grants (
     agent_id       TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
     pinned_version INT NOT NULL,
     granted_by     VARCHAR(255) NOT NULL,
+    can_manage     INTEGER NOT NULL DEFAULT 0,
     tenant_id      TEXT NOT NULL REFERENCES tenants(id),
     created_at     TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     UNIQUE(skill_id, agent_id)
@@ -1226,6 +1228,7 @@ CREATE TABLE IF NOT EXISTS secure_cli_agent_grants (
     deny_verbose    TEXT,
     timeout_seconds INTEGER,
     tips            TEXT,
+    encrypted_env   BLOB,
     enabled         BOOLEAN NOT NULL DEFAULT 1,
     tenant_id       TEXT NOT NULL REFERENCES tenants(id),
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
@@ -1272,7 +1275,7 @@ CREATE TABLE IF NOT EXISTS agent_heartbeats (
     enabled            BOOLEAN NOT NULL DEFAULT 0,
     interval_sec       INT NOT NULL DEFAULT 1800,
     prompt             TEXT,
-    provider_id        TEXT REFERENCES llm_providers(id),
+    provider_id        TEXT REFERENCES llm_providers(id) ON DELETE SET NULL,
     model              VARCHAR(200),
     isolated_session   BOOLEAN NOT NULL DEFAULT 1,
     light_context      BOOLEAN NOT NULL DEFAULT 0,
@@ -1521,6 +1524,7 @@ CREATE TABLE IF NOT EXISTS vault_documents (
     tenant_id     TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     agent_id      TEXT REFERENCES agents(id) ON DELETE SET NULL,
     team_id       TEXT REFERENCES agent_teams(id) ON DELETE SET NULL,
+    chat_id       TEXT,  -- NULL = team-wide (shared / legacy); non-NULL = scoped to specific chat for isolated teams
     scope         TEXT NOT NULL DEFAULT 'personal',
     custom_scope  TEXT,
     path          TEXT NOT NULL,
@@ -1531,7 +1535,13 @@ CREATE TABLE IF NOT EXISTS vault_documents (
     summary       TEXT NOT NULL DEFAULT '',
     metadata      TEXT DEFAULT '{}',
     created_at    TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    updated_at    TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    updated_at    TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    CONSTRAINT vault_documents_scope_consistency CHECK (
+        (scope = 'personal' AND agent_id IS NOT NULL AND team_id IS NULL) OR
+        (scope = 'team'     AND team_id  IS NOT NULL AND agent_id IS NULL) OR
+        (scope = 'shared'   AND agent_id IS NULL     AND team_id  IS NULL) OR
+        scope = 'custom'
+    )
 );
 -- SQLite prohibits expressions in inline UNIQUE constraints; use a unique index instead.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_vault_docs_unique_path
@@ -1541,6 +1551,7 @@ CREATE INDEX IF NOT EXISTS idx_vault_docs_agent_scope ON vault_documents(agent_i
 CREATE INDEX IF NOT EXISTS idx_vault_docs_type ON vault_documents(agent_id, doc_type);
 CREATE INDEX IF NOT EXISTS idx_vault_docs_hash ON vault_documents(content_hash);
 CREATE INDEX IF NOT EXISTS idx_vault_docs_team ON vault_documents(team_id);
+CREATE INDEX IF NOT EXISTS idx_vault_docs_team_chat ON vault_documents(team_id, chat_id) WHERE team_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_vault_docs_basename ON vault_documents(tenant_id, path_basename);
 CREATE INDEX IF NOT EXISTS idx_vault_docs_path_prefix ON vault_documents(tenant_id, path);
 CREATE INDEX IF NOT EXISTS idx_vault_docs_delegation
@@ -1568,3 +1579,245 @@ CREATE INDEX IF NOT EXISTS idx_vault_links_to ON vault_links(to_doc_id);
 CREATE INDEX IF NOT EXISTS idx_vault_links_source
     ON vault_links(json_extract(metadata, '$.source'))
     WHERE json_extract(metadata, '$.source') IS NOT NULL;
+
+-- ============================================================
+-- Table: hooks (renamed from agent_hooks, migration 000055)
+-- SQLite translation: JSONB→TEXT, TIMESTAMPTZ→TEXT, UUID→TEXT,
+-- BYTEA→BLOB, DATE→TEXT (ISO8601), CHECK for enums.
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS hooks (
+    id           TEXT NOT NULL PRIMARY KEY,
+    tenant_id    TEXT NOT NULL DEFAULT '0193a5b0-7000-7000-8000-000000000001',
+    scope        TEXT NOT NULL CHECK (scope IN ('global', 'tenant', 'agent')),
+    event        TEXT NOT NULL,
+    handler_type TEXT NOT NULL CHECK (handler_type IN ('command', 'http', 'prompt', 'script')),
+    config       TEXT NOT NULL DEFAULT '{}',
+    matcher      TEXT,
+    if_expr      TEXT,
+    timeout_ms   INTEGER NOT NULL DEFAULT 5000,
+    on_timeout   TEXT NOT NULL DEFAULT 'block' CHECK (on_timeout IN ('block', 'allow')),
+    priority     INTEGER NOT NULL DEFAULT 0,
+    enabled      INTEGER NOT NULL DEFAULT 1,
+    version      INTEGER NOT NULL DEFAULT 1,
+    source       TEXT NOT NULL DEFAULT 'ui' CHECK (source IN ('ui', 'api', 'seed', 'builtin')),
+    metadata     TEXT NOT NULL DEFAULT '{}',
+    name         TEXT,
+    created_by   TEXT,
+    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_hooks_lookup
+    ON hooks (tenant_id, event)
+    WHERE enabled = 1;
+
+-- ============================================================
+-- Table: hook_agents (renamed from agent_hook_agents, N:M junction)
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS hook_agents (
+    hook_id  TEXT NOT NULL REFERENCES hooks(id) ON DELETE CASCADE,
+    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    PRIMARY KEY (hook_id, agent_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_hook_agents_agent
+    ON hook_agents (agent_id);
+
+-- ============================================================
+-- Table: hook_executions (append-only audit log, migration 000052)
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS hook_executions (
+    id           TEXT NOT NULL PRIMARY KEY,
+    hook_id      TEXT REFERENCES hooks(id) ON DELETE SET NULL,
+    session_id   TEXT,
+    event        TEXT NOT NULL,
+    input_hash   TEXT,
+    decision     TEXT NOT NULL CHECK (decision IN ('allow', 'block', 'error', 'timeout')),
+    duration_ms  INTEGER NOT NULL DEFAULT 0,
+    retry        INTEGER NOT NULL DEFAULT 0,
+    dedup_key    TEXT,
+    error        TEXT,
+    error_detail BLOB,
+    metadata     TEXT NOT NULL DEFAULT '{}',
+    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_hook_executions_session
+    ON hook_executions (session_id, created_at);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_hook_executions_dedup
+    ON hook_executions (dedup_key)
+    WHERE dedup_key IS NOT NULL;
+
+-- ============================================================
+-- Table: tenant_hook_budget (migration 000052)
+-- month_start stored as TEXT ISO8601 date (YYYY-MM-DD).
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS tenant_hook_budget (
+    tenant_id      TEXT NOT NULL PRIMARY KEY,
+    month_start    TEXT NOT NULL,
+    budget_total   INTEGER NOT NULL DEFAULT 0,
+    remaining      INTEGER NOT NULL DEFAULT 0,
+    last_warned_at TEXT,
+    metadata       TEXT NOT NULL DEFAULT '{}',
+    updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+-- ============================================================
+-- Table: webhooks  (registry, migrations 000059 + 000061)
+-- secret_hash stores SHA-256 hex; used only for bearer-token lookup.
+-- encrypted_secret stores AES-256-GCM(raw_secret, GOCLAW_ENCRYPTION_KEY); decrypted at HMAC sign time.
+-- scopes + ip_allowlist stored as JSON arrays (TEXT) — no native array type.
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS webhooks (
+    id                  TEXT        PRIMARY KEY,
+    tenant_id           TEXT        NOT NULL,
+    agent_id            TEXT        REFERENCES agents(id) ON DELETE SET NULL,
+    name                TEXT        NOT NULL,
+    kind                TEXT        NOT NULL CHECK (kind IN ('llm', 'message')),
+    secret_prefix       TEXT,
+    secret_hash         TEXT        NOT NULL,
+    encrypted_secret    TEXT        NOT NULL DEFAULT '',
+    scopes              TEXT        NOT NULL DEFAULT '[]',
+    channel_id          TEXT,
+    rate_limit_per_min  INTEGER     NOT NULL DEFAULT 60,
+    ip_allowlist        TEXT        NOT NULL DEFAULT '[]',
+    require_hmac        INTEGER     NOT NULL DEFAULT 0,
+    localhost_only      INTEGER     NOT NULL DEFAULT 0,
+    revoked             INTEGER     NOT NULL DEFAULT 0,
+    created_by          TEXT,
+    created_at          TEXT        NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at          TEXT        NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    last_used_at        TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_webhooks_tenant
+    ON webhooks (tenant_id);
+CREATE INDEX IF NOT EXISTS idx_webhooks_tenant_agent
+    ON webhooks (tenant_id, agent_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_webhooks_secret
+    ON webhooks (secret_hash)
+    WHERE revoked = 0;
+
+-- ============================================================
+-- Table: webhook_calls  (audit + async state, migrations 000059 + 000060)
+-- request_payload stored as TEXT (canonical JSON: {"body_hash":"...","meta":{...}}).
+-- response stored as TEXT (JSON). BLOB would silently accept non-JSON; TEXT enforces
+-- that callers write valid JSON, matching PG's jsonb column behaviour.
+-- delivery_id: stable UUID across outbound retries; emitted as X-Webhook-Delivery-Id.
+-- lease_token: random UUID set by ClaimNext; guards UpdateStatusCAS for exactly-once delivery.
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS webhook_calls (
+    id               TEXT     PRIMARY KEY,
+    tenant_id        TEXT     NOT NULL,
+    webhook_id       TEXT     NOT NULL REFERENCES webhooks(id) ON DELETE CASCADE,
+    agent_id         TEXT,
+    idempotency_key  TEXT,
+    mode             TEXT     NOT NULL CHECK (mode IN ('sync', 'async')),
+    callback_url     TEXT,
+    status           TEXT     NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'running', 'done', 'failed', 'dead')),
+    attempts         INTEGER  NOT NULL DEFAULT 0,
+    delivery_id      TEXT     NOT NULL,
+    next_attempt_at  TEXT,
+    started_at       TEXT,
+    lease_token      TEXT,
+    request_payload  TEXT,
+    response         TEXT,
+    last_error       TEXT,
+    created_at       TEXT     NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    completed_at     TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_webhook_calls_tenant_created
+    ON webhook_calls (tenant_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_webhook_calls_status_attempt
+    ON webhook_calls (status, next_attempt_at);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_webhook_calls_idempotency
+    ON webhook_calls (webhook_id, idempotency_key)
+    WHERE idempotency_key IS NOT NULL;
+
+-- ============================================================
+-- Table: workstations (migration 000062)
+-- metadata and default_env stored as BLOB (AES-256-GCM encrypted).
+-- backend_type constrained to 'ssh' | 'docker'.
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS workstations (
+    id              TEXT PRIMARY KEY,
+    workstation_key VARCHAR(100) NOT NULL,
+    tenant_id       TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    name            VARCHAR(255) NOT NULL,
+    backend_type    VARCHAR(20) NOT NULL CHECK (backend_type IN ('ssh','docker')),
+    metadata        BLOB NOT NULL,
+    default_cwd     VARCHAR(500) NOT NULL DEFAULT '',
+    default_env     BLOB NOT NULL,
+    active          INTEGER NOT NULL DEFAULT 1,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    created_by      VARCHAR(255) NOT NULL DEFAULT '',
+    UNIQUE (tenant_id, workstation_key)
+);
+CREATE INDEX IF NOT EXISTS idx_workstations_tenant_active
+    ON workstations(tenant_id, active) WHERE active = 1;
+
+CREATE TABLE IF NOT EXISTS agent_workstation_links (
+    agent_id        TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    workstation_id  TEXT NOT NULL REFERENCES workstations(id) ON DELETE CASCADE,
+    tenant_id       TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    is_default      INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (agent_id, workstation_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_workstation_default
+    ON agent_workstation_links(agent_id) WHERE is_default = 1;
+CREATE INDEX IF NOT EXISTS idx_agent_workstation_tenant ON agent_workstation_links(tenant_id);
+
+-- ============================================================
+-- Table: workstation_permissions (migration 000063)
+-- Per-workstation binary allowlist. Default-deny: no matching
+-- enabled pattern → exec rejected. Pattern matches argv[0] only.
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS workstation_permissions (
+    id              TEXT PRIMARY KEY,
+    workstation_id  TEXT NOT NULL REFERENCES workstations(id) ON DELETE CASCADE,
+    tenant_id       TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    pattern         VARCHAR(500) NOT NULL,
+    enabled         INTEGER NOT NULL DEFAULT 1,
+    created_by      VARCHAR(255) NOT NULL DEFAULT '',
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE (workstation_id, pattern)
+);
+CREATE INDEX IF NOT EXISTS idx_workstation_perms_ws ON workstation_permissions(workstation_id) WHERE enabled = 1;
+CREATE INDEX IF NOT EXISTS idx_workstation_perms_tenant ON workstation_permissions(tenant_id);
+
+-- ============================================================
+-- Table: workstation_activity (migration 000064)
+-- Rolling audit log for exec and deny events. Append-only;
+-- pruned nightly (rows older than 30 days) via Prune().
+-- cmd_preview: first 200 chars, secrets redacted.
+-- cmd_hash: sha256 hex for forensic cross-reference.
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS workstation_activity (
+    id              TEXT PRIMARY KEY,
+    tenant_id       TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    workstation_id  TEXT NOT NULL REFERENCES workstations(id) ON DELETE CASCADE,
+    agent_id        VARCHAR(255) NOT NULL DEFAULT '',
+    action          VARCHAR(20)  NOT NULL,
+    cmd_hash        VARCHAR(64)  NOT NULL DEFAULT '',
+    cmd_preview     VARCHAR(200) NOT NULL DEFAULT '',
+    exit_code       INTEGER,
+    duration_ms     INTEGER,
+    deny_reason     VARCHAR(200) NOT NULL DEFAULT '',
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_ws_activity_ws_time     ON workstation_activity(workstation_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ws_activity_tenant_time ON workstation_activity(tenant_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ws_activity_retention   ON workstation_activity(created_at);

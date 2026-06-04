@@ -82,6 +82,11 @@ func clientCanReceiveEvent(c *Client, event bus.Event) bool {
 		return true
 	}
 
+	// Immediate trace status events: broadcast to all tenant clients (no per-user routing).
+	if event.Name == protocol.EventTraceStatusChanged {
+		return true
+	}
+
 	// Team events: filter by TeamID.
 	if strings.HasPrefix(event.Name, "team.") || strings.HasPrefix(event.Name, "delegation.") {
 		if tid := extractTeamID(event); tid != "" {
@@ -123,6 +128,13 @@ func clientCanReceiveEvent(c *Client, event bus.Event) bool {
 
 	// Skill dep events → broadcast (non-sensitive, skill names only).
 	if strings.HasPrefix(event.Name, "skill.") {
+		return true
+	}
+
+	// Package update events → only Owner clients (TenantID=Nil filter above).
+	// red-team B1/C5: explicit branch provides defense-in-depth even though the
+	// Admin/Owner path at line 46 already covers uuid.Nil events for owners.
+	if strings.HasPrefix(event.Name, "package.update.") {
 		return true
 	}
 

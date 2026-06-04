@@ -19,6 +19,7 @@ func CheckSkillDeps(m *SkillManifest) (bool, []string) {
 	if m == nil || m.IsEmpty() {
 		return true, nil
 	}
+	ensureNpmGlobalEnv()
 
 	var missing []string
 
@@ -121,6 +122,7 @@ func checkNodePackages(packages []string, scriptsDir string) []string {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "node", "-e", sb.String())
+	cmd.Env = npmCommandEnv()
 	if scriptsDir != "" {
 		cmd.Dir = scriptsDir
 	}
@@ -147,17 +149,24 @@ func checkNodePackages(packages []string, scriptsDir string) []string {
 // importToPipName maps Python import names to their pip package names when they differ.
 var importToPipName = func(importName string) string {
 	m := map[string]string{
-		"cv2":      "opencv-python",
-		"PIL":      "Pillow",
-		"yaml":     "pyyaml",
-		"sklearn":  "scikit-learn",
-		"bs4":      "beautifulsoup4",
-		"dateutil": "python-dateutil",
-		"dotenv":   "python-dotenv",
-		"pptx":     "python-pptx",
-		"docx":     "python-docx",
-		"attr":     "attrs",
-		"gi":       "PyGObject",
+		"cv2":         "opencv-python",
+		"PIL":         "Pillow",
+		"yaml":        "pyyaml",
+		"sklearn":     "scikit-learn",
+		"bs4":         "beautifulsoup4",
+		"dateutil":    "python-dateutil",
+		"dotenv":      "python-dotenv",
+		"pptx":        "python-pptx",
+		"docx":        "python-docx",
+		"attr":        "attrs",
+		"gi":          "PyGObject",
+		"psycopg2":    "psycopg2-binary",
+		"psycopg":     "psycopg[binary]",
+		"MySQLdb":     "mysqlclient",
+		"Crypto":      "pycryptodome",
+		"serial":      "pyserial",
+		"skimage":     "scikit-image",
+		"Levenshtein": "python-Levenshtein",
 	}
 	if pip, ok := m[importName]; ok {
 		return pip

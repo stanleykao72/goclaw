@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useCallback } from "react";
-import { Plus, Trash2, Loader2, Shield, FolderOpen, RefreshCw } from "lucide-react";
+import { Plus, Trash2, Loader2, Shield, FolderOpen, RefreshCw, Users, CheckCircle2, XCircle } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -7,12 +7,13 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
 import { Combobox, type ComboboxOption } from "@/components/ui/combobox";
-import { useConfigPermissions, type ConfigPermission } from "../hooks/use-config-permissions";
+import { useConfigPermissions, type ConfigPermission, type ConfigPermissionDecision } from "../hooks/use-config-permissions";
 import { UserPickerCombobox } from "@/components/shared/user-picker-combobox";
 import { useContactResolver } from "@/hooks/use-contact-resolver";
 import { formatUserLabel } from "@/lib/format-user-label";
-import { useWs } from "@/hooks/use-ws";
+import { useWs, useHttp } from "@/hooks/use-ws";
 import { Methods } from "@/api/protocol";
+import type { ChannelContact } from "@/types/contact";
 import type { DeliveryTarget } from "../hooks/use-agent-heartbeat";
 
 const CONFIG_TYPES = [
@@ -54,13 +55,16 @@ interface AgentPermissionsTabProps {
 export function AgentPermissionsTab({ agentId }: AgentPermissionsTabProps) {
   const { t } = useTranslation("agents");
   const ws = useWs();
-  const { permissions, loading, load, grant, revoke } = useConfigPermissions(agentId);
+  const http = useHttp();
+  const { permissions, loading, load, grant, revoke, check } = useConfigPermissions(agentId);
 
   const [userId, setUserId] = useState("");
   const [configType, setConfigType] = useState("file_writer");
   const [scope, setScope] = useState("group:*");
   const [permission, setPermission] = useState("allow");
   const [adding, setAdding] = useState(false);
+  const [checking, setChecking] = useState(false);
+  const [decision, setDecision] = useState<ConfigPermissionDecision | undefined>();
   const [targets, setTargets] = useState<DeliveryTarget[]>([]);
 
   // Fetch delivery targets (groups/topics) from channel_contacts
@@ -105,11 +109,50 @@ export function AgentPermissionsTab({ agentId }: AgentPermissionsTabProps) {
 
   useEffect(() => { load(); }, [load]);
 
+  const handleCheck = useCallback(async () => {
+    const trimmed = userId.trim();
+    if (!trimmed || !scope || !configType) {
+      setDecision(undefined);
+      return;
+    }
+    setChecking(true);
+    try {
+      setDecision(await check(scope, configType, trimmed));
+    } catch {
+      setDecision(undefined);
+    } finally {
+      setChecking(false);
+    }
+  }, [check, scope, configType, userId]);
+
+  useEffect(() => {
+    setDecision(undefined);
+  }, [scope, configType, userId]);
+
   const handleAdd = async () => {
-    if (!userId.trim()) return;
+    const trimmed = userId.trim();
+    if (!trimmed) return;
     setAdding(true);
-    await grant(scope, configType, userId.trim(), permission);
+    // Look up contact info so the grant carries displayName/username metadata
+    // upfront — avoids the round-trip to Telegram's getChatMember on the
+    // backend and works even if the bot isn't in the group yet.
+    let metadata: Record<string, string> | undefined;
+    try {
+      const res = await http.get<{ contacts: Record<string, ChannelContact> }>(
+        "/v1/contacts/resolve",
+        { ids: trimmed },
+      );
+      const c = res.contacts?.[trimmed];
+      if (c?.display_name || c?.username) {
+        metadata = {
+          displayName: c.display_name ?? "",
+          username: c.username ?? "",
+        };
+      }
+    } catch { /* best-effort — backend still auto-enriches via getChatMember */ }
+    await grant(scope, configType, trimmed, permission, metadata);
     setUserId("");
+    setDecision(undefined);
     setAdding(false);
   };
 
@@ -174,6 +217,17 @@ export function AgentPermissionsTab({ agentId }: AgentPermissionsTabProps) {
             placeholder={t("permissions.userIdPlaceholder")}
             className="flex-1 min-w-[160px]"
           />
+          <Button
+            type="button"
+            variant={userId === "*" ? "default" : "outline"}
+            size="sm"
+            className="h-9 shrink-0"
+            onClick={() => setUserId("*")}
+            title={t("permissions.allMembersTitle")}
+          >
+            <Users className="h-4 w-4" />
+            <span className="hidden sm:inline">{t("permissions.allMembers")}</span>
+          </Button>
           <Select value={configType} onValueChange={setConfigType}>
             <SelectTrigger className="w-[130px] text-base md:text-sm">
               <SelectValue />
@@ -205,9 +259,37 @@ export function AgentPermissionsTab({ agentId }: AgentPermissionsTabProps) {
             className="h-9 w-9 shrink-0"
             onClick={handleAdd}
             disabled={adding || !userId.trim()}
+            title={t("permissions.addRule")}
           >
             {adding ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
           </Button>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="h-8"
+            onClick={handleCheck}
+            disabled={checking || !userId.trim()}
+          >
+            {checking ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Shield className="h-3.5 w-3.5" />}
+            {t("permissions.checkAccess")}
+          </Button>
+          {decision && (
+            <div
+              className={`flex min-w-0 items-center gap-1.5 rounded-md border px-2 py-1 text-xs ${
+                decision.allowed
+                  ? "border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900/60 dark:bg-emerald-950/40 dark:text-emerald-300"
+                  : "border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-300"
+              }`}
+            >
+              {decision.allowed ? <CheckCircle2 className="h-3.5 w-3.5 shrink-0" /> : <XCircle className="h-3.5 w-3.5 shrink-0" />}
+              <span className="truncate">
+                {decision.allowed ? t("permissions.allowed") : t("permissions.denied")} - {decision.reason}
+              </span>
+            </div>
+          )}
         </div>
         {currentDescKey && (
           <p className="text-xs text-muted-foreground">{t(currentDescKey)}</p>
@@ -237,7 +319,12 @@ export function AgentPermissionsTab({ agentId }: AgentPermissionsTabProps) {
                       <span className="text-xs font-medium text-muted-foreground">{scopeLabels.get(scopeKey) ?? scopeKey}</span>
                     </div>
                     {writers.map((p) => {
-                      const label = p.metadata?.displayName || formatUserLabel(p.userId, resolve);
+                      // Label preference: displayName → contact resolver → "User <id>" fallback.
+                      // Username is rendered separately next to the label when present.
+                      const resolved = formatUserLabel(p.userId, resolve);
+                      const isNumericFallback = /^#?-?\d+$/.test(resolved);
+                      const label = p.metadata?.displayName
+                        || (isNumericFallback ? t("permissions.unknownWriterLabel", { id: p.userId }) : resolved);
                       const username = p.metadata?.username ? ` @${p.metadata.username}` : "";
                       return (
                         <div key={p.id} className="flex items-center justify-between gap-2 px-3 py-2 pl-7">

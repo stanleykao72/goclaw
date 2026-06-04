@@ -5,11 +5,15 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/nextlevelbuilder/goclaw/internal/bootstrap"
+	"github.com/nextlevelbuilder/goclaw/internal/config"
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
 	"github.com/nextlevelbuilder/goclaw/internal/workspace"
 )
@@ -42,7 +46,8 @@ func (m *mockTokenCounter) Count(_ string, _ string) int { return m.countPerMess
 func (m *mockTokenCounter) CountMessages(_ string, msgs []providers.Message) int {
 	return len(msgs) * m.countPerMessage
 }
-func (m *mockTokenCounter) ModelContextWindow(_ string) int { return 200_000 }
+func (m *mockTokenCounter) CountToolSchemas(_ string, _ []providers.ToolDefinition) int { return 0 }
+func (m *mockTokenCounter) ModelContextWindow(_ string) int                              { return 200_000 }
 
 // --- ThinkStage tests ---
 
@@ -333,6 +338,118 @@ func TestThinkStage_LLMError_Propagates(t *testing.T) {
 	}
 }
 
+// Issue 958: Context overflow triggers emergency compaction + retry
+
+func TestThinkStage_ContextOverflow_TriggersCompaction(t *testing.T) {
+	t.Parallel()
+	callCount := 0
+	compacted := false
+
+	deps := &PipelineDeps{
+		Config: PipelineConfig{MaxIterations: 10, MaxTokens: 1000},
+		CallLLM: func(_ context.Context, _ *RunState, _ providers.ChatRequest) (*providers.ChatResponse, error) {
+			callCount++
+			if callCount == 1 {
+				return nil, &providers.HTTPError{Status: 400, Body: "Prompt exceeds max length"}
+			}
+			return &providers.ChatResponse{Content: "success after compact", FinishReason: "stop"}, nil
+		},
+		CompactMessages: func(_ context.Context, msgs []providers.Message, _ string) ([]providers.Message, error) {
+			compacted = true
+			return []providers.Message{{Role: "user", Content: "[Summary]"}}, nil
+		},
+	}
+
+	stage := NewThinkStage(deps)
+	state := defaultState()
+	state.Messages.SetHistory([]providers.Message{{Role: "user", Content: "test"}})
+
+	// First call: overflow → compact → retry
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("first Execute() should trigger retry, got error: %v", err)
+	}
+	if !compacted {
+		t.Error("expected compaction to be triggered")
+	}
+	if state.Think.OverflowRetries != 1 {
+		t.Errorf("expected OverflowRetries=1, got %d", state.Think.OverflowRetries)
+	}
+	// Stage returns Continue (nil error) to signal retry this iteration
+	if stage.Result() != Continue {
+		t.Errorf("Result() = %v after compaction, want Continue", stage.Result())
+	}
+}
+
+func TestThinkStage_ContextOverflow_FailsAfterOneRetry(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{
+		Config: PipelineConfig{MaxIterations: 10, MaxTokens: 1000},
+		CallLLM: func(_ context.Context, _ *RunState, _ providers.ChatRequest) (*providers.ChatResponse, error) {
+			return nil, &providers.HTTPError{Status: 400, Body: "Prompt exceeds max length"}
+		},
+		CompactMessages: func(_ context.Context, _ []providers.Message, _ string) ([]providers.Message, error) {
+			return []providers.Message{{Role: "user", Content: "[Summary]"}}, nil
+		},
+	}
+
+	stage := NewThinkStage(deps)
+	state := defaultState()
+	state.Think.OverflowRetries = 1 // Already retried once
+
+	err := stage.Execute(context.Background(), state)
+	if err == nil {
+		t.Error("expected error after second overflow")
+	}
+	if !strings.Contains(err.Error(), "context overflow after compaction") {
+		t.Errorf("expected 'context overflow after compaction' message, got %v", err)
+	}
+}
+
+func TestThinkStage_ContextOverflow_NoCompactCallback_FailsGracefully(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{
+		Config: PipelineConfig{MaxIterations: 10, MaxTokens: 1000},
+		CallLLM: func(_ context.Context, _ *RunState, _ providers.ChatRequest) (*providers.ChatResponse, error) {
+			return nil, &providers.HTTPError{Status: 400, Body: "Prompt exceeds max length"}
+		},
+		CompactMessages: nil, // No compaction available
+	}
+
+	stage := NewThinkStage(deps)
+	state := defaultState()
+
+	err := stage.Execute(context.Background(), state)
+	if err == nil {
+		t.Error("expected error when no compaction available")
+	}
+}
+
+func TestThinkStage_ContextOverflow_CompactionFails_ReturnsOriginalError(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{
+		Config: PipelineConfig{MaxIterations: 10, MaxTokens: 1000},
+		CallLLM: func(_ context.Context, _ *RunState, _ providers.ChatRequest) (*providers.ChatResponse, error) {
+			return nil, &providers.HTTPError{Status: 400, Body: "Prompt exceeds max length"}
+		},
+		CompactMessages: func(_ context.Context, _ []providers.Message, _ string) ([]providers.Message, error) {
+			return nil, errors.New("compaction failed")
+		},
+	}
+
+	stage := NewThinkStage(deps)
+	state := defaultState()
+
+	err := stage.Execute(context.Background(), state)
+	if err == nil {
+		t.Error("expected error when compaction fails")
+	}
+	// Should return LLM error wrapped, not compaction error
+	if !strings.Contains(err.Error(), "llm call") {
+		t.Errorf("expected 'llm call' in error message, got %v", err)
+	}
+}
+
 // --- PruneStage tests ---
 
 func TestPruneStage_UnderBudget_NoOp(t *testing.T) {
@@ -344,9 +461,9 @@ func TestPruneStage_UnderBudget_NoOp(t *testing.T) {
 			MaxTokens:     1000,
 		},
 		TokenCounter: &mockTokenCounter{countPerMessage: 1}, // tiny counts
-		PruneMessages: func(msgs []providers.Message, _ int) []providers.Message {
+		PruneMessages: func(msgs []providers.Message, _ int) ([]providers.Message, PruneStats) {
 			pruneCallCount++
-			return msgs
+			return msgs, PruneStats{}
 		},
 	}
 	stage := NewPruneStage(deps, nil)
@@ -380,10 +497,10 @@ func TestPruneStage_Over70Percent_CallsPruneMessages(t *testing.T) {
 			MaxTokens:     1000,
 		},
 		TokenCounter: &mockTokenCounter{countPerMessage: 100},
-		PruneMessages: func(msgs []providers.Message, budget int) []providers.Message {
+		PruneMessages: func(msgs []providers.Message, budget int) ([]providers.Message, PruneStats) {
 			pruneCallCount++
 			// return trimmed history that's under budget
-			return msgs[:1]
+			return msgs[:1], PruneStats{ResultsTrimmed: 1}
 		},
 	}
 	stage := NewPruneStage(deps, nil)
@@ -416,9 +533,9 @@ func TestPruneStage_Over100Percent_CallsCompact(t *testing.T) {
 			MaxTokens:     100,
 		},
 		TokenCounter: &mockTokenCounter{countPerMessage: 100},
-		PruneMessages: func(msgs []providers.Message, _ int) []providers.Message {
+		PruneMessages: func(msgs []providers.Message, _ int) ([]providers.Message, PruneStats) {
 			// return same size — still over budget
-			return msgs
+			return msgs, PruneStats{}
 		},
 		CompactMessages: func(_ context.Context, msgs []providers.Message, _ string) ([]providers.Message, error) {
 			compactCallCount++
@@ -455,8 +572,8 @@ func TestPruneStage_StillOverAfterCompaction_ReturnsAbortRun(t *testing.T) {
 			MaxTokens:     100,
 		},
 		TokenCounter: &mockTokenCounter{countPerMessage: 100},
-		PruneMessages: func(msgs []providers.Message, _ int) []providers.Message {
-			return msgs // no reduction
+		PruneMessages: func(msgs []providers.Message, _ int) ([]providers.Message, PruneStats) {
+			return msgs, PruneStats{} // no reduction
 		},
 		CompactMessages: func(_ context.Context, msgs []providers.Message, _ string) ([]providers.Message, error) {
 			// compaction still returns too many messages
@@ -520,9 +637,9 @@ func TestPruneStage_EffectiveContextWindow_OverridesConfig(t *testing.T) {
 			MaxTokens:     1_000,
 		},
 		TokenCounter: &mockTokenCounter{countPerMessage: 600},
-		PruneMessages: func(msgs []providers.Message, _ int) []providers.Message {
+		PruneMessages: func(msgs []providers.Message, _ int) ([]providers.Message, PruneStats) {
 			pruneCallCount++
-			return msgs
+			return msgs, PruneStats{}
 		},
 	}
 	stage := NewPruneStage(deps, nil)
@@ -632,9 +749,9 @@ func TestPruneStage_ReserveTokens_BuffersBudget(t *testing.T) {
 			ReserveTokens: 2_000,
 		},
 		TokenCounter: &mockTokenCounter{countPerMessage: 100},
-		PruneMessages: func(msgs []providers.Message, _ int) []providers.Message {
+		PruneMessages: func(msgs []providers.Message, _ int) ([]providers.Message, PruneStats) {
 			pruneCallCount++
-			return msgs[:1]
+			return msgs[:1], PruneStats{ResultsTrimmed: 1}
 		},
 	}
 	stage := NewPruneStage(deps, nil)
@@ -666,9 +783,9 @@ func TestPruneStage_EffectiveContextWindow_ZeroFallsBackToConfig(t *testing.T) {
 			MaxTokens:     1_000,
 		},
 		TokenCounter: &mockTokenCounter{countPerMessage: 600},
-		PruneMessages: func(msgs []providers.Message, _ int) []providers.Message {
+		PruneMessages: func(msgs []providers.Message, _ int) ([]providers.Message, PruneStats) {
 			pruneCallCount++
-			return msgs[:1]
+			return msgs[:1], PruneStats{ResultsTrimmed: 1}
 		},
 	}
 	stage := NewPruneStage(deps, nil)
@@ -847,6 +964,197 @@ func TestToolStage_MultipleTools_ParallelPath_InvokesRawAndProcessForEach(t *tes
 	}
 	if state.Tool.TotalToolCalls != 3 {
 		t.Errorf("TotalToolCalls = %d, want 3", state.Tool.TotalToolCalls)
+	}
+}
+
+func TestToolStage_MultipleTools_SequentialBarrierSkipsParallelRawPath(t *testing.T) {
+	t.Parallel()
+	calls := []string{}
+	deps := &PipelineDeps{
+		ExecuteToolCall: func(_ context.Context, _ *RunState, tc providers.ToolCall) ([]providers.Message, error) {
+			calls = append(calls, tc.Name)
+			return []providers.Message{{Role: "tool", Content: "result:" + tc.Name, ToolCallID: tc.ID}}, nil
+		},
+		ExecuteToolRaw: func(_ context.Context, _ providers.ToolCall) (providers.Message, any, error) {
+			t.Fatal("ExecuteToolRaw must not be called when a sequential barrier is present")
+			return providers.Message{}, nil, nil
+		},
+		ProcessToolResult: func(_ context.Context, _ *RunState, _ providers.ToolCall, _ providers.Message, _ any) []providers.Message {
+			t.Fatal("ProcessToolResult must not be called when a sequential barrier is present")
+			return nil
+		},
+		SequentialToolCall: func(tc providers.ToolCall) bool {
+			return tc.Name == "wait"
+		},
+	}
+	stage := NewToolStage(deps)
+	state := defaultState()
+	state.Think.LastResponse = &providers.ChatResponse{
+		ToolCalls: []providers.ToolCall{
+			{ID: "1", Name: "message"},
+			{ID: "2", Name: "wait"},
+			{ID: "3", Name: "message"},
+		},
+	}
+
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	want := []string{"message", "wait", "message"}
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("ExecuteToolCall order = %v, want %v", calls, want)
+	}
+}
+
+func TestToolStage_MultipleTools_PrefixedSequentialBarrierSkipsParallelRawPath(t *testing.T) {
+	t.Parallel()
+	calls := []string{}
+	deps := &PipelineDeps{
+		ExecuteToolCall: func(_ context.Context, _ *RunState, tc providers.ToolCall) ([]providers.Message, error) {
+			calls = append(calls, tc.Name)
+			return []providers.Message{{Role: "tool", Content: "result:" + tc.Name, ToolCallID: tc.ID}}, nil
+		},
+		ExecuteToolRaw: func(_ context.Context, _ providers.ToolCall) (providers.Message, any, error) {
+			t.Fatal("ExecuteToolRaw must not be called when a prefixed sequential barrier is present")
+			return providers.Message{}, nil, nil
+		},
+		ProcessToolResult: func(_ context.Context, _ *RunState, _ providers.ToolCall, _ providers.Message, _ any) []providers.Message {
+			t.Fatal("ProcessToolResult must not be called when a prefixed sequential barrier is present")
+			return nil
+		},
+		SequentialToolCall: func(tc providers.ToolCall) bool {
+			return strings.TrimPrefix(tc.Name, "proxy_") == "wait"
+		},
+	}
+	stage := NewToolStage(deps)
+	state := defaultState()
+	state.Think.LastResponse = &providers.ChatResponse{
+		ToolCalls: []providers.ToolCall{
+			{ID: "1", Name: "proxy_message"},
+			{ID: "2", Name: "proxy_wait"},
+			{ID: "3", Name: "proxy_message"},
+		},
+	}
+
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	want := []string{"proxy_message", "proxy_wait", "proxy_message"}
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("ExecuteToolCall order = %v, want %v", calls, want)
+	}
+}
+
+func TestToolStage_SequentialBatchStopsAfterContextCancellation(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	calls := []string{}
+	deps := &PipelineDeps{
+		ExecuteToolCall: func(_ context.Context, _ *RunState, tc providers.ToolCall) ([]providers.Message, error) {
+			calls = append(calls, tc.Name)
+			if tc.Name == "wait" {
+				cancel()
+			}
+			return []providers.Message{{Role: "tool", Content: "result:" + tc.Name, ToolCallID: tc.ID}}, nil
+		},
+		ExecuteToolRaw: func(_ context.Context, _ providers.ToolCall) (providers.Message, any, error) {
+			t.Fatal("ExecuteToolRaw must not be called when a sequential barrier is present")
+			return providers.Message{}, nil, nil
+		},
+		ProcessToolResult: func(_ context.Context, _ *RunState, _ providers.ToolCall, _ providers.Message, _ any) []providers.Message {
+			t.Fatal("ProcessToolResult must not be called when a sequential barrier is present")
+			return nil
+		},
+		SequentialToolCall: func(tc providers.ToolCall) bool {
+			return tc.Name == "wait"
+		},
+	}
+	stage := NewToolStage(deps)
+	state := defaultState()
+	state.Think.LastResponse = &providers.ChatResponse{
+		ToolCalls: []providers.ToolCall{
+			{ID: "1", Name: "message"},
+			{ID: "2", Name: "wait", Arguments: map[string]any{"timeMs": 1000}},
+			{ID: "3", Name: "message"},
+		},
+	}
+
+	if err := stage.Execute(ctx, state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	want := []string{"message", "wait"}
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("ExecuteToolCall order = %v, want %v", calls, want)
+	}
+	if stage.Result() != AbortRun {
+		t.Fatalf("Result() = %v, want AbortRun", stage.Result())
+	}
+}
+
+func TestToolStage_SequentialBatchEnforcesToolBudgetBeforeEachCall(t *testing.T) {
+	t.Parallel()
+	calls := []string{}
+	deps := &PipelineDeps{
+		Config: PipelineConfig{MaxToolCalls: 2},
+		ExecuteToolCall: func(_ context.Context, _ *RunState, tc providers.ToolCall) ([]providers.Message, error) {
+			calls = append(calls, tc.Name)
+			return []providers.Message{{Role: "tool", Content: "result:" + tc.Name, ToolCallID: tc.ID}}, nil
+		},
+		SequentialToolCall: func(tc providers.ToolCall) bool {
+			return tc.Name == "wait"
+		},
+	}
+	stage := NewToolStage(deps)
+	state := defaultState()
+	state.Think.LastResponse = &providers.ChatResponse{
+		ToolCalls: []providers.ToolCall{
+			{ID: "1", Name: "message"},
+			{ID: "2", Name: "wait", Arguments: map[string]any{"timeMs": 1000}},
+			{ID: "3", Name: "message"},
+		},
+	}
+
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	want := []string{"message", "wait"}
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("ExecuteToolCall order = %v, want %v", calls, want)
+	}
+	if stage.Result() != BreakLoop {
+		t.Fatalf("Result() = %v, want BreakLoop", stage.Result())
+	}
+}
+
+func TestToolStage_SequentialWaitBatchEnforcesCumulativeWaitCap(t *testing.T) {
+	t.Parallel()
+	calls := []string{}
+	deps := &PipelineDeps{
+		ExecuteToolCall: func(_ context.Context, _ *RunState, tc providers.ToolCall) ([]providers.Message, error) {
+			calls = append(calls, tc.ID)
+			return []providers.Message{{Role: "tool", Content: "result:" + tc.Name, ToolCallID: tc.ID}}, nil
+		},
+		SequentialToolCall: func(tc providers.ToolCall) bool {
+			return tc.Name == "wait"
+		},
+	}
+	stage := NewToolStage(deps)
+	state := defaultState()
+	state.Think.LastResponse = &providers.ChatResponse{
+		ToolCalls: []providers.ToolCall{
+			{ID: "1", Name: "wait", Arguments: map[string]any{"timeMs": 300000}},
+			{ID: "2", Name: "wait", Arguments: map[string]any{"timeMs": 300000}},
+		},
+	}
+
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if !reflect.DeepEqual(calls, []string{"1"}) {
+		t.Fatalf("ExecuteToolCall calls = %v, want [1]", calls)
+	}
+	if stage.Result() != AbortRun {
+		t.Fatalf("Result() = %v, want AbortRun", stage.Result())
 	}
 }
 
@@ -1126,6 +1434,155 @@ func TestObserveStage_EmptyContent_BlockRepliesNotIncremented(t *testing.T) {
 	}
 }
 
+// --- ObserveStage image accumulation (regression for mid-loop image loss) ---
+//
+// These tests cover the bug where LLM emits an image_generation_call alongside
+// a function_call in iter N, then responds text-only in iter N+1. Without
+// accumulation in Observe, FinalizeStage would only see LastResponse.Images
+// (which is empty at iter N+1) and drop the iter-N image.
+
+// Case 1: single iteration with image only → accumulated.
+func TestObserveStage_ImageAccumulation_SingleIterImageOnly(t *testing.T) {
+	t.Parallel()
+	stage := NewObserveStage(&PipelineDeps{})
+	state := defaultState()
+	state.Think.LastResponse = &providers.ChatResponse{
+		FinishReason: "stop",
+		Images: []providers.ImageContent{
+			{MimeType: "image/png", Data: "imgA"},
+		},
+	}
+	_ = stage.Execute(context.Background(), state)
+	if got := len(state.Observe.AssistantImages); got != 1 {
+		t.Fatalf("AssistantImages len = %d, want 1", got)
+	}
+	if state.Observe.AssistantImages[0].Data != "imgA" {
+		t.Errorf("image data = %q, want %q", state.Observe.AssistantImages[0].Data, "imgA")
+	}
+	// Source response.Images must be cleared to prevent double-counting on re-exec.
+	if state.Think.LastResponse.Images != nil {
+		t.Error("LastResponse.Images must be cleared after draining")
+	}
+}
+
+// Case 2: image + tool_call in same iter → image accumulated, tool_call flows through think.
+func TestObserveStage_ImageAccumulation_ImagePlusToolCall(t *testing.T) {
+	t.Parallel()
+	stage := NewObserveStage(&PipelineDeps{})
+	state := defaultState()
+	state.Think.LastResponse = &providers.ChatResponse{
+		FinishReason: "tool_calls",
+		ToolCalls:    []providers.ToolCall{{ID: "1", Name: "search"}},
+		Images: []providers.ImageContent{
+			{MimeType: "image/png", Data: "imgMid"},
+		},
+	}
+	_ = stage.Execute(context.Background(), state)
+	if got := len(state.Observe.AssistantImages); got != 1 {
+		t.Fatalf("AssistantImages len = %d, want 1 (image must survive tool_calls path)", got)
+	}
+}
+
+// Case 3: mid-loop image in iter 1 + text-only iter 2 → image from iter 1 retained.
+//
+// This is the regression scenario that motivated the accumulator. Without the fix
+// FinalizeStage reads LastResponse (iter 2) and drops iter-1 image.
+func TestObserveStage_ImageAccumulation_MidLoopImagePreservedAcrossIterations(t *testing.T) {
+	t.Parallel()
+	stage := NewObserveStage(&PipelineDeps{})
+	state := defaultState()
+
+	// Iter 1: image + tool call.
+	state.Think.LastResponse = &providers.ChatResponse{
+		FinishReason: "tool_calls",
+		ToolCalls:    []providers.ToolCall{{ID: "1", Name: "search"}},
+		Images:       []providers.ImageContent{{MimeType: "image/png", Data: "iter1img"}},
+	}
+	_ = stage.Execute(context.Background(), state)
+
+	// Iter 2: text-only final response — no Images.
+	state.Think.LastResponse = &providers.ChatResponse{
+		FinishReason: "stop",
+		Content:      "Done.",
+	}
+	_ = stage.Execute(context.Background(), state)
+
+	if got := len(state.Observe.AssistantImages); got != 1 {
+		t.Fatalf("AssistantImages len = %d, want 1 (iter-1 image must survive)", got)
+	}
+	if state.Observe.AssistantImages[0].Data != "iter1img" {
+		t.Errorf("image data = %q, want %q", state.Observe.AssistantImages[0].Data, "iter1img")
+	}
+}
+
+// Case 4: multiple images emitted across multiple iterations → all retained in order.
+func TestObserveStage_ImageAccumulation_MultipleImagesAcrossIterations(t *testing.T) {
+	t.Parallel()
+	stage := NewObserveStage(&PipelineDeps{})
+	state := defaultState()
+
+	// Iter 1: two images + tool call.
+	state.Think.LastResponse = &providers.ChatResponse{
+		FinishReason: "tool_calls",
+		ToolCalls:    []providers.ToolCall{{ID: "1", Name: "t"}},
+		Images: []providers.ImageContent{
+			{MimeType: "image/png", Data: "A"},
+			{MimeType: "image/png", Data: "B"},
+		},
+	}
+	_ = stage.Execute(context.Background(), state)
+
+	// Iter 2: one image standalone.
+	state.Think.LastResponse = &providers.ChatResponse{
+		FinishReason: "stop",
+		Images:       []providers.ImageContent{{MimeType: "image/png", Data: "C"}},
+	}
+	_ = stage.Execute(context.Background(), state)
+
+	if got := len(state.Observe.AssistantImages); got != 3 {
+		t.Fatalf("AssistantImages len = %d, want 3", got)
+	}
+	for i, want := range []string{"A", "B", "C"} {
+		if state.Observe.AssistantImages[i].Data != want {
+			t.Errorf("image[%d] = %q, want %q", i, state.Observe.AssistantImages[i].Data, want)
+		}
+	}
+}
+
+// Case 5: partial frames must be filtered out — only final (non-partial) images accumulate.
+func TestObserveStage_ImageAccumulation_PartialFramesFiltered(t *testing.T) {
+	t.Parallel()
+	stage := NewObserveStage(&PipelineDeps{})
+	state := defaultState()
+	state.Think.LastResponse = &providers.ChatResponse{
+		FinishReason: "stop",
+		Images: []providers.ImageContent{
+			{MimeType: "image/png", Data: "partial1", Partial: true},
+			{MimeType: "image/png", Data: "final1"},
+			{MimeType: "image/png", Data: "partial2", Partial: true},
+		},
+	}
+	_ = stage.Execute(context.Background(), state)
+	if got := len(state.Observe.AssistantImages); got != 1 {
+		t.Fatalf("AssistantImages len = %d, want 1 (partials filtered)", got)
+	}
+	if state.Observe.AssistantImages[0].Data != "final1" {
+		t.Errorf("image data = %q, want %q", state.Observe.AssistantImages[0].Data, "final1")
+	}
+}
+
+// Case 6: nil response → no panic, accumulator unchanged.
+func TestObserveStage_ImageAccumulation_NilResponseSafe(t *testing.T) {
+	t.Parallel()
+	stage := NewObserveStage(&PipelineDeps{})
+	state := defaultState()
+	state.Think.LastResponse = nil
+	_ = stage.Execute(context.Background(), state)
+	if state.Observe.AssistantImages != nil {
+		t.Errorf("AssistantImages = %v, want nil", state.Observe.AssistantImages)
+	}
+}
+
 // --- CheckpointStage tests ---
 
 func TestCheckpointStage_SkipsIteration0(t *testing.T) {
@@ -1290,6 +1747,75 @@ func TestFinalizeStage_DeduplicatesMediaByPath(t *testing.T) {
 	}
 	if len(state.Tool.MediaResults) != 2 {
 		t.Errorf("MediaResults len = %d after dedup, want 2", len(state.Tool.MediaResults))
+	}
+}
+
+// TestFinalizeStage_PersistsFromObserveAccumulator verifies that FinalizeStage
+// sources assistant images from state.Observe.AssistantImages, NOT from
+// LastResponse.Images. This guards against the regression where a mid-loop
+// image_generation_call is lost when the final iteration responds text-only.
+func TestFinalizeStage_PersistsFromObserveAccumulator(t *testing.T) {
+	t.Parallel()
+	var persistedImages []providers.ImageContent
+	deps := &PipelineDeps{
+		PersistAssistantImages: func(msg *providers.Message, _ string) {
+			// Capture what was handed to the persist callback.
+			persistedImages = append([]providers.ImageContent(nil), msg.Images...)
+			// Simulate hash→MediaRef mapping.
+			for range msg.Images {
+				msg.MediaRefs = append(msg.MediaRefs, providers.MediaRef{
+					Kind: "image", MimeType: "image/png", Path: "/tmp/img.png",
+				})
+			}
+			msg.Images = nil
+		},
+		FlushMessages: func(_ context.Context, _ string, _ []providers.Message) error { return nil },
+	}
+	stage := NewFinalizeStage(deps)
+	state := defaultState()
+
+	// Observe has accumulated an image from an earlier iteration.
+	state.Observe.AssistantImages = []providers.ImageContent{
+		{MimeType: "image/png", Data: "iterMidImage"},
+	}
+	// LastResponse is the final iteration — text-only, no Images.
+	state.Think.LastResponse = &providers.ChatResponse{FinishReason: "stop", Content: "Done."}
+	state.Observe.FinalContent = "Done."
+
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if len(persistedImages) != 1 {
+		t.Fatalf("persisted images len = %d, want 1 (accumulator-sourced image must be persisted)", len(persistedImages))
+	}
+	if persistedImages[0].Data != "iterMidImage" {
+		t.Errorf("persisted image data = %q, want %q", persistedImages[0].Data, "iterMidImage")
+	}
+	// Accumulator must be drained.
+	if state.Observe.AssistantImages != nil {
+		t.Errorf("AssistantImages = %v, want nil after drain", state.Observe.AssistantImages)
+	}
+}
+
+// TestFinalizeStage_NoPersistWhenAccumulatorEmpty verifies no-op when no images
+// were emitted across any iteration. Prevents regression where a non-nil
+// LastResponse with empty Images would still call PersistAssistantImages.
+func TestFinalizeStage_NoPersistWhenAccumulatorEmpty(t *testing.T) {
+	t.Parallel()
+	persistCalled := false
+	deps := &PipelineDeps{
+		PersistAssistantImages: func(_ *providers.Message, _ string) { persistCalled = true },
+		FlushMessages:          func(_ context.Context, _ string, _ []providers.Message) error { return nil },
+	}
+	stage := NewFinalizeStage(deps)
+	state := defaultState()
+	state.Think.LastResponse = &providers.ChatResponse{FinishReason: "stop", Content: "hi"}
+
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if persistCalled {
+		t.Error("PersistAssistantImages must not be called when accumulator is empty")
 	}
 }
 
@@ -1766,5 +2292,154 @@ func TestFinalizeStage_DeduplicatesMedia_WithRealFile(t *testing.T) {
 	}
 	if state.Tool.MediaResults[0].Size == 0 {
 		t.Error("Size should be populated from real file")
+	}
+}
+
+// ─── parseTTL (Phase 06) ─────────────────────────────────────────────────
+
+func TestParseTTL_ValidInputs(t *testing.T) {
+	cases := []struct {
+		in   string
+		want time.Duration
+	}{
+		{"", 5 * time.Minute},
+		{"5m", 5 * time.Minute},
+		{"30s", 30 * time.Second},
+		{"1h30m", 90 * time.Minute},
+		{"bogus", 5 * time.Minute},  // invalid → fallback
+		{"-1m", 5 * time.Minute},    // negative → fallback
+	}
+	for _, tc := range cases {
+		got := parseTTL(tc.in)
+		if got != tc.want {
+			t.Errorf("parseTTL(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+// ─── Cache-TTL gate (Phase 06) ───────────────────────────────────────────
+
+// makePruneHistory builds history that exceeds the 70% soft threshold.
+// budget = 10000-0-1000=9000, soft=6300. 100 msgs * 100 = 10000 > 6300.
+func makePruneHistory(n int) []providers.Message {
+	h := make([]providers.Message, n)
+	for i := range h {
+		h[i] = providers.Message{Role: "tool", ToolCallID: "c1", Content: "x"}
+	}
+	return h
+}
+
+func TestPruneStage_CacheTtlGate_SkipsWithinTTL(t *testing.T) {
+	t.Parallel()
+	// cache live (1 min ago), history above soft threshold but below hard budget.
+	var pruneCalled int32
+	deps := &PipelineDeps{
+		Config:       PipelineConfig{ContextWindow: 10000, MaxTokens: 1000},
+		TokenCounter: &mockTokenCounter{countPerMessage: 100},
+		PruneMessages: func(msgs []providers.Message, _ int) ([]providers.Message, PruneStats) {
+			atomic.AddInt32(&pruneCalled, 1)
+			return msgs, PruneStats{}
+		},
+		GetProviderCaps:  func() providers.ProviderCapabilities { return providers.ProviderCapabilities{CacheControl: true} },
+		GetPruningConfig: func() *config.ContextPruningConfig { return &config.ContextPruningConfig{Mode: "cache-ttl", TTL: "5m"} },
+		GetCacheTouch:    func(string) time.Time { return time.Now().Add(-1 * time.Minute) }, // 1m ago, within 5m TTL
+		MarkCacheTouched: func(string) {},
+	}
+	stage := NewPruneStage(deps, nil)
+	state := defaultState()
+	state.Messages.SetHistory(makePruneHistory(50)) // 50*100=5000 tokens; soft=6300, hard=9000; below hard
+
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if atomic.LoadInt32(&pruneCalled) != 0 {
+		t.Error("prune should be skipped when cache is live and below hard budget")
+	}
+}
+
+func TestPruneStage_CacheTtlGate_PrunesAfterTTL(t *testing.T) {
+	t.Parallel()
+	// touch = 6 minutes ago → TTL expired → gate allows prune
+	var pruneCalled int32
+	var touchCalled int32
+	deps := &PipelineDeps{
+		Config:       PipelineConfig{ContextWindow: 10000, MaxTokens: 1000},
+		TokenCounter: &mockTokenCounter{countPerMessage: 100},
+		PruneMessages: func(msgs []providers.Message, _ int) ([]providers.Message, PruneStats) {
+			atomic.AddInt32(&pruneCalled, 1)
+			return msgs[:1], PruneStats{ResultsTrimmed: 1}
+		},
+		GetProviderCaps:  func() providers.ProviderCapabilities { return providers.ProviderCapabilities{CacheControl: true} },
+		GetPruningConfig: func() *config.ContextPruningConfig { return &config.ContextPruningConfig{Mode: "cache-ttl", TTL: "5m"} },
+		GetCacheTouch:    func(string) time.Time { return time.Now().Add(-6 * time.Minute) }, // 6m ago, expired
+		MarkCacheTouched: func(string) { atomic.AddInt32(&touchCalled, 1) },
+	}
+	stage := NewPruneStage(deps, nil)
+	state := defaultState()
+	state.Messages.SetHistory(makePruneHistory(100)) // 100*100=10000; above soft threshold
+
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if atomic.LoadInt32(&pruneCalled) == 0 {
+		t.Error("prune should fire when TTL expired")
+	}
+	if atomic.LoadInt32(&touchCalled) == 0 {
+		t.Error("MarkCacheTouched should be called after mutation")
+	}
+}
+
+func TestPruneStage_CacheTtlGate_NoCacheSupport_Prunes(t *testing.T) {
+	t.Parallel()
+	// CacheControl=false → gate is no-op → normal prune runs
+	var pruneCalled int32
+	deps := &PipelineDeps{
+		Config:       PipelineConfig{ContextWindow: 10000, MaxTokens: 1000},
+		TokenCounter: &mockTokenCounter{countPerMessage: 100},
+		PruneMessages: func(msgs []providers.Message, _ int) ([]providers.Message, PruneStats) {
+			atomic.AddInt32(&pruneCalled, 1)
+			return msgs[:1], PruneStats{ResultsTrimmed: 1}
+		},
+		GetProviderCaps:  func() providers.ProviderCapabilities { return providers.ProviderCapabilities{CacheControl: false} },
+		GetPruningConfig: func() *config.ContextPruningConfig { return &config.ContextPruningConfig{Mode: "cache-ttl", TTL: "5m"} },
+		GetCacheTouch:    func(string) time.Time { return time.Now().Add(-1 * time.Minute) },
+		MarkCacheTouched: func(string) {},
+	}
+	stage := NewPruneStage(deps, nil)
+	state := defaultState()
+	state.Messages.SetHistory(makePruneHistory(100))
+
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if atomic.LoadInt32(&pruneCalled) == 0 {
+		t.Error("prune should fire when provider has no cache support")
+	}
+}
+
+func TestPruneStage_CacheTtlGate_MarkTouchedOnlyOnMutation(t *testing.T) {
+	t.Parallel()
+	// PruneMessages returns zero stats (no mutation) → MarkCacheTouched must NOT be called.
+	var touchCalled int32
+	deps := &PipelineDeps{
+		Config:       PipelineConfig{ContextWindow: 10000, MaxTokens: 1000},
+		TokenCounter: &mockTokenCounter{countPerMessage: 100},
+		PruneMessages: func(msgs []providers.Message, _ int) ([]providers.Message, PruneStats) {
+			return msgs, PruneStats{} // no mutation
+		},
+		GetProviderCaps:  func() providers.ProviderCapabilities { return providers.ProviderCapabilities{CacheControl: true} },
+		GetPruningConfig: func() *config.ContextPruningConfig { return &config.ContextPruningConfig{Mode: "cache-ttl", TTL: "5m"} },
+		GetCacheTouch:    func(string) time.Time { return time.Time{} }, // cold
+		MarkCacheTouched: func(string) { atomic.AddInt32(&touchCalled, 1) },
+	}
+	stage := NewPruneStage(deps, nil)
+	state := defaultState()
+	state.Messages.SetHistory(makePruneHistory(100))
+
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if atomic.LoadInt32(&touchCalled) != 0 {
+		t.Error("MarkCacheTouched should NOT be called when prune returns no mutation")
 	}
 }

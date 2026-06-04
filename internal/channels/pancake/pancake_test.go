@@ -3,6 +3,9 @@ package pancake
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -373,25 +376,68 @@ func TestAPIClientSendMessageReturnsBodyLevelError(t *testing.T) {
 	}
 }
 
-// TestTruncateForTikTok_MultiByteCharacters verifies rune-safe truncation for
+// TestTruncateRuneSafe_MultiByteCharacters verifies rune-safe truncation for
 // Vietnamese diacritics and emoji (multi-byte UTF-8 sequences).
-func TestTruncateForTikTok_MultiByteCharacters(t *testing.T) {
+func TestTruncateRuneSafe_MultiByteCharacters(t *testing.T) {
 	// Vietnamese text with diacritics (multi-byte UTF-8)
 	input := strings.Repeat("Xin chào ", 100) // ~900 bytes, <500 runes
-	result := truncateForTikTok(input)
+	result := truncateRuneSafe(input, 500)
 	if !utf8.ValidString(result) {
-		t.Fatal("truncateForTikTok produced invalid UTF-8")
+		t.Fatal("truncateRuneSafe produced invalid UTF-8")
 	}
 
 	// Emoji string exceeding 500 runes
 	emoji := strings.Repeat("😊", 600)
-	result = truncateForTikTok(emoji)
+	result = truncateRuneSafe(emoji, 500)
 	runes := []rune(result)
 	if len(runes) > 500 {
 		t.Errorf("expected <=500 runes, got %d", len(runes))
 	}
 	if !utf8.ValidString(result) {
 		t.Fatal("emoji truncation produced invalid UTF-8")
+	}
+}
+
+// --- Shopee platform support tests (Phase 1: TDD red state) ---
+
+// TestMaxMessageLength_Shopee verifies shopee returns 500 char limit.
+func TestMaxMessageLength_Shopee(t *testing.T) {
+	ch := &Channel{platform: "shopee"}
+	if got := ch.maxMessageLength(); got != 500 {
+		t.Fatalf("shopee maxMessageLength = %d, want 500", got)
+	}
+	// Regression guards for existing platforms.
+	for _, tc := range []struct {
+		p    string
+		want int
+	}{
+		{"tiktok", 500}, {"facebook", 2000}, {"whatsapp", 4096},
+	} {
+		ch.platform = tc.p
+		if got := ch.maxMessageLength(); got != tc.want {
+			t.Fatalf("%s maxMessageLength = %d, want %d", tc.p, got, tc.want)
+		}
+	}
+}
+
+// TestTruncateRuneSafe_Shopee verifies FormatOutbound truncates shopee to 500 runes.
+// Uses Vietnamese diacritics and emoji to catch byte-vs-rune bugs.
+func TestTruncateRuneSafe_Shopee(t *testing.T) {
+	// Vietnamese text: 600 "Xin chào " iterations → >500 runes.
+	input := strings.Repeat("Xin chào ", 100)
+	out := FormatOutbound(input, "shopee")
+	if utf8.RuneCountInString(out) > 500 {
+		t.Fatalf("shopee output = %d runes, want <=500", utf8.RuneCountInString(out))
+	}
+	if !utf8.ValidString(out) {
+		t.Fatal("shopee truncation produced invalid UTF-8")
+	}
+
+	// Emoji-only input exceeding 500 runes.
+	emoji := strings.Repeat("😊", 600)
+	out = FormatOutbound(emoji, "shopee")
+	if utf8.RuneCountInString(out) > 500 {
+		t.Fatalf("emoji shopee output = %d runes, want <=500", utf8.RuneCountInString(out))
 	}
 }
 
@@ -494,12 +540,18 @@ func buildWebhookBody(pageID, convID, convType, senderID, msgID, content, postID
 		pageID, conv, msgID, content)
 }
 
+func signTestPancakeRequest(req *http.Request, body, secret string) {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(body))
+	req.Header.Set("X-Pancake-Signature", "sha256="+hex.EncodeToString(mac.Sum(nil)))
+}
+
 // newTestRouter creates an isolated webhookRouter with a registered channel.
 func newTestRouter(t *testing.T, cfg pancakeInstanceConfig) (*webhookRouter, *Channel, *bus.MessageBus) {
 	t.Helper()
 	msgBus := bus.New()
 	cfg.PageID = "page-test"
-	creds := pancakeCreds{APIKey: "k", PageAccessToken: "t"}
+	creds := pancakeCreds{APIKey: "k", PageAccessToken: "t", WebhookSecret: "test-secret"}
 	ch, err := New(cfg, creds, msgBus, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -514,10 +566,12 @@ func newTestRouter(t *testing.T, cfg pancakeInstanceConfig) (*webhookRouter, *Ch
 func TestWebhookRouterRoutesCommentEvent(t *testing.T) {
 	cfg := pancakeInstanceConfig{}
 	cfg.Features.CommentReply = true
-	router, _, msgBus := newTestRouter(t, cfg)
+	router, ch, msgBus := newTestRouter(t, cfg)
+	ch.webhookSecret = "test-secret"
 
 	body := buildWebhookBody("page-test", "conv-1", "COMMENT", "user-1", "msg-1", "hello", "")
 	req := httptest.NewRequest(http.MethodPost, webhookPath, strings.NewReader(body))
+	signTestPancakeRequest(req, body, ch.webhookSecret)
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
@@ -536,13 +590,66 @@ func TestWebhookRouterRoutesCommentEvent(t *testing.T) {
 	}
 }
 
+// TestWebhookRouterRoutesWebhookPageID covers the production Facebook COMMENT case:
+// Pancake sends event.page_id = Facebook native page ID (780222461832476),
+// but the channel is configured with Pancake's internal page ID (1098014820065543).
+// Fix: configure webhook_page_id = "fb-native-id" so the router registers under both.
+func TestWebhookRouterRoutesWebhookPageID(t *testing.T) {
+	cfg := pancakeInstanceConfig{}
+	cfg.Features.CommentReply = true
+	cfg.WebhookPageID = "fb-native-id" // Facebook native page ID sent in webhook event.page_id
+
+	msgBus := bus.New()
+	cfg.PageID = "pancake-internal-id"
+	creds := pancakeCreds{APIKey: "k", PageAccessToken: "t", WebhookSecret: "test-secret"}
+	ch, err := New(cfg, creds, msgBus, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ch.platform = "facebook"
+
+	// Simulate register — both IDs should be in the router.
+	router := &webhookRouter{instances: make(map[string]*Channel)}
+	router.register(ch)
+
+	if router.instances["pancake-internal-id"] == nil {
+		t.Error("router should have channel registered under Pancake internal page ID")
+	}
+	if router.instances["fb-native-id"] == nil {
+		t.Error("router should have channel registered under Facebook native page ID (webhook_page_id)")
+	}
+
+	// Webhook arrives with Facebook native page ID — must route to the channel.
+	body := buildWebhookBody("fb-native-id", "conv-1", "COMMENT", "user-1", "msg-1", "hello", "")
+	req := httptest.NewRequest(http.MethodPost, webhookPath, strings.NewReader(body))
+	signTestPancakeRequest(req, body, ch.webhookSecret)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	msg, ok := msgBus.ConsumeInbound(ctx)
+	if !ok {
+		t.Fatal("expected message published: webhook_page_id should route COMMENT to correct channel")
+	}
+	if msg.Metadata["pancake_mode"] != "comment" {
+		t.Errorf("pancake_mode = %q, want comment", msg.Metadata["pancake_mode"])
+	}
+}
+
 func TestWebhookRouterRoutesInboxEvent(t *testing.T) {
 	cfg := pancakeInstanceConfig{}
 	cfg.Features.InboxReply = true
-	router, _, msgBus := newTestRouter(t, cfg)
+	router, ch, msgBus := newTestRouter(t, cfg)
+	ch.webhookSecret = "test-secret"
 
 	body := buildWebhookBody("page-test", "conv-1", "INBOX", "user-1", "msg-2", "inbox msg", "")
 	req := httptest.NewRequest(http.MethodPost, webhookPath, strings.NewReader(body))
+	signTestPancakeRequest(req, body, ch.webhookSecret)
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
@@ -555,6 +662,77 @@ func TestWebhookRouterRoutesInboxEvent(t *testing.T) {
 	// inbox handler sets pancake_mode = "inbox"
 	if msg.Metadata["pancake_mode"] != "inbox" {
 		t.Errorf("pancake_mode = %q, want %q", msg.Metadata["pancake_mode"], "inbox")
+	}
+}
+
+func TestWebhookRouterMissingSecretDoesNotDispatch(t *testing.T) {
+	cfg := pancakeInstanceConfig{}
+	cfg.Features.InboxReply = true
+	router, ch, msgBus := newTestRouter(t, cfg)
+	ch.webhookSecret = ""
+
+	body := buildWebhookBody("page-test", "conv-1", "INBOX", "user-1", "msg-2", "inbox msg", "")
+	req := httptest.NewRequest(http.MethodPost, webhookPath, strings.NewReader(body))
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected provider-safe 200, got %d", w.Code)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if _, ok := msgBus.ConsumeInbound(ctx); ok {
+		t.Fatal("expected no dispatch when webhook secret is missing")
+	}
+}
+
+func TestWebhookRouterSignatureMismatchDoesNotDispatch(t *testing.T) {
+	cfg := pancakeInstanceConfig{}
+	cfg.Features.InboxReply = true
+	router, ch, msgBus := newTestRouter(t, cfg)
+
+	body := buildWebhookBody("page-test", "conv-1", "INBOX", "user-1", "msg-2", "inbox msg", "")
+	req := httptest.NewRequest(http.MethodPost, webhookPath, strings.NewReader(body))
+	signTestPancakeRequest(req, body, "wrong-secret")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected provider-safe 200, got %d", w.Code)
+	}
+	if ch.webhookSecret == "" {
+		t.Fatal("test setup error: expected configured webhook secret")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if _, ok := msgBus.ConsumeInbound(ctx); ok {
+		t.Fatal("expected no dispatch on signature mismatch")
+	}
+}
+
+func TestWebhookRouterDuplicateSignedBodyDoesNotDispatchTwice(t *testing.T) {
+	cfg := pancakeInstanceConfig{}
+	cfg.Features.InboxReply = true
+	router, ch, msgBus := newTestRouter(t, cfg)
+
+	body := buildWebhookBody("page-test", "conv-1", "INBOX", "user-1", "", "inbox msg", "")
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodPost, webhookPath, strings.NewReader(body))
+		signTestPancakeRequest(req, body, ch.webhookSecret)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("request %d status = %d, want 200", i+1, w.Code)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if _, ok := msgBus.ConsumeInbound(ctx); !ok {
+		t.Fatal("expected first signed webhook to dispatch")
+	}
+	if _, ok := msgBus.ConsumeInbound(ctx); ok {
+		t.Fatal("expected duplicate signed webhook body to be skipped")
 	}
 }
 
@@ -582,10 +760,12 @@ func TestWebhookRouterSkipsUnknownType(t *testing.T) {
 func TestWebhookRouterCommentNormalizesPostID(t *testing.T) {
 	cfg := pancakeInstanceConfig{}
 	cfg.Features.CommentReply = true
-	router, _, msgBus := newTestRouter(t, cfg)
+	router, ch, msgBus := newTestRouter(t, cfg)
+	ch.webhookSecret = "test-secret"
 
 	body := buildWebhookBody("page-test", "conv-1", "COMMENT", "user-1", "msg-4", "hello", "post-123")
 	req := httptest.NewRequest(http.MethodPost, webhookPath, strings.NewReader(body))
+	signTestPancakeRequest(req, body, ch.webhookSecret)
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
@@ -604,9 +784,9 @@ func TestWebhookRouterCommentNormalizesPostID(t *testing.T) {
 
 // multiCaptureTransport records multiple requests (for first-inbox tests).
 type multiCaptureTransport struct {
-	reqs  []*http.Request
+	reqs   []*http.Request
 	bodies [][]byte
-	mu    sync.Mutex
+	mu     sync.Mutex
 }
 
 func (t *multiCaptureTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -633,7 +813,7 @@ func newChannelWithMultiCapture(t *testing.T, cfg pancakeInstanceConfig) (*Chann
 	transport := &multiCaptureTransport{}
 	msgBus := bus.New()
 	cfg.PageID = "page-123"
-	creds := pancakeCreds{APIKey: "k", PageAccessToken: "t"}
+	creds := pancakeCreds{APIKey: "k", PageAccessToken: "t", WebhookSecret: "test-secret"}
 	ch, err := New(cfg, creds, msgBus, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -675,18 +855,39 @@ func TestSend_CommentMode(t *testing.T) {
 	}
 }
 
-func TestSend_CommentMode_WithFirstInbox(t *testing.T) {
+func TestSend_CommentMode_MissingCommentID_ReturnsError(t *testing.T) {
 	cfg := pancakeInstanceConfig{}
-	cfg.Features.FirstInbox = true
-	cfg.FirstInboxMessage = "Thanks!"
-	ch, transport := newChannelWithMultiCapture(t, cfg)
+	ch, _ := newChannelWithMultiCapture(t, cfg)
 
 	err := ch.Send(context.Background(), bus.OutboundMessage{
 		ChatID:  "conv-123",
 		Content: "reply text",
 		Metadata: map[string]string{
 			"pancake_mode": "comment",
-			"sender_id":    "user-1",
+			// reply_to_comment_id intentionally absent
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error when reply_to_comment_id is missing, got nil")
+	}
+	if !strings.Contains(err.Error(), "reply_to_comment_id") {
+		t.Errorf("error message should mention reply_to_comment_id, got: %v", err)
+	}
+}
+
+func TestSend_CommentMode_WithPrivateReply(t *testing.T) {
+	cfg := pancakeInstanceConfig{}
+	cfg.Features.PrivateReply = true
+	cfg.PrivateReplyMessage = "Thanks!"
+	ch, transport := newChannelWithMultiCapture(t, cfg)
+
+	err := ch.Send(context.Background(), bus.OutboundMessage{
+		ChatID:  "conv-123",
+		Content: "reply text",
+		Metadata: map[string]string{
+			"pancake_mode":        "comment",
+			"sender_id":           "user-1",
+			"reply_to_comment_id": "msg-1",
 		},
 	})
 	if err != nil {
@@ -712,60 +913,60 @@ func TestSend_CommentMode_WithFirstInbox(t *testing.T) {
 	}
 }
 
-func TestSend_CommentMode_FirstInboxDedup(t *testing.T) {
+func TestSend_CommentMode_PrivateReplyStateless(t *testing.T) {
+	// Stateless: each Send() with PrivateReply enabled fires a DM.
+	// Dedup responsibility lives at the webhook layer (comment_id) and
+	// at Facebook's platform (per-comment private_replies idempotency).
 	cfg := pancakeInstanceConfig{}
-	cfg.Features.FirstInbox = true
-	cfg.FirstInboxMessage = "DM!"
+	cfg.Features.PrivateReply = true
+	cfg.PrivateReplyMessage = "DM!"
 	ch, transport := newChannelWithMultiCapture(t, cfg)
 
 	outMsg := bus.OutboundMessage{
 		ChatID:  "conv-123",
 		Content: "hi",
 		Metadata: map[string]string{
-			"pancake_mode": "comment",
-			"sender_id":    "user-1",
+			"pancake_mode":        "comment",
+			"sender_id":           "user-1",
+			"reply_to_comment_id": "msg-1",
 		},
 	}
-	ch.Send(context.Background(), outMsg)  //nolint:errcheck
-	outMsg.ChatID = "conv-456"             // second comment, different conv, same sender
-	ch.Send(context.Background(), outMsg)  //nolint:errcheck
+	ch.Send(context.Background(), outMsg) //nolint:errcheck
+	outMsg.ChatID = "conv-456"
+	outMsg.Metadata["reply_to_comment_id"] = "msg-2"
+	ch.Send(context.Background(), outMsg) //nolint:errcheck
 
 	transport.mu.Lock()
 	defer transport.mu.Unlock()
-	// Expected: reply_comment x2, private_reply x1 (deduped on sender)
-	if len(transport.reqs) != 3 {
-		t.Fatalf("expected 3 requests (2x reply_comment + 1x private_reply), got %d", len(transport.reqs))
+	// 2x reply_comment + 2x private_reply = 4 requests (stateless)
+	if len(transport.reqs) != 4 {
+		t.Fatalf("expected 4 requests (2x reply_comment + 2x private_reply, stateless), got %d", len(transport.reqs))
 	}
-	var actions []string
+	var privateCount int
 	for _, body := range transport.bodies {
 		var p map[string]any
 		json.Unmarshal(body, &p)
-		if a, ok := p["action"].(string); ok {
-			actions = append(actions, a)
-		}
-	}
-	privateCount := 0
-	for _, a := range actions {
-		if a == "private_reply" {
+		if p["action"] == "private_reply" {
 			privateCount++
 		}
 	}
-	if privateCount != 1 {
-		t.Errorf("expected exactly 1 private_reply, got %d (actions: %v)", privateCount, actions)
+	if privateCount != 2 {
+		t.Errorf("expected 2 private_reply calls (stateless), got %d", privateCount)
 	}
 }
 
-func TestSend_CommentMode_FirstInboxDisabled(t *testing.T) {
+func TestSend_CommentMode_PrivateReplyDisabled(t *testing.T) {
 	cfg := pancakeInstanceConfig{}
-	cfg.Features.FirstInbox = false
+	cfg.Features.PrivateReply = false
 	ch, transport := newChannelWithMultiCapture(t, cfg)
 
 	ch.Send(context.Background(), bus.OutboundMessage{ //nolint:errcheck
 		ChatID:  "conv-123",
 		Content: "reply",
 		Metadata: map[string]string{
-			"pancake_mode": "comment",
-			"sender_id":    "user-1",
+			"pancake_mode":        "comment",
+			"sender_id":           "user-1",
+			"reply_to_comment_id": "msg-1",
 		},
 	})
 
@@ -777,7 +978,7 @@ func TestSend_CommentMode_FirstInboxDisabled(t *testing.T) {
 	var p map[string]any
 	json.Unmarshal(transport.bodies[0], &p)
 	if p["action"] == "private_reply" {
-		t.Error("should not send private_reply when FirstInbox is disabled")
+		t.Error("should not send private_reply when PrivateReply is disabled")
 	}
 }
 
@@ -813,8 +1014,9 @@ func TestSend_CommentMode_EchoRemembered(t *testing.T) {
 		ChatID:  "conv-echo",
 		Content: "some reply",
 		Metadata: map[string]string{
-			"pancake_mode": "comment",
-			"sender_id":    "user-1",
+			"pancake_mode":        "comment",
+			"sender_id":           "user-1",
+			"reply_to_comment_id": "msg-1",
 		},
 	})
 
@@ -823,14 +1025,15 @@ func TestSend_CommentMode_EchoRemembered(t *testing.T) {
 	}
 }
 
-// --- First Inbox ---
+// --- Private Reply ---
 
-func TestSendFirstInbox_DefaultMessage(t *testing.T) {
+func TestSendPrivateReply_DefaultMessage(t *testing.T) {
 	cfg := pancakeInstanceConfig{}
-	cfg.FirstInboxMessage = "" // empty = use default
+	cfg.Features.PrivateReply = true
+	cfg.PrivateReplyMessage = "" // empty = use default
 	ch, transport := newChannelWithMultiCapture(t, cfg)
 
-	ch.sendFirstInbox(context.Background(), "user-1", "conv-123")
+	ch.sendPrivateReply(context.Background(), "user-1", "conv-123", "", "")
 
 	transport.mu.Lock()
 	defer transport.mu.Unlock()
@@ -844,16 +1047,17 @@ func TestSendFirstInbox_DefaultMessage(t *testing.T) {
 	}
 	msg, _ := p["message"].(string)
 	if msg == "" {
-		t.Error("expected non-empty default first inbox message")
+		t.Error("expected non-empty default private reply message")
 	}
 }
 
-func TestSendFirstInbox_CustomMessage(t *testing.T) {
+func TestSendPrivateReply_CustomMessage(t *testing.T) {
 	cfg := pancakeInstanceConfig{}
-	cfg.FirstInboxMessage = "Thanks for your comment!"
+	cfg.Features.PrivateReply = true
+	cfg.PrivateReplyMessage = "Thanks for your comment!"
 	ch, transport := newChannelWithMultiCapture(t, cfg)
 
-	ch.sendFirstInbox(context.Background(), "user-1", "conv-123")
+	ch.sendPrivateReply(context.Background(), "user-1", "conv-123", "", "")
 
 	transport.mu.Lock()
 	defer transport.mu.Unlock()
@@ -867,7 +1071,9 @@ func TestSendFirstInbox_CustomMessage(t *testing.T) {
 	}
 }
 
-func TestSendFirstInbox_ErrorRetryAllowed(t *testing.T) {
+func TestSendPrivateReply_APIErrorLoggedAndNonBlocking(t *testing.T) {
+	// Stateless: API errors are logged (warn) but do not prevent subsequent
+	// sends. No state to release. Second call still attempts the API.
 	errorTransport := &captureTransport{
 		resp: &http.Response{
 			StatusCode: http.StatusInternalServerError,
@@ -876,26 +1082,53 @@ func TestSendFirstInbox_ErrorRetryAllowed(t *testing.T) {
 		},
 	}
 	cfg := pancakeInstanceConfig{}
-	cfg.FirstInboxMessage = "DM"
+	cfg.Features.PrivateReply = true
+	cfg.PrivateReplyMessage = "DM"
 	msgBus := bus.New()
 	cfg.PageID = "page-123"
 	creds := pancakeCreds{APIKey: "k", PageAccessToken: "t"}
 	ch, _ := New(cfg, creds, msgBus, nil)
 	ch.apiClient.httpClient = &http.Client{Transport: errorTransport}
 
-	// First call: API error → firstInboxSent entry should be deleted (allows retry).
-	ch.sendFirstInbox(context.Background(), "user-1", "conv-123")
-	_, alreadyStored := ch.firstInboxSent.Load("user-1")
-	if alreadyStored {
-		t.Error("firstInboxSent should be deleted on error (allow retry)")
+	ch.sendPrivateReply(context.Background(), "user-1", "conv-123", "", "")
+	if errorTransport.req == nil {
+		t.Fatal("expected first API call to be attempted even when it errors")
 	}
 
-	// Second call: should attempt again (retry allowed).
+	// Second call: still attempts the API — stateless behaviour.
 	secondTransport := &captureTransport{}
 	ch.apiClient.httpClient = &http.Client{Transport: secondTransport}
-	ch.sendFirstInbox(context.Background(), "user-1", "conv-123")
+	ch.sendPrivateReply(context.Background(), "user-1", "conv-123", "", "")
 	if secondTransport.req == nil {
-		t.Error("expected retry request after error-deletion")
+		t.Error("expected retry request after previous failure (stateless, no per-sender dedup)")
+	}
+}
+
+// TestFactoryExplicitPlatformPreserved verifies that explicit platform from config
+// is loaded into the channel and is not overwritten.
+func TestFactoryExplicitPlatformPreserved(t *testing.T) {
+	cfg := json.RawMessage(`{
+		"page_id": "123",
+		"platform": "instagram",
+		"features": {"inbox_reply": true}
+	}`)
+	creds := json.RawMessage(`{
+		"api_key": "test_key",
+		"page_access_token": "test_token"
+	}`)
+	ch, err := Factory("test", creds, cfg, nil, nil)
+	if err != nil {
+		t.Fatalf("Factory failed: %v", err)
+	}
+	pc := ch.(*Channel)
+	if pc.platform != "instagram" {
+		t.Errorf("expected platform instagram from config, got %q", pc.platform)
+	}
+	// Verify auto-detect block condition: ch.platform is already set,
+	// so getPage would NOT be called at Start(). platform should remain "instagram".
+	// (Start() skips GetPage when ch.platform != "")
+	if pc.platform == "" {
+		t.Error("platform must not be empty after Factory with explicit platform config")
 	}
 }
 
@@ -903,12 +1136,12 @@ func TestSendFirstInbox_ErrorRetryAllowed(t *testing.T) {
 func TestCommentFlowEndToEnd(t *testing.T) {
 	cfg := pancakeInstanceConfig{}
 	cfg.Features.CommentReply = true
-	cfg.Features.FirstInbox = true
-	cfg.FirstInboxMessage = "Welcome!"
+	cfg.Features.PrivateReply = true
+	cfg.PrivateReplyMessage = "Welcome!"
 	transport := &multiCaptureTransport{}
 	msgBus := bus.New()
 	cfg.PageID = "page-e2e"
-	creds := pancakeCreds{APIKey: "k", PageAccessToken: "t"}
+	creds := pancakeCreds{APIKey: "k", PageAccessToken: "t", WebhookSecret: "test-secret"}
 	ch, err := New(cfg, creds, msgBus, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -921,6 +1154,7 @@ func TestCommentFlowEndToEnd(t *testing.T) {
 	// Step 1: POST comment webhook.
 	body := buildWebhookBody("page-e2e", "conv-e2e", "COMMENT", "user-e2e", "msg-e2e", "great product!", "")
 	req := httptest.NewRequest(http.MethodPost, webhookPath, strings.NewReader(body))
+	signTestPancakeRequest(req, body, ch.webhookSecret)
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
@@ -942,8 +1176,8 @@ func TestCommentFlowEndToEnd(t *testing.T) {
 
 	// Step 4: Send outbound reply.
 	outMsg := bus.OutboundMessage{
-		ChatID:  inMsg.ChatID,
-		Content: "thank you!",
+		ChatID:   inMsg.ChatID,
+		Content:  "thank you!",
 		Metadata: inMsg.Metadata,
 	}
 	if err := ch.Send(context.Background(), outMsg); err != nil {
@@ -973,9 +1207,10 @@ func TestCommentFlowEndToEnd(t *testing.T) {
 		t.Errorf("second action = %q, want private_reply", actions[1])
 	}
 
-	// Step 6: Second comment from same sender — no second DM.
+	// Step 6: Second comment from same sender — stateless: another DM fires.
 	body2 := buildWebhookBody("page-e2e", "conv-e2e", "COMMENT", "user-e2e", "msg-e2e-2", "another comment", "")
 	req2 := httptest.NewRequest(http.MethodPost, webhookPath, strings.NewReader(body2))
+	signTestPancakeRequest(req2, body2, ch.webhookSecret)
 	w2 := httptest.NewRecorder()
 	router.ServeHTTP(w2, req2)
 
@@ -986,8 +1221,8 @@ func TestCommentFlowEndToEnd(t *testing.T) {
 		t.Fatal("expected second inbound message")
 	}
 	outMsg2 := bus.OutboundMessage{
-		ChatID:  inMsg2.ChatID,
-		Content: "thanks again",
+		ChatID:   inMsg2.ChatID,
+		Content:  "thanks again",
 		Metadata: inMsg2.Metadata,
 	}
 	ch.Send(context.Background(), outMsg2) //nolint:errcheck
@@ -996,8 +1231,9 @@ func TestCommentFlowEndToEnd(t *testing.T) {
 	finalCount := len(transport.reqs)
 	transport.mu.Unlock()
 
-	// 2 (first round) + 1 (second reply_comment only, no second private_reply)
-	if finalCount != 3 {
-		t.Errorf("expected 3 total requests after dedup, got %d", finalCount)
+	// 2 (first round: reply_comment + private_reply) + 2 (second: reply_comment + private_reply)
+	// Stateless — no per-sender dedup. FB's per-comment idempotency handles duplicates platform-side.
+	if finalCount != 4 {
+		t.Errorf("expected 4 total requests (stateless: 2 rounds × (reply + DM)), got %d", finalCount)
 	}
 }

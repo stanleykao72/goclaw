@@ -16,6 +16,11 @@ type TokenCounter interface {
 	// including per-message overhead (role tokens, separators).
 	CountMessages(model string, msgs []providers.Message) int
 
+	// CountToolSchemas returns token count for a slice of tool definitions
+	// serialised as JSON (the form sent to the LLM provider).
+	// Returns 0 for nil or empty slice.
+	CountToolSchemas(model string, tools []providers.ToolDefinition) int
+
 	// ModelContextWindow returns max context tokens for a model.
 	// Falls back to provider default if model unknown.
 	ModelContextWindow(model string) int
@@ -26,8 +31,8 @@ type TokenizerID string
 
 const (
 	TokenizerCL100K   TokenizerID = "cl100k_base" // Claude, GPT-3.5/4
-	TokenizerO200K    TokenizerID = "o200k_base"   // GPT-4o, GPT-5
-	TokenizerFallback TokenizerID = "fallback"      // rune-count / 3
+	TokenizerO200K    TokenizerID = "o200k_base"  // GPT-4o, GPT-5
+	TokenizerFallback TokenizerID = "fallback"    // rune-count / 3
 )
 
 // ModelInfo maps a model name prefix to its tokenizer + context window.
@@ -42,6 +47,7 @@ var DefaultRegistry = map[string]ModelInfo{
 	"claude-":   {TokenizerCL100K, 200_000},
 	"gpt-4o":    {TokenizerO200K, 128_000},
 	"gpt-4":     {TokenizerCL100K, 128_000},
+	"gpt-5.5":   {TokenizerO200K, 1_050_000},
 	"gpt-5":     {TokenizerO200K, 1_000_000},
 	"qwen-":     {TokenizerCL100K, 128_000},
 	"deepseek-": {TokenizerCL100K, 128_000},

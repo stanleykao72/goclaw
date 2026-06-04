@@ -45,4 +45,8 @@ export const ROUTES = {
   SETUP: "/setup",
   BACKUP_RESTORE: "/backup-restore",
   SELECT_TENANT: "/select-tenant",
+  HOOKS: "/hooks",
+  HOOK_DETAIL: "/hooks/:id",
+  WORKSTATIONS: "/workstations",
+  WORKSTATION_DETAIL: "/workstations/:id",
 } as const;

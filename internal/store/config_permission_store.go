@@ -12,16 +12,18 @@ import (
 
 // Config type constants for agent_config_permissions.config_type column.
 const (
-	ConfigTypeFileWriter = "file_writer" // Group file write access
-	ConfigTypeHeartbeat  = "heartbeat"   // Heartbeat config access
-	ConfigTypeCron       = "cron"        // Cron job management access
+	ConfigTypeFileWriter   = "file_writer"   // Group file write access
+	ConfigTypeHeartbeat    = "heartbeat"     // Heartbeat config access
+	ConfigTypeCron         = "cron"          // Cron job management access
+	ConfigTypeContextFiles = "context_files" // Context file write access
+	ConfigTypeWildcard     = "*"             // Any config type
 )
 
 // ConfigPermission represents an allow/deny rule for agent configuration.
 type ConfigPermission struct {
 	ID         uuid.UUID       `json:"id" db:"id"`
 	AgentID    uuid.UUID       `json:"agentId" db:"agent_id"`
-	Scope      string          `json:"scope" db:"scope"`           // "agent" | "group:telegram:-100456" | "group:*" | "*"
+	Scope      string          `json:"scope" db:"scope"`            // "agent" | "group:telegram:-100456" | "group:*" | "*"
 	ConfigType string          `json:"configType" db:"config_type"` // "heartbeat" | "cron" | "context_files" | "file_writer" | "*"
 	UserID     string          `json:"userId" db:"user_id"`
 	Permission string          `json:"permission" db:"permission"` // "allow" | "deny"
@@ -29,6 +31,70 @@ type ConfigPermission struct {
 	Metadata   json.RawMessage `json:"metadata,omitempty" db:"metadata"`
 	CreatedAt  time.Time       `json:"createdAt" db:"created_at"`
 	UpdatedAt  time.Time       `json:"updatedAt" db:"updated_at"`
+}
+
+// ConfigPermissionDecision is a compact, UI-safe explanation of an effective
+// permission check.
+type ConfigPermissionDecision struct {
+	Allowed    bool   `json:"allowed"`
+	AgentID    string `json:"agentId"`
+	Scope      string `json:"scope"`
+	ConfigType string `json:"configType"`
+	UserID     string `json:"userId"`
+	Reason     string `json:"reason"`
+}
+
+// ValidConfigPermission reports whether permission is an accepted value.
+func ValidConfigPermission(permission string) bool {
+	return permission == "allow" || permission == "deny"
+}
+
+// ValidConfigType reports whether configType is supported by the generic
+// agent_config_permissions evaluator.
+func ValidConfigType(configType string) bool {
+	switch configType {
+	case ConfigTypeFileWriter, ConfigTypeHeartbeat, ConfigTypeCron, ConfigTypeContextFiles, ConfigTypeWildcard:
+		return true
+	default:
+		return false
+	}
+}
+
+// ValidConfigScope reports whether scope is understood by the generic
+// agent_config_permissions evaluator and current UI matrix.
+func ValidConfigScope(scope string) bool {
+	return scope == "agent" ||
+		scope == "*" ||
+		scope == "group:*" ||
+		strings.HasPrefix(scope, "group:") ||
+		strings.HasPrefix(scope, "guild:")
+}
+
+// CheckConfigPermissionDecision wraps CheckPermission with a stable response
+// shape that the UI can render before and after granting a rule.
+func CheckConfigPermissionDecision(ctx context.Context, permStore ConfigPermissionStore, agentID uuid.UUID, scope, configType, userID string) (ConfigPermissionDecision, error) {
+	decision := ConfigPermissionDecision{
+		AgentID:    agentID.String(),
+		Scope:      scope,
+		ConfigType: configType,
+		UserID:     userID,
+	}
+	if permStore == nil {
+		decision.Reason = "permission store unavailable"
+		return decision, nil
+	}
+	allowed, err := permStore.CheckPermission(ctx, agentID, scope, configType, userID)
+	if err != nil {
+		decision.Reason = "permission check failed"
+		return decision, err
+	}
+	decision.Allowed = allowed
+	if allowed {
+		decision.Reason = "matched an allow rule"
+	} else {
+		decision.Reason = "no matching allow rule or a deny rule has precedence"
+	}
+	return decision, nil
 }
 
 // ConfigPermissionStore manages agent configuration permissions with wildcard scope matching.
@@ -47,8 +113,19 @@ type ConfigPermissionStore interface {
 
 // CheckFileWriterPermission returns an error if the caller is in a group context
 // and is not a file writer. Returns nil if write is allowed.
-// Fail-open: returns nil on DB errors or missing context (cron, subagent).
-// Replaces the deleted CheckGroupWritePermission / GroupWriterCache.
+//
+// Policy in group/guild context (#915):
+//   - empty SenderID        → DENY  (system turn lost the real user — security gap if allowed)
+//   - synthetic SenderID    → DENY  (subagent:, notification:, teammate:, system:, ticker:, session_send_tool)
+//   - real numeric SenderID → DB lookup; deny if no grant
+//   - missing tenant / DB errors → DENY (permission boundary must fail closed)
+//
+// Outside group/guild context (DM, HTTP, cron-direct): always allow — no per-user
+// writer gate applies.
+//
+// Upstream callers should propagate the real acting sender through wrappers
+// (subagent announce, delegate announce, teammate dispatch) so legitimate
+// re-ingress turns carry the original user's sender.
 func CheckFileWriterPermission(ctx context.Context, permStore ConfigPermissionStore) error {
 	if permStore == nil {
 		return nil
@@ -61,14 +138,24 @@ func CheckFileWriterPermission(ctx context.Context, permStore ConfigPermissionSt
 	if agentID == uuid.Nil {
 		return nil // no agent context
 	}
+	if TenantIDFromContext(ctx) == uuid.Nil {
+		return fmt.Errorf("permission denied: tenant context is required for group file writes")
+	}
+	// RBAC bypass: admin / operator / owner roles are pre-authenticated by
+	// the tenant RBAC system (dashboard users, tenant admins). File-writer
+	// grants exist to gate random group members; authenticated admins
+	// shouldn't trip over them when dispatching work that writes files.
+	if isAdminRole(ctx) {
+		return nil
+	}
 	senderID := SenderIDFromContext(ctx)
-	if senderID == "" {
-		return nil // system context (cron, subagent)
+	if senderID == "" || isSyntheticSender(senderID) {
+		return fmt.Errorf("permission denied: system context cannot write files in group chats. If this is a legitimate user action, ensure the acting sender is preserved through the tool chain")
 	}
 	numericID := strings.SplitN(senderID, "|", 2)[0]
 	allowed, err := permStore.CheckPermission(ctx, agentID, userID, ConfigTypeFileWriter, numericID)
 	if err != nil {
-		return nil // fail-open
+		return fmt.Errorf("permission denied: file writer permission check failed: %w", err)
 	}
 	if !allowed {
 		return fmt.Errorf("permission denied: only file writers can modify files in this group. Use /addwriter to get write access")
@@ -76,9 +163,78 @@ func CheckFileWriterPermission(ctx context.Context, permStore ConfigPermissionSt
 	return nil
 }
 
+// CheckContextFilePermission returns an error if a protected context file write
+// in group/guild context does not have context_files or file_writer access.
+func CheckContextFilePermission(ctx context.Context, permStore ConfigPermissionStore) error {
+	if permStore == nil {
+		return nil
+	}
+	userID := UserIDFromContext(ctx)
+	if !strings.HasPrefix(userID, "group:") && !strings.HasPrefix(userID, "guild:") {
+		return nil
+	}
+	agentID := AgentIDFromContext(ctx)
+	if agentID == uuid.Nil {
+		return nil
+	}
+	if TenantIDFromContext(ctx) == uuid.Nil {
+		return fmt.Errorf("permission denied: tenant context is required for group context file writes")
+	}
+	if isAdminRole(ctx) {
+		return nil
+	}
+	senderID := SenderIDFromContext(ctx)
+	if senderID == "" || isSyntheticSender(senderID) {
+		return fmt.Errorf("permission denied: system context cannot write files in group chats. If this is a legitimate user action, ensure the acting sender is preserved through the tool chain")
+	}
+	numericID := strings.SplitN(senderID, "|", 2)[0]
+
+	allowed, err := permStore.CheckPermission(ctx, agentID, userID, ConfigTypeContextFiles, numericID)
+	if err != nil {
+		return fmt.Errorf("permission denied: context file permission check failed: %w", err)
+	}
+	if allowed {
+		return nil
+	}
+
+	allowed, err = permStore.CheckPermission(ctx, agentID, userID, ConfigTypeFileWriter, numericID)
+	if err != nil {
+		return fmt.Errorf("permission denied: file writer permission check failed: %w", err)
+	}
+	if !allowed {
+		return fmt.Errorf("permission denied: only users with context_files or file_writer permission can modify context files in this group")
+	}
+	return nil
+}
+
+// isAdminRole reports whether ctx carries an elevated RBAC role
+// (admin / operator / owner) that should bypass per-user file-writer
+// grants. Tenant-authenticated identities pre-pass RBAC at the gateway
+// edge; re-checking per-channel grants here is redundant and blocks
+// legitimate dashboard-dispatched work (#915).
+func isAdminRole(ctx context.Context) bool {
+	switch RoleFromContext(ctx) {
+	case "admin", "operator", RoleOwner:
+		return true
+	}
+	return false
+}
+
+// isSyntheticSender reports whether senderID is an internal system component
+// (not a real user). Mirrors bus.IsInternalSender — kept here to avoid the
+// store→bus import dependency. If prefixes change, update both.
+func isSyntheticSender(senderID string) bool {
+	return strings.HasPrefix(senderID, "system:") ||
+		strings.HasPrefix(senderID, "notification:") ||
+		strings.HasPrefix(senderID, "teammate:") ||
+		strings.HasPrefix(senderID, "ticker:") ||
+		strings.HasPrefix(senderID, "subagent:") ||
+		senderID == "session_send_tool"
+}
+
 // CheckCronPermission returns an error if the caller is in a group context
 // and does not have cron or file_writer permission. Returns nil if allowed.
-// Fail-open: returns nil on DB errors or missing context (cron, subagent).
+// Same sender-policy as CheckFileWriterPermission (see that fn's docstring).
 func CheckCronPermission(ctx context.Context, permStore ConfigPermissionStore) error {
 	if permStore == nil {
 		return nil
@@ -91,16 +247,22 @@ func CheckCronPermission(ctx context.Context, permStore ConfigPermissionStore) e
 	if agentID == uuid.Nil {
 		return nil // no agent context
 	}
+	if TenantIDFromContext(ctx) == uuid.Nil {
+		return fmt.Errorf("permission denied: tenant context is required for group cron permissions")
+	}
+	if isAdminRole(ctx) {
+		return nil // RBAC bypass (admin/operator/owner)
+	}
 	senderID := SenderIDFromContext(ctx)
-	if senderID == "" {
-		return nil // system context (cron, subagent)
+	if senderID == "" || isSyntheticSender(senderID) {
+		return fmt.Errorf("permission denied: system context cannot manage cron jobs in group chats")
 	}
 	numericID := strings.SplitN(senderID, "|", 2)[0]
 
 	// Check cron-specific permission first.
 	allowed, err := permStore.CheckPermission(ctx, agentID, userID, ConfigTypeCron, numericID)
 	if err != nil {
-		return nil // fail-open
+		return fmt.Errorf("permission denied: cron permission check failed: %w", err)
 	}
 	if allowed {
 		return nil
@@ -108,7 +270,7 @@ func CheckCronPermission(ctx context.Context, permStore ConfigPermissionStore) e
 	// Fall back to file_writer (implies full mutation access).
 	allowed, err = permStore.CheckPermission(ctx, agentID, userID, ConfigTypeFileWriter, numericID)
 	if err != nil {
-		return nil // fail-open
+		return fmt.Errorf("permission denied: file writer permission check failed: %w", err)
 	}
 	if !allowed {
 		return fmt.Errorf("permission denied: only users with cron or file_writer permission can manage cron jobs in group chats")

@@ -4,9 +4,11 @@ import (
 	"archive/zip"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -22,7 +24,10 @@ import (
 	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
 )
 
-const uploadDepsInstallTimeout = 5 * time.Minute
+const (
+	uploadDepsInstallTimeout = 5 * time.Minute
+	maxUploadManagerAgentIDs = 100
+)
 
 var (
 	installUploadedSkillDeps = skills.InstallDeps
@@ -47,23 +52,39 @@ func (h *SkillsHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
+	managerAgentIDs, err := parseUploadManagerAgentIDs(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidRequest, err.Error())})
+		return
+	}
+
 	// Save to temp file for zip processing
 	tmp, err := os.CreateTemp("", "skill-upload-*.zip")
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": i18n.T(locale, i18n.MsgInternalError, "failed to create temp file")})
 		return
 	}
-	defer os.Remove(tmp.Name())
-	defer tmp.Close()
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
 
 	size, err := io.Copy(tmp, file)
 	if err != nil {
+		tmp.Close()
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": i18n.T(locale, i18n.MsgInternalError, "failed to save upload")})
+		return
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": i18n.T(locale, i18n.MsgInternalError, "failed to finalize upload")})
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": i18n.T(locale, i18n.MsgInternalError, "failed to finalize upload")})
 		return
 	}
 
 	// Open as zip
-	zr, err := zip.OpenReader(tmp.Name())
+	zr, err := zip.OpenReader(tmpName)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidRequest, "invalid ZIP file")})
 		return
@@ -105,6 +126,20 @@ func (h *SkillsHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Security guard: scan for malicious content BEFORE any disk/DB write
+	violations, safe := skills.GuardSkillContent(skillContent)
+	if !safe {
+		slog.Warn("security.skills.upload_rejected",
+			"user_id", userID,
+			"violations", len(violations),
+			"first_rule", violations[0].Reason)
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error":      i18n.T(locale, i18n.MsgInvalidRequest, "skill content failed security scan"),
+			"violations": skills.FormatGuardViolations(violations),
+		})
+		return
+	}
+
 	name, description, slug, frontmatter := skills.ParseSkillFrontmatter(skillContent)
 	if name == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgRequired, "name in SKILL.md frontmatter")})
@@ -139,12 +174,23 @@ func (h *SkillsHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 	// could both pass the hash check before either creates a new version.
 	existingHash, existingVer, skillExists := h.skills.GetSkillHashBySlug(r.Context(), slug)
 	if skillExists && existingHash != "" && existingHash == skillHash {
-		writeJSON(w, http.StatusOK, map[string]any{
+		response := map[string]any{
 			"slug":    slug,
 			"version": existingVer,
 			"name":    name,
 			"status":  "unchanged",
-		})
+		}
+		if len(managerAgentIDs) > 0 {
+			if existing, ok := h.skills.GetSkill(r.Context(), slug); ok && existing.ID != "" {
+				if existingID, err := uuid.Parse(existing.ID); err == nil {
+					grantErrors := h.grantUploadedSkillManagers(r.Context(), existingID, managerAgentIDs, existingVer, userID)
+					if len(grantErrors) > 0 {
+						response["grant_errors"] = grantErrors
+					}
+				}
+			}
+		}
+		writeJSON(w, http.StatusOK, response)
 		return
 	}
 
@@ -158,6 +204,7 @@ func (h *SkillsHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	wroteSkillMD := false
 	for _, f := range zr.File {
 		if f.FileInfo().IsDir() {
 			continue
@@ -179,22 +226,38 @@ func (h *SkillsHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		// Security: prevent path traversal
-		name := filepath.Clean(entryName)
-		if strings.Contains(name, "..") {
+		cleanName := filepath.Clean(entryName)
+		if strings.Contains(cleanName, "..") {
 			continue
 		}
-		destPath := filepath.Join(destDir, name)
+		destPath := filepath.Join(destDir, cleanName)
 		if !strings.HasPrefix(destPath, destDir+string(filepath.Separator)) {
 			continue
 		}
 		if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
-			continue
+			os.RemoveAll(destDir)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": i18n.T(locale, i18n.MsgInternalError, "failed to create skill file directory")})
+			return
 		}
 		data, err := readZipFile(f)
 		if err != nil {
-			continue
+			os.RemoveAll(destDir)
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidRequest, "failed to read ZIP entry")})
+			return
 		}
-		os.WriteFile(destPath, []byte(data), 0644)
+		if err := os.WriteFile(destPath, []byte(data), 0644); err != nil {
+			os.RemoveAll(destDir)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": i18n.T(locale, i18n.MsgInternalError, "failed to write skill files")})
+			return
+		}
+		if cleanName == "SKILL.md" {
+			wroteSkillMD = true
+		}
+	}
+	if !wroteSkillMD {
+		os.RemoveAll(destDir)
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidRequest, "ZIP must contain a writable SKILL.md")})
+		return
 	}
 
 	// Save metadata to DB
@@ -232,9 +295,7 @@ func (h *SkillsHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 			)
 			skill.Status = depState.status
 			skill.MissingDeps = depState.missing
-			for key, value := range depState.response {
-				response[key] = value
-			}
+			maps.Copy(response, depState.response)
 		}
 	}
 
@@ -246,6 +307,12 @@ func (h *SkillsHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	response["id"] = id
+	if len(managerAgentIDs) > 0 {
+		grantErrors := h.grantUploadedSkillManagers(depsCtx, id, managerAgentIDs, version, userID)
+		if len(grantErrors) > 0 {
+			response["grant_errors"] = grantErrors
+		}
+	}
 
 	h.skills.BumpVersion()
 	h.emitCacheInvalidate(bus.CacheKindSkills, id.String(), uuid.Nil)
@@ -254,6 +321,47 @@ func (h *SkillsHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 	depState.emit(h, slug)
 
 	writeJSON(w, http.StatusCreated, response)
+}
+
+func parseUploadManagerAgentIDs(r *http.Request) ([]uuid.UUID, error) {
+	raw := strings.TrimSpace(r.FormValue("manager_agent_ids"))
+	if raw == "" {
+		return nil, nil
+	}
+	var values []string
+	if err := json.Unmarshal([]byte(raw), &values); err != nil {
+		return nil, fmt.Errorf("manager_agent_ids must be a JSON array")
+	}
+	if len(values) > maxUploadManagerAgentIDs {
+		return nil, fmt.Errorf("manager_agent_ids exceeds limit of %d", maxUploadManagerAgentIDs)
+	}
+	out := make([]uuid.UUID, 0, len(values))
+	seen := make(map[uuid.UUID]bool, len(values))
+	for _, value := range values {
+		id, err := uuid.Parse(strings.TrimSpace(value))
+		if err != nil || id == uuid.Nil {
+			return nil, fmt.Errorf("invalid manager_agent_ids value")
+		}
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out, nil
+}
+
+func (h *SkillsHandler) grantUploadedSkillManagers(ctx context.Context, skillID uuid.UUID, agentIDs []uuid.UUID, version int, userID string) []string {
+	if version <= 0 {
+		version = 1
+	}
+	var errs []string
+	for _, agentID := range agentIDs {
+		if err := h.skills.GrantToAgent(ctx, skillID, agentID, version, userID, true); err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", agentID, err))
+		}
+	}
+	return errs
 }
 
 func canAutoInstallUploadedSkillDeps(ctx context.Context) bool {

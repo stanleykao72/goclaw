@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
 
+	"github.com/nextlevelbuilder/goclaw/internal/audio"
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/channels"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/media"
@@ -42,27 +44,35 @@ func (c *Channel) handleMessage(_ *discordgo.Session, m *discordgo.MessageCreate
 		peerKind = "direct"
 	}
 
+	// Pre-compute mention flag for groups so policy gating can suppress
+	// pairing replies when the bot was not addressed.
+	mentioned := false
+	if !isDM {
+		for _, u := range m.Mentions {
+			if u.ID == c.botUserID {
+				mentioned = true
+				break
+			}
+		}
+		if !mentioned && m.ReferencedMessage != nil &&
+			m.ReferencedMessage.Author != nil &&
+			m.ReferencedMessage.Author.ID == c.botUserID {
+			mentioned = true
+		}
+	}
+
 	if isDM {
 		if !c.checkDMPolicy(ctx, senderID, channelID) {
 			return
 		}
 	} else {
-		if !c.checkGroupPolicy(ctx, senderID, channelID) {
+		if !c.checkGroupPolicy(ctx, senderID, channelID, mentioned) {
 			slog.Debug("discord group message rejected by policy",
 				"user_id", senderID,
 				"username", senderName,
 			)
 			return
 		}
-	}
-
-	// Check allowlist (for "open" policy, still apply allowlist if configured)
-	if !c.IsAllowed(senderID) {
-		slog.Debug("discord message rejected by allowlist",
-			"user_id", senderID,
-			"username", senderName,
-		)
-		return
 	}
 
 	// Handle bot commands (writer management, etc.) before further processing.
@@ -113,7 +123,18 @@ func (c *Channel) handleMessage(_ *discordgo.Session, m *discordgo.MessageCreate
 
 			switch mi.Type {
 			case media.TypeAudio, media.TypeVoice:
-				transcript, sttErr := c.transcribeAudio(context.Background(), mi.FilePath)
+				var transcript string
+				var sttErr error
+				if c.audioMgr != nil {
+					sttCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+					res, err := c.audioMgr.Transcribe(sttCtx, audio.STTInput{FilePath: mi.FilePath, MimeType: "audio/ogg"}, audio.STTOptions{})
+					cancel()
+					if err == nil && res != nil {
+						transcript = res.Text
+					} else {
+						sttErr = err
+					}
+				}
 				if sttErr != nil {
 					slog.Warn("discord: STT transcription failed",
 						"type", mi.Type, "error", sttErr,
@@ -137,6 +158,7 @@ func (c *Channel) handleMessage(_ *discordgo.Session, m *discordgo.MessageCreate
 				mediaFiles = append(mediaFiles, bus.MediaFile{
 					Path:     mi.FilePath,
 					MimeType: mi.ContentType,
+					Filename: mi.FileName,
 				})
 			}
 		}
@@ -162,20 +184,8 @@ func (c *Channel) handleMessage(_ *discordgo.Session, m *discordgo.MessageCreate
 
 	// Mention gating: in groups, only respond when bot is @mentioned (default true).
 	// When not mentioned, record message to pending history for later context.
+	// `mentioned` was pre-computed above for policy gating.
 	if peerKind == "group" && c.RequireMention() {
-		mentioned := false
-		for _, u := range m.Mentions {
-			if u.ID == c.botUserID {
-				mentioned = true
-				break
-			}
-		}
-		// Reply to bot's message counts as implicit mention.
-		if !mentioned && m.ReferencedMessage != nil &&
-			m.ReferencedMessage.Author != nil &&
-			m.ReferencedMessage.Author.ID == c.botUserID {
-			mentioned = true
-		}
 		if !mentioned {
 			// Collect media file paths for group history context.
 			var mediaPaths []string
@@ -253,9 +263,11 @@ func (c *Channel) handleMessage(_ *discordgo.Session, m *discordgo.MessageCreate
 			finalContent = annotated
 		}
 		// Collect media from pending history entries (sent before this @mention).
+		// Original filename not retained by CollectMedia; use disk basename so
+		// persistMedia's sanitizer gets a meaningful stem instead of UUID fallback.
 		if histMediaPaths := c.GroupHistory().CollectMedia(channelID); len(histMediaPaths) > 0 {
 			for _, p := range histMediaPaths {
-				mediaFiles = append(mediaFiles, bus.MediaFile{Path: p})
+				mediaFiles = append(mediaFiles, bus.MediaFile{Path: p, Filename: filepath.Base(p)})
 			}
 		}
 	}
@@ -311,12 +323,17 @@ func (c *Channel) handleMessage(_ *discordgo.Session, m *discordgo.MessageCreate
 }
 
 // checkGroupPolicy evaluates the group policy for a sender, with pairing support.
-func (c *Channel) checkGroupPolicy(ctx context.Context, senderID, channelID string) bool {
+// When RequireMention is enabled, pairing replies only fire if the bot was
+// explicitly addressed — otherwise the bot stays silent in the channel.
+func (c *Channel) checkGroupPolicy(ctx context.Context, senderID, channelID string, mentioned bool) bool {
 	result := c.CheckGroupPolicy(ctx, senderID, channelID, c.config.GroupPolicy)
 	switch result {
 	case channels.PolicyAllow:
 		return true
 	case channels.PolicyNeedsPairing:
+		if c.RequireMention() && !mentioned {
+			return false
+		}
 		groupSenderID := fmt.Sprintf("group:%s", channelID)
 		c.sendPairingReply(ctx, groupSenderID, channelID)
 		return false

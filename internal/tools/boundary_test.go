@@ -76,7 +76,11 @@ func TestResolvePath_TraversalBlocked(t *testing.T) {
 
 func TestResolvePath_AbsoluteEscapeBlocked(t *testing.T) {
 	ws := setupWorkspace(t)
-	_, err := resolvePath("/etc/passwd", ws, true)
+	outside := filepath.Join(t.TempDir(), "passwd")
+	if err := os.WriteFile(outside, []byte("secret"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := resolvePath(outside, ws, true)
 	if err == nil {
 		t.Fatal("expected error for absolute path outside workspace, got nil")
 	}
@@ -186,12 +190,13 @@ func TestResolvePath_NonExistentFileInWorkspace(t *testing.T) {
 func TestResolvePath_UnrestrictedAllowsEscape(t *testing.T) {
 	ws := setupWorkspace(t)
 	// restrict=false should allow any path
-	resolved, err := resolvePath("/etc/hosts", ws, false)
+	outside := filepath.Join(t.TempDir(), "hosts")
+	resolved, err := resolvePath(outside, ws, false)
 	if err != nil {
 		t.Fatalf("expected success with restrict=false, got: %v", err)
 	}
-	if resolved != "/etc/hosts" {
-		t.Fatalf("expected /etc/hosts, got: %s", resolved)
+	if resolved != filepath.Clean(outside) {
+		t.Fatalf("expected %s, got: %s", filepath.Clean(outside), resolved)
 	}
 }
 
@@ -322,15 +327,19 @@ func TestResolvePathWithAllowed_TeamWorkspaceAccess(t *testing.T) {
 }
 
 func TestIsPathInside(t *testing.T) {
+	parent := filepath.Join(t.TempDir(), "a", "b")
+	child := filepath.Join(parent, "c")
+	sibling := parent + "c"
+	other := filepath.Join(t.TempDir(), "a", "b")
 	tests := []struct {
 		child, parent string
 		want          bool
 	}{
-		{"/a/b/c", "/a/b", true},
-		{"/a/b", "/a/b", true},
-		{"/a/bc", "/a/b", false}, // not a child, just prefix match
-		{"/a", "/a/b", false},
-		{"/x/y", "/a/b", false},
+		{child, parent, true},
+		{parent, parent, true},
+		{sibling, parent, false}, // not a child, just prefix match
+		{filepath.Dir(parent), parent, false},
+		{other, parent, false},
 	}
 	for _, tt := range tests {
 		got := isPathInside(tt.child, tt.parent)
@@ -348,11 +357,11 @@ func TestIsPathInside_WindowsCaseInsensitive(t *testing.T) {
 		child, parent string
 		want          bool
 	}{
-		{`C:\Workspace\file.txt`, `c:\workspace`, true},       // case mismatch
-		{`c:\workspace\file.txt`, `C:\Workspace`, true},       // reverse case
-		{`C:\WORKSPACE\SUB\FILE`, `c:\workspace`, true},       // all caps child
-		{`D:\other`, `C:\workspace`, false},                   // different drive
-		{`C:\workspaceX\file.txt`, `C:\workspace`, false},     // prefix but not child
+		{`C:\Workspace\file.txt`, `c:\workspace`, true},   // case mismatch
+		{`c:\workspace\file.txt`, `C:\Workspace`, true},   // reverse case
+		{`C:\WORKSPACE\SUB\FILE`, `c:\workspace`, true},   // all caps child
+		{`D:\other`, `C:\workspace`, false},               // different drive
+		{`C:\workspaceX\file.txt`, `C:\workspace`, false}, // prefix but not child
 	}
 	for _, tt := range tests {
 		got := isPathInside(tt.child, tt.parent)
@@ -507,6 +516,111 @@ func TestAllowedWithTeamWorkspace_TenantPathsOnly(t *testing.T) {
 	}
 	if result[0] != "/global/skills" || result[1] != "/tenant/data" {
 		t.Errorf("unexpected result: %v", result)
+	}
+}
+
+func TestAllowedWithTeamWorkspace_TeamRootMerged(t *testing.T) {
+	// Team root should be appended after team workspace so leader/member agents
+	// can read peer-scoped files in the same team without enabling shared mode.
+	ctx := context.Background()
+	base := []string{"/global/skills"}
+	teamWs := "/data/teams/abc/chatA"
+	teamRoot := "/data/teams/abc"
+
+	ctx = WithToolTeamWorkspace(ctx, teamWs)
+	ctx = WithToolTeamRoot(ctx, teamRoot)
+
+	result := allowedWithTeamWorkspace(ctx, base)
+
+	expected := []string{"/global/skills", teamWs, teamRoot}
+	if len(result) != len(expected) {
+		t.Fatalf("expected %d paths, got %d: %v", len(expected), len(result), result)
+	}
+	for i, exp := range expected {
+		if result[i] != exp {
+			t.Errorf("path[%d]: expected %q, got %q", i, exp, result[i])
+		}
+	}
+}
+
+func TestAllowedWriteWithTeamWorkspace_ExcludesTeamRoot(t *testing.T) {
+	// Write variant must NOT include team root — cross-chat writes are blocked
+	// even when reads across the same team are allowed. Shared-mode parity:
+	// when teamWs == teamRoot (shared workspace), writing to teamWs is still
+	// permitted because teamWs is the leaf scope.
+	ctx := context.Background()
+	base := []string{"/global/skills"}
+	teamWs := "/data/teams/abc/chatA"
+	teamRoot := "/data/teams/abc"
+
+	ctx = WithToolTeamWorkspace(ctx, teamWs)
+	ctx = WithToolTeamRoot(ctx, teamRoot)
+
+	writeAllowed := allowedWriteWithTeamWorkspace(ctx, base)
+	readAllowed := allowedWithTeamWorkspace(ctx, base)
+
+	// Read allowed should include team root.
+	if len(readAllowed) != 3 {
+		t.Fatalf("read: expected 3 prefixes, got %d: %v", len(readAllowed), readAllowed)
+	}
+	// Write allowed must NOT include team root.
+	if len(writeAllowed) != 2 {
+		t.Fatalf("write: expected 2 prefixes (base + teamWs), got %d: %v", len(writeAllowed), writeAllowed)
+	}
+	for _, p := range writeAllowed {
+		if p == teamRoot {
+			t.Errorf("write allowed must not include team root %q", teamRoot)
+		}
+	}
+}
+
+func TestAllowedWithTeamWorkspace_TeamRootDeduped(t *testing.T) {
+	// When team root == team workspace (shared-workspace mode), avoid duplicate entry.
+	ctx := context.Background()
+	base := []string{"/global/skills"}
+	same := "/data/teams/abc"
+
+	ctx = WithToolTeamWorkspace(ctx, same)
+	ctx = WithToolTeamRoot(ctx, same)
+
+	result := allowedWithTeamWorkspace(ctx, base)
+
+	if len(result) != 2 {
+		t.Fatalf("expected 2 paths (base + one team path), got %d: %v", len(result), result)
+	}
+	if result[0] != "/global/skills" || result[1] != same {
+		t.Errorf("unexpected result: %v", result)
+	}
+}
+
+func TestResolvePathWithAllowed_TeamRootCrossChatAccess(t *testing.T) {
+	// Reproduces trace 019db4df-c2e2: leader agent in chat scope "chatA" tries to
+	// read a file generated by a teammate under chat scope "chatB" within the
+	// same team. Team root as allowed prefix must permit this cross-chat read.
+	teamRoot := t.TempDir()
+	chatA := filepath.Join(teamRoot, "chatA")
+	chatB := filepath.Join(teamRoot, "chatB", "generated")
+	if err := os.MkdirAll(chatA, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(chatB, 0755); err != nil {
+		t.Fatal(err)
+	}
+	peerFile := filepath.Join(chatB, "v3-02-prompt-mode.png")
+	if err := os.WriteFile(peerFile, []byte("img"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Without team root: leader scoped to chatA cannot reach chatB.
+	_, err := resolvePathWithAllowed(peerFile, chatA, true, nil)
+	if err == nil {
+		t.Fatal("expected error without team root in allowed prefixes, got nil")
+	}
+
+	// With team root as allowed prefix: access granted.
+	_, err = resolvePathWithAllowed(peerFile, chatA, true, []string{teamRoot})
+	if err != nil {
+		t.Fatalf("expected success with team root in allowed prefixes, got: %v", err)
 	}
 }
 

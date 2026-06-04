@@ -10,7 +10,6 @@ export const NO_EMBEDDING_TYPES = new Set([
   "claude_cli",
   "acp",
   "chatgpt_oauth",
-  "suno",
   "anthropic_native",
 ]);
 
@@ -38,7 +37,7 @@ export function routingSignature(routing: ChatGPTOAuthRoutingConfig): string {
   const strategy =
     routing.strategy === "round_robin" || routing.strategy === "priority_order"
       ? routing.strategy
-      : "primary_first";
+      : "priority_order";
   return JSON.stringify({ strategy, extra_provider_names: extras });
 }
 

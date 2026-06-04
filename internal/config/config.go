@@ -50,11 +50,62 @@ type Config struct {
 	Sessions  SessionsConfig  `json:"sessions"`
 	Database  DatabaseConfig  `json:"database"`
 	Tts       TtsConfig       `json:"tts"`
+	Audio     *AudioConfig    `json:"audio,omitempty"` // optional STT/Music defaults (Phase 3/4)
 	Cron      CronConfig      `json:"cron"`
 	Telemetry TelemetryConfig `json:"telemetry"`
 	Tailscale TailscaleConfig `json:"tailscale"`
 	Bindings  []AgentBinding  `json:"bindings,omitempty"`
+	Hooks     HooksConfig     `json:"hooks"`
+	Packages  PackagesConfig  `json:"packages"` // runtime package mgmt (GitHub updater)
 	mu        sync.RWMutex
+}
+
+// PackagesConfig tunes the runtime package update flow (Phase 1: GitHub
+// binaries). GitHubToken is RESERVED for Phase 2 (authenticated rate-limit
+// bump); currently unwired.
+//
+// UpdatesCheckTTL controls how stale the updates cache can get before a
+// GET /v1/packages/updates triggers a background refresh. Encoded as
+// human-readable string (e.g. "1h", "30m") parsed via time.ParseDuration;
+// empty string → default 1h.
+//
+// ScratchDir is the tmp workspace used by the update executor for download
+// + extract + staging before atomic swap. Defaults to "{BinDir}/../tmp" when
+// empty; operators MAY set explicitly to avoid symlink-resolution issues
+// (red-team H6).
+type PackagesConfig struct {
+	GitHubToken     string `json:"github_token,omitempty"`      // Phase 2 stub
+	UpdatesCheckTTL string `json:"updates_check_ttl,omitempty"` // e.g. "1h"
+	ScratchDir      string `json:"scratch_dir,omitempty"`       // abs path
+}
+
+// UpdatesCheckTTLDuration parses UpdatesCheckTTL returning 1h on empty/invalid.
+func (p PackagesConfig) UpdatesCheckTTLDuration() time.Duration {
+	if p.UpdatesCheckTTL == "" {
+		return time.Hour
+	}
+	d, err := time.ParseDuration(p.UpdatesCheckTTL)
+	if err != nil || d <= 0 {
+		return time.Hour
+	}
+	return d
+}
+
+// HooksConfig tunes the script-hook runtime caps. All zero-valued fields fall
+// back to the handlers package defaults (see handlers.NewScriptHandler).
+//
+// ScriptConcurrency bounds the total concurrent script executions per process.
+// ScriptPerTenantConcurrency bounds a single tenant's share of that pool so a
+// runaway tenant cannot starve global slots. ScriptCacheSize caps the LRU of
+// compiled goja programs keyed by (hookID, version).
+//
+// BuiltinDisable names builtin hook IDs (from Phase 04's builtins.yaml) that
+// the operator wants force-disabled at startup — per-deployment escape hatch.
+type HooksConfig struct {
+	ScriptConcurrency          int      `json:"script_concurrency,omitempty"`
+	ScriptPerTenantConcurrency int      `json:"script_per_tenant_concurrency,omitempty"`
+	ScriptCacheSize            int      `json:"script_cache_size,omitempty"`
+	BuiltinDisable             []string `json:"builtin_disable,omitempty"`
 }
 
 // TailscaleConfig configures the optional Tailscale tsnet listener.
@@ -150,10 +201,15 @@ type MemoryFlushConfig struct {
 }
 
 // ContextPruningConfig configures in-memory context pruning of old tool results.
-// Matching TS src/agents/pi-extensions/context-pruning/settings.ts.
-// Mode "cache-ttl": prune when context exceeds softTrimRatio of context window.
+// Matches TS openclaw/src/agents/pi-hooks/context-pruning/settings.ts.
+//
+// Mode "" (default) or "off" → pruning disabled, zero overhead.
+// Mode "cache-ttl" → prune eligible tool results when ratio exceeds softTrimRatio,
+//
+//	gated by provider prompt-cache TTL (see PruneStage).
 type ContextPruningConfig struct {
-	Mode                 string                   `json:"mode,omitempty"`                 // "off" (default), "cache-ttl"
+	Mode                 string                   `json:"mode,omitempty"`                 // "" (default off), "off", "cache-ttl"
+	TTL                  string                   `json:"ttl,omitempty"`                  // cache TTL gate duration (default "5m"), Go duration string e.g. "5m", "30s"
 	KeepLastAssistants   int                      `json:"keepLastAssistants,omitempty"`   // protect last N assistant msgs (default 3)
 	SoftTrimRatio        float64                  `json:"softTrimRatio,omitempty"`        // start soft trim at this % of window (default 0.3)
 	HardClearRatio       float64                  `json:"hardClearRatio,omitempty"`       // start hard clear at this % (default 0.5)
@@ -330,13 +386,13 @@ type ModelPricing struct {
 // When enabled, spans are exported to an OTLP-compatible backend (Jaeger, Tempo, Datadog, etc.)
 // in addition to PostgreSQL storage.
 type TelemetryConfig struct {
-	Enabled      bool                       `json:"enabled,omitempty"`       // enable OTLP export (default false)
-	Endpoint     string                     `json:"endpoint,omitempty"`      // OTLP endpoint (e.g. "localhost:4317", "https://otel.example.com:4318")
-	Protocol     string                     `json:"protocol,omitempty"`      // "grpc" (default) or "http"
-	Insecure     bool                       `json:"insecure,omitempty"`      // skip TLS verification (default false, set true for local dev)
-	ServiceName  string                     `json:"service_name,omitempty"`  // OTEL service name (default "goclaw-gateway")
-	Headers      map[string]string          `json:"headers,omitempty"`       // extra headers (e.g. auth tokens for cloud backends)
-	ModelPricing map[string]*ModelPricing    `json:"model_pricing,omitempty"` // cost per model, key = "provider/model" or just "model"
+	Enabled      bool                     `json:"enabled,omitempty"`       // enable OTLP export (default false)
+	Endpoint     string                   `json:"endpoint,omitempty"`      // OTLP endpoint (e.g. "localhost:4317", "https://otel.example.com:4318")
+	Protocol     string                   `json:"protocol,omitempty"`      // "grpc" (default) or "http"
+	Insecure     bool                     `json:"insecure,omitempty"`      // skip TLS verification (default false, set true for local dev)
+	ServiceName  string                   `json:"service_name,omitempty"`  // OTEL service name (default "goclaw-gateway")
+	Headers      map[string]string        `json:"headers,omitempty"`       // extra headers (e.g. auth tokens for cloud backends)
+	ModelPricing map[string]*ModelPricing `json:"model_pricing,omitempty"` // cost per model, key = "provider/model" or just "model"
 }
 
 // CronConfig configures the cron job system.

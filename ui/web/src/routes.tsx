@@ -96,9 +96,6 @@ const ContactsPage = lazyWithRetry(() =>
 const ActivityPage = lazyWithRetry(() =>
   import("@/pages/activity/activity-page").then((m) => ({ default: m.ActivityPage })),
 );
-const CliCredentialsPage = lazyWithRetry(() =>
-  import("@/pages/cli-credentials/cli-credentials-page").then((m) => ({ default: m.CliCredentialsPage })),
-);
 const ApiKeysPage = lazyWithRetry(() =>
   import("@/pages/api-keys/api-keys-page").then((m) => ({ default: m.ApiKeysPage })),
 );
@@ -113,6 +110,12 @@ const TenantDetailPage = lazyWithRetry(() =>
 );
 const BackupRestorePage = lazyWithRetry(() =>
   import("@/pages/backup-restore/backup-restore-page").then((m) => ({ default: m.BackupRestorePage })),
+);
+const HooksPage = lazyWithRetry(() =>
+  import("@/pages/hooks").then((m) => ({ default: m.HooksPage })),
+);
+const WorkstationsPage = lazyWithRetry(() =>
+  import("@/pages/workstations/workstations-page").then((m) => ({ default: m.WorkstationsPage })),
 );
 const TenantSelectorPage = lazyWithRetry(() =>
   import("@/pages/login/tenant-selector").then((m) => ({ default: m.TenantSelectorPage })),
@@ -172,15 +175,18 @@ export function AppRoutes() {
           <Route path={ROUTES.SKILL_DETAIL} element={<SkillsPage key="detail" />} />
           <Route path={ROUTES.CRON} element={<CronPage key="list" />} />
           <Route path={ROUTES.CRON_DETAIL} element={<CronPage key="detail" />} />
+          <Route path={ROUTES.HOOKS} element={<HooksPage key="list" />} />
+          <Route path={ROUTES.HOOK_DETAIL} element={<HooksPage key="detail" />} />
           {/* Admin-only pages */}
           <Route path={ROUTES.CONFIG} element={<RequireCrossTenant><ConfigPage /></RequireCrossTenant>} />
           <Route path={ROUTES.PROVIDERS} element={<RequireAdmin><ProvidersPage key="list" /></RequireAdmin>} />
           <Route path={ROUTES.PROVIDER_DETAIL} element={<RequireAdmin><ProvidersPage key="detail" /></RequireAdmin>} />
-          <Route path={ROUTES.CLI_CREDENTIALS} element={<RequireAdmin><CliCredentialsPage /></RequireAdmin>} />
+          <Route path={ROUTES.CLI_CREDENTIALS} element={<Navigate to="/packages?tab=cli-credentials" replace />} />
           <Route path={ROUTES.API_KEYS} element={<RequireAdmin><ApiKeysPage /></RequireAdmin>} />
           <Route path={ROUTES.CHANNELS} element={<RequireAdmin><ChannelsPage key="list" /></RequireAdmin>} />
           <Route path={ROUTES.CHANNEL_DETAIL} element={<RequireAdmin><ChannelsPage key="detail" /></RequireAdmin>} />
           <Route path={ROUTES.NODES} element={<RequireAdmin><NodesPage /></RequireAdmin>} />
+          <Route path={ROUTES.WORKSTATIONS} element={<RequireAdmin><WorkstationsPage /></RequireAdmin>} />
           <Route path={ROUTES.LOGS} element={<RequireAdmin><LogsPage /></RequireAdmin>} />
           <Route path={ROUTES.BUILTIN_TOOLS} element={<RequireAdmin><BuiltinToolsPage /></RequireAdmin>} />
           <Route path={ROUTES.MCP} element={<RequireAdmin><MCPPage /></RequireAdmin>} />

@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/mymmrac/telego"
 
+	"github.com/nextlevelbuilder/goclaw/internal/audio"
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/channels"
 	"github.com/nextlevelbuilder/goclaw/internal/config"
@@ -38,11 +39,15 @@ type Channel struct {
 	reactions         sync.Map                    // localKey string → *StatusReactionController
 	threadIDs         sync.Map                    // localKey string → messageThreadID int (for forum topic routing)
 	mentionMode       string             // "strict" (default) or "yield"
+	botDisplayName    string             // bot's first_name from GetMe (e.g. "ViệtBot"); captured once at Start
 	pollCancel        context.CancelFunc // cancels the long polling context
 	pollDone          chan struct{}      // closed when polling goroutine exits
 	handlerWg         sync.WaitGroup     // tracks in-flight handler goroutines for graceful shutdown
 	handlerSem        chan struct{}      // bounded semaphore for concurrent handler goroutines
 	pendingDraftID    sync.Map           // localKey string → int (draftID)
+	audioMgr          *audio.Manager    // unified STT via audio.Manager (nil = no STT)
+	writerHealMu      sync.Mutex         // guards writerHealLastTry for /writers self-heal
+	writerHealLastTry map[string]time.Time // key "chatID|userID" → last attempt timestamp
 	// pairingService, approvedGroups, pairingDebounce, groupHistory, historyLimit, requireMention
 	// are inherited from channels.BaseChannel.
 }
@@ -85,8 +90,9 @@ func WithPendingMessageStore(s store.PendingMessageStore) Option {
 
 // New creates a new Telegram channel from config.
 // pairingSvc is optional (nil = fall back to allowlist only).
+// audioMgr is optional (nil = STT disabled).
 // Optional stores are set via Option functions.
-func New(cfg config.TelegramConfig, msgBus *bus.MessageBus, pairingSvc store.PairingStore, chanOpts ...Option) (*Channel, error) {
+func New(cfg config.TelegramConfig, msgBus *bus.MessageBus, pairingSvc store.PairingStore, audioMgr *audio.Manager, chanOpts ...Option) (*Channel, error) {
 	var botOpts []telego.BotOption
 
 	if cfg.APIServer != "" {
@@ -107,7 +113,13 @@ func New(cfg config.TelegramConfig, msgBus *bus.MessageBus, pairingSvc store.Pai
 	}
 
 	httpClient := &http.Client{
-		Timeout:   60 * time.Second, // Must exceed getUpdates Timeout to avoid long-poll race (#361)
+		// Must exceed getUpdates long-poll Timeout (25s, #361) AND cover the
+		// longest per-attempt media upload. A 60s cap was killing multi-MB
+		// photo uploads on slow networks mid-flight (#628), even when the
+		// per-call ctx deadline was generous. 3 min matches
+		// sendMediaOverallTimeout so a single upload attempt can consume the
+		// full media budget when needed.
+		Timeout:   3 * time.Minute,
 		Transport: transport,
 	}
 	// Apply ForceIPv4 at init if configured (explicit, predictable, no runtime heuristic).
@@ -152,6 +164,7 @@ func New(cfg config.TelegramConfig, msgBus *bus.MessageBus, pairingSvc store.Pai
 		httpClient:  httpClient,
 		transport:   transport,
 		mentionMode: mentionMode,
+		audioMgr:    audioMgr,
 	}
 	ch.SetPairingService(pairingSvc)
 	ch.SetGroupHistory(channels.MakeHistory(channels.TypeTelegram, nil, base.TenantID()))
@@ -177,6 +190,7 @@ func (c *Channel) Start(ctx context.Context) error {
 	username := ""
 	if me != nil {
 		username = me.Username
+		c.botDisplayName = me.FirstName
 	}
 
 	// Create a cancellable context for the polling goroutine.

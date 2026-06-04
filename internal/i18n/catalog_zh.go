@@ -31,6 +31,14 @@ func init() {
 		MsgUserIDRequired:    "user_id 是必填项",
 		MsgMsgRequired:       "消息是必填项",
 
+		// Abort
+		MsgAbortStopped:         "已停止运行",
+		MsgAbortForced:          "已强制中止运行（超过 3 秒宽限期）",
+		MsgAbortAlreadyAborting: "正在中止中",
+		MsgAbortNotFound:        "运行未找到或已结束",
+		MsgAbortUnauthorized:    "无权中止此运行",
+		MsgAbortFailed:          "无法中止运行：%s",
+
 		// Channel instances
 		MsgInvalidChannelType: "Channel类型无效",
 		MsgInstanceNotFound:   "未找到实例",
@@ -65,7 +73,12 @@ func init() {
 		MsgAlreadySummoning:      "Agent正在被召唤中",
 		MsgSummoningUnavailable:  "召唤功能不可用",
 		MsgNoDescription:         "Agent没有可供重新召唤的描述",
+		MsgSummonCancelled:       "已取消召唤",
+		MsgCannotCancel:          "Agent 未处于召唤状态",
 		MsgInvalidPath:           "路径无效",
+
+		// Tenant backup / restore
+		MsgRestoreNewModeRejectsTenantID: "mode=new 会创建新租户；请传 tenant_slug（而非 tenant_id）作为新租户的 slug",
 
 		// Scheduler
 		MsgQueueFull:    "Session队列已满",
@@ -81,12 +94,12 @@ func init() {
 		MsgNotImplemented: "%s 尚未实现",
 
 		// Agent links
-		MsgLinksNotConfigured:   "Agent链接未配置",
-		MsgInvalidDirection:     "方向必须是 outbound、inbound 或 bidirectional",
-		MsgSourceTargetSame:     "源和目标必须是不同的Agent",
-		MsgCannotDelegateOpen:   "无法委派给开放型Agent — 只有预定义Agent才能作为委派目标",
-		MsgNoUpdatesProvided:    "未提供更新内容",
-		MsgInvalidLinkStatus:    "状态必须是 active 或 disabled",
+		MsgLinksNotConfigured: "Agent链接未配置",
+		MsgInvalidDirection:   "方向必须是 outbound、inbound 或 bidirectional",
+		MsgSourceTargetSame:   "源和目标必须是不同的Agent",
+		MsgCannotDelegateOpen: "无法委派给开放型Agent — 只有预定义Agent才能作为委派目标",
+		MsgNoUpdatesProvided:  "未提供更新内容",
+		MsgInvalidLinkStatus:  "状态必须是 active 或 disabled",
 
 		// Teams
 		MsgTeamsNotConfigured:   "团队未配置",
@@ -100,6 +113,7 @@ func init() {
 		// Skills
 		MsgSkillsUpdateNotSupported: "基于文件的Skill不支持 skills.update",
 		MsgCannotResolveSkillID:     "无法解析基于文件的Skill ID",
+		MsgInvalidVisibility:        "无效的 visibility %q：必须为 private 或 public",
 
 		// Logs
 		MsgInvalidLogAction: "action 必须是 'start' 或 'stop'",
@@ -184,5 +198,117 @@ func init() {
 		MsgTenantUserNotFound:  "未找到租户用户",
 		MsgTenantMismatch:      "租户用户不属于此租户",
 		MsgTenantScopeRequired: "此操作需要指定租户范围",
+
+		// TTS / 声音
+		MsgTtsUnknownModel:       "未知的 tts 模型：%s",
+		MsgVoicesListFailed:      "获取声音列表失败：%s",
+		MsgTtsGeminiInvalidVoice: "无效的 Gemini 声音：%s",
+		MsgTtsGeminiSpeakerLimit: "Gemini TTS 最多支持 2 位发言人",
+		MsgTtsGeminiInvalidModel:  "无效的 Gemini TTS 模型：%s",
+		MsgTtsGeminiTextOnly:      "Gemini 拒绝生成音频。请尝试更简单的文本，不要翻译或添加评论。",
+		MsgTtsParamOutOfRange:     "TTS 参数 %q 的值 %v 超出范围 [%v, %v]",
+		MsgTtsParamUnknownKey:     "TTS 参数 %q 不受此提供商支持",
+		MsgTtsMiniMaxVoicesFailed: "获取 MiniMax 声音列表失败：%s",
+
+		// STT
+		MsgSTTAllProvidersFailed:     "所有 STT 提供商均失败",
+		MsgSTTLegacyConfigDeprecated: "旧版 STT 配置已弃用；请迁移至 builtin_tools[stt]",
+		MsgSTTWhatsappPrivacyWarning: "为 WhatsApp 启用 STT 将破坏发送至此 Agent 的语音消息的端对端加密。",
+		MsgVoiceMessageFallback:      "[语音消息]",
+
+		// Webhooks
+		MsgWebhookAuthFailed:              "Webhook 身份验证失败",
+		MsgWebhookHMACInvalid:             "HMAC 签名无效",
+		MsgWebhookHMACTimestampSkew:       "请求时间戳超出可接受窗口",
+		MsgWebhookBearerRequiredHMAC:      "此 Webhook 需要 HMAC 身份验证",
+		MsgWebhookRevoked:                 "Webhook 已被撤销",
+		MsgWebhookKindMismatch:            "请求类型与 Webhook 配置不匹配",
+		MsgWebhookRateLimited:             "超出 Webhook 速率限制",
+		MsgWebhookBodyTooLarge:            "请求正文超出大小限制",
+		MsgWebhookIdempotencyConflict:     "幂等键冲突：请求正文不匹配",
+		MsgWebhookTenantMismatch:          "Webhook 租户不匹配",
+		MsgWebhookAgentNotFound:           "未找到 Webhook 代理",
+		MsgWebhookChannelNotFound:         "未找到 Webhook 频道",
+		MsgWebhookMediaSSRFBlocked:        "媒体 URL 被 SSRF 策略拦截",
+		MsgWebhookMediaTooLarge:           "媒体文件超出大小限制",
+		MsgWebhookMediaMIMEDenied:         "媒体 MIME 类型不被允许",
+		MsgWebhookCallbackURLInvalid:      "回调 URL 无效或被拦截",
+		MsgWebhookLLMTimeout:              "LLM 处理超时",
+		MsgWebhookLaneSaturated:           "Webhook 处理通道已满",
+		MsgWebhookLocalhostOnlyViolation:  "此 Webhook 仅限本地调用",
+		MsgWebhookMediaChannelUnsupported: "频道不支持媒体附件",
+		MsgWebhookIPDenied:                "请求来源不在 IP 白名单中",
+		MsgWebhookEncryptionUnavailable:   "Webhook 加密密钥未配置；请设置 GOCLAW_ENCRYPTION_KEY 以启用 Webhook",
+
+		// Hooks
+		// Workstation
+		MsgWorkstationNotFound:     "未找到工作站：%s",
+		MsgWorkstationKeyExists:    "工作站键已被使用：%s",
+		MsgInvalidBackend:          "无效的后端类型：%s（必须是 ssh|docker）",
+		MsgWorkstationInactive:     "工作站未激活：%s",
+		MsgInvalidMetadataShape:    "%s 后端的元数据无效：%s",
+		MsgWorkstationRequired:     "Agent 未绑定工作站，请提供 workstation_id",
+		MsgWorkstationAccessDenied: "Agent %s 无权访问工作站 %s",
+		MsgBackendNotReady:         "工作站后端未就绪：%s",
+
+		MsgHookInvalidMatcher:          "无效的匹配器正则表达式: %s",
+		MsgHookCommandDisabledStandard: "命令类型钩子仅在 Lite 版本可用",
+		MsgHookPromptRequiresMatcher:   "prompt 钩子必须指定 matcher 或 if_expr(成本失控保护)",
+		MsgHookCircuitBreakerTripped:   "钩子在多次失败后已自动禁用",
+		MsgHookBudgetExceeded:          "租户钩子令牌预算已耗尽",
+		MsgHookPerTurnCapReached:       "单轮钩子调用次数已达上限",
+		MsgHookBuiltinReadOnly:         "内置钩子只读,仅允许切换启用状态",
+
+		// Workstation permissions (Phase 6)
+		MsgWorkstationCmdDenied:    "命令被工作站策略拒绝: %s",
+		MsgWorkstationEnvDenied:    "环境变量被策略拒绝: %s",
+		MsgWorkstationInputInvalid: "命令包含无效字符: %s",
+		MsgWorkstationRateLimit:    "已超过工作站速率限制",
+		MsgWorkstationPermNotFound: "未找到权限条目: %s",
+		// Workstation activity (Phase 7)
+		MsgWorkstationActivityTitle: "近期活动",
+		MsgWorkstationActionExec:    "执行",
+		MsgWorkstationActionDeny:    "拒绝",
+
+		// Package updates (Phase 4+5)
+		MsgPackageNotInstalled:  "软件包 %s 未安装",
+		MsgPackageUpdateLocked:  "软件包 %s 正在被其他请求更新",
+		MsgReleaseNotFound:      "%s 未找到版本 %s",
+		MsgAssetNotFound:        "没有适用于 %s/%s 的文件",
+		MsgChecksumMismatch:     "%s 校验和不匹配",
+		MsgUpdateSwapFailed:     "安装 %s 失败；已恢复旧版本",
+		MsgUpdateManifestDesync: "二进制文件已更新但清单保存失败 — %s 需要手动恢复",
+		MsgUpdateCacheStale:     "更新缓存已过期；请先刷新再应用更新",
+
+		// Grant env validation
+		MsgGrantEnvDeniedKeys:   "不允许的环境变量键：%s",
+		MsgGrantEnvValueInvalid: "无效的环境变量值：%s",
+		MsgGrantEnvTooManyKeys:  "环境变量键过多：最多 50 个",
+		MsgGrantEnvRevealLimit:  "env 查看请求超出速率限制，请稍后再试",
+
+		// Message tool cross-target forward notice
+		MessageCrossTargetForwarded: "📤 已按请求转发至 %s:%q",
+
+		// Package update source labels
+		MsgPackagesUpdatesSourceGithub: "GitHub",
+		MsgPackagesUpdatesSourcePip:    "pip",
+		MsgPackagesUpdatesSourceNpm:    "npm",
+		MsgPackagesUpdatesSourceApk:    "apk",
+
+		// Package update availability messages
+		MsgPackagesUpdatesUnavailablePip: "系统中未安装 pip",
+		MsgPackagesUpdatesUnavailableNpm: "系统中未安装 npm",
+		MsgPackagesUpdatesUnavailableApk: "此系统不可用 apk",
+
+		// Package update failure reasons
+		MsgPackagesUpdatesReasonDependencyConflict: "依赖冲突",
+		MsgPackagesUpdatesReasonPermission:         "权限被拒绝",
+		MsgPackagesUpdatesReasonNetwork:            "网络错误",
+		MsgPackagesUpdatesReasonNotFound:           "未找到软件包",
+		MsgPackagesUpdatesReasonTargetMissing:      "版本不可用",
+		MsgPackagesUpdatesReasonExternallyManaged:  "环境由外部管理",
+		MsgPackagesUpdatesReasonLocked:             "软件包数据库已锁定",
+		MsgPackagesUpdatesReasonDiskFull:           "磁盘已满",
+		MsgPackagesUpdatesReasonHelperUnavailable:  "特权助手不可用",
 	})
 }

@@ -220,6 +220,18 @@ type ProvidersConfig struct {
 	Novita         ProviderConfig  `json:"novita"`          // Novita AI (OpenAI-compatible endpoint)
 	BytePlus       ProviderConfig  `json:"byteplus"`        // BytePlus ModelArk (Seed 2.0)
 	BytePlusCoding ProviderConfig  `json:"byteplus_coding"` // BytePlus ModelArk Coding Plan
+	Vertex         VertexConfig    `json:"vertex"`          // Google Cloud Vertex AI (OAuth2 service account + ADC)
+}
+
+// VertexConfig configures Google Cloud Vertex AI.
+// Credentials precedence: APIKey (inline JSON) > CredentialsFile (path) > ADC (both empty).
+// ProjectID and Region are required; Model optional (defaults to google/gemini-2.0-flash-001).
+type VertexConfig struct {
+	APIKey          string `json:"api_key,omitempty"`          // service account JSON inline (secret — never persist in config.json)
+	CredentialsFile string `json:"credentials_file,omitempty"` // path to service account JSON file
+	ProjectID       string `json:"project_id,omitempty"`
+	Region          string `json:"region,omitempty"`
+	Model           string `json:"model,omitempty"`
 }
 
 // OllamaConfig configures a local (or self-hosted) Ollama instance.
@@ -294,6 +306,9 @@ func (p *ProvidersConfig) APIBaseForType(providerType string) string {
 		return p.BytePlus.APIBase
 	case "byteplus_coding":
 		return p.BytePlusCoding.APIBase
+	case "vertex":
+		// Computed from project+region at registration time; no config-level static base.
+		return ""
 	default:
 		return ""
 	}
@@ -323,7 +338,8 @@ func (c *Config) HasAnyProvider() bool {
 		p.ACP.Binary != "" ||
 		p.Novita.APIKey != "" ||
 		p.BytePlus.APIKey != "" ||
-		p.BytePlusCoding.APIKey != ""
+		p.BytePlusCoding.APIKey != "" ||
+		(p.Vertex.ProjectID != "" && p.Vertex.Region != "")
 }
 
 // QuotaWindow defines request limits per time window. Zero means unlimited.
@@ -371,10 +387,10 @@ type ToolsConfig struct {
 	Allow            []string                    `json:"allow,omitempty"`      // global allow list (tool names or "group:xxx")
 	Deny             []string                    `json:"deny,omitempty"`       // global deny list
 	AlsoAllow        []string                    `json:"alsoAllow,omitempty"`  // additive: adds without removing existing
-	ByProvider       map[string]*ToolPolicySpec  `json:"byProvider,omitempty"` // per-provider overrides
-	ExecApproval     ExecApprovalCfg             `json:"execApproval"`         // exec command approval settings
+	ByProvider       map[string]*ToolPolicySpec  `json:"byProvider,omitempty"`      // per-provider overrides
+	ShellDenyGroups  map[string]bool             `json:"shellDenyGroups,omitempty"` // global shell deny-group toggles (group name -> denied); per-agent overrides win per-key
+	ExecApproval     ExecApprovalCfg             `json:"execApproval"`              // exec command approval settings
 	WebFetch         WebFetchPolicyConfig        `json:"web_fetch"`            // domain policy for URL fetching
-	Web              WebToolsConfig              `json:"web"`
 	Browser          BrowserToolConfig           `json:"browser"`
 	RateLimitPerHour int                         `json:"rate_limit_per_hour,omitempty"` // max tool executions per hour per session (0 = disabled)
 	ScrubCredentials *bool                       `json:"scrub_credentials,omitempty"`   // auto-redact API keys/tokens in tool output (default true)
@@ -430,38 +446,14 @@ type ToolPolicySpec struct {
 	Deny       []string                   `json:"deny,omitempty"`
 	AlsoAllow  []string                   `json:"alsoAllow,omitempty"`
 	ByProvider map[string]*ToolPolicySpec `json:"byProvider,omitempty"`
+	Wait       *WaitToolPolicy            `json:"wait,omitempty"`
 	ToolCallPrefix string `json:"toolCallPrefix,omitempty"` // prefix to strip from model's tool call names before registry lookup
 }
 
-type WebToolsConfig struct {
-	ProviderOrder []string         `json:"provider_order,omitempty"`
-	Exa           ExaConfig        `json:"exa"`
-	Tavily        TavilyConfig     `json:"tavily"`
-	Brave         BraveConfig      `json:"brave"`
-	DuckDuckGo    DuckDuckGoConfig `json:"duckduckgo"`
-}
-
-type ExaConfig struct {
-	Enabled    bool   `json:"enabled"`
-	APIKey     string `json:"api_key"`
-	MaxResults int    `json:"max_results"`
-}
-
-type TavilyConfig struct {
-	Enabled    bool   `json:"enabled"`
-	APIKey     string `json:"api_key"`
-	MaxResults int    `json:"max_results"`
-}
-
-type BraveConfig struct {
-	Enabled    bool   `json:"enabled"`
-	APIKey     string `json:"api_key"`
-	MaxResults int    `json:"max_results"`
-}
-
-type DuckDuckGoConfig struct {
-	Enabled    bool `json:"enabled"`
-	MaxResults int  `json:"max_results"`
+// WaitToolPolicy configures per-agent safety bounds for the wait tool.
+type WaitToolPolicy struct {
+	MinMs int `json:"min_ms,omitempty"`
+	MaxMs int `json:"max_ms,omitempty"`
 }
 
 // SessionsConfig controls session behavior.
@@ -475,7 +467,7 @@ type SessionsConfig struct {
 // TtsConfig configures text-to-speech.
 // Matching TS src/config/types.tts.ts.
 type TtsConfig struct {
-	Provider   string              `json:"provider,omitempty"`   // "openai", "elevenlabs", "edge", "minimax"
+	Provider   string              `json:"provider,omitempty"`   // "openai", "elevenlabs", "edge", "minimax", "gemini"
 	Auto       string              `json:"auto,omitempty"`       // "off" (default), "always", "inbound", "tagged"
 	Mode       string              `json:"mode,omitempty"`       // "final" (default), "all"
 	MaxLength  int                 `json:"max_length,omitempty"` // max text length before truncation (default 1500)
@@ -484,6 +476,16 @@ type TtsConfig struct {
 	ElevenLabs TtsElevenLabsConfig `json:"elevenlabs"`
 	Edge       TtsEdgeConfig       `json:"edge"`
 	MiniMax    TtsMiniMaxConfig    `json:"minimax"`
+	Gemini     TtsGeminiConfig     `json:"gemini"`
+}
+
+// TtsGeminiConfig configures the Google Gemini TTS provider.
+type TtsGeminiConfig struct {
+	APIKey   string `json:"api_key,omitempty"`  // required; encrypted at rest
+	APIBase  string `json:"api_base,omitempty"` // custom endpoint (optional; SSRF-gated)
+	Voice    string `json:"voice,omitempty"`    // default "Kore"
+	Model    string `json:"model,omitempty"`    // default "gemini-2.5-flash-preview-tts"
+	Speakers string `json:"speakers,omitempty"` // JSON-encoded []SpeakerVoice for multi-speaker mode
 }
 
 // TtsOpenAIConfig configures the OpenAI TTS provider.

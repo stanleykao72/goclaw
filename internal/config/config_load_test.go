@@ -24,9 +24,7 @@ func TestDefault_SensibleDefaults(t *testing.T) {
 	if cfg.Agents.Defaults.MaxToolIterations != DefaultMaxIterations {
 		t.Fatalf("default max iterations: got %d", cfg.Agents.Defaults.MaxToolIterations)
 	}
-	if cfg.Tools.Web.DuckDuckGo.MaxResults != 5 {
-		t.Fatalf("default ddg max results: got %d", cfg.Tools.Web.DuckDuckGo.MaxResults)
-	}
+
 }
 
 // --- Load with missing file → uses defaults ---
@@ -115,6 +113,39 @@ func TestLoad_EnvVarOverrides_InvalidPort(t *testing.T) {
 	// Invalid port should keep default
 	if cfg.Gateway.Port != 18790 {
 		t.Fatalf("invalid port env should keep default: got %d", cfg.Gateway.Port)
+	}
+}
+
+func TestValidateGatewayAuthRejectsExternalNoToken(t *testing.T) {
+	cfg := Default()
+	cfg.Gateway.Host = "0.0.0.0"
+	cfg.Gateway.Token = ""
+	t.Setenv(GatewayAllowInsecureNoAuthEnv, "")
+
+	if err := ValidateGatewayAuth(cfg.Gateway); err == nil {
+		t.Fatal("expected external bind with empty gateway token to fail")
+	}
+}
+
+func TestValidateGatewayAuthAllowsLoopbackNoToken(t *testing.T) {
+	cfg := Default()
+	cfg.Gateway.Host = "127.0.0.1"
+	cfg.Gateway.Token = ""
+	t.Setenv(GatewayAllowInsecureNoAuthEnv, "")
+
+	if err := ValidateGatewayAuth(cfg.Gateway); err != nil {
+		t.Fatalf("loopback no-token mode should be allowed: %v", err)
+	}
+}
+
+func TestValidateGatewayAuthAllowsExplicitInsecureOptIn(t *testing.T) {
+	cfg := Default()
+	cfg.Gateway.Host = "0.0.0.0"
+	cfg.Gateway.Token = ""
+	t.Setenv(GatewayAllowInsecureNoAuthEnv, "1")
+
+	if err := ValidateGatewayAuth(cfg.Gateway); err != nil {
+		t.Fatalf("explicit insecure opt-in should allow no-token mode: %v", err)
 	}
 }
 

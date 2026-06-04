@@ -48,6 +48,42 @@ func TestEnsureSchema_FreshDB(t *testing.T) {
 			t.Errorf("vault_documents missing column %q", want)
 		}
 	}
+
+	for _, table := range []string{"hooks", "hook_agents"} {
+		var count int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&count); err != nil {
+			t.Fatalf("lookup %s table: %v", table, err)
+		}
+		if count != 1 {
+			t.Errorf("fresh schema missing %q table", table)
+		}
+	}
+}
+
+func TestEnsureSchema_PreHooksUpgradeCreatesHookTables(t *testing.T) {
+	db := openTestDBAtVersion(t, 19)
+	for _, table := range []string{"tenant_hook_budget", "hook_executions", "hook_agents", "hooks"} {
+		if _, err := db.Exec(`DROP TABLE IF EXISTS ` + table); err != nil {
+			t.Fatalf("drop %s: %v", table, err)
+		}
+	}
+	if _, err := db.Exec(`UPDATE schema_version SET version = 19`); err != nil {
+		t.Fatalf("set pre-hooks schema version: %v", err)
+	}
+
+	if err := EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema (pre-hooks to current) failed: %v", err)
+	}
+
+	for _, table := range []string{"hooks", "hook_agents"} {
+		var count int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&count); err != nil {
+			t.Fatalf("lookup %s table: %v", table, err)
+		}
+		if count != 1 {
+			t.Errorf("upgrade schema missing %q table", table)
+		}
+	}
 }
 
 // TestEnsureSchema_MigrationV11Only verifies migrations from v11 onward
@@ -122,6 +158,80 @@ func TestEnsureSchema_MigrationV11_SeedsAgentFiles(t *testing.T) {
 	db.QueryRow("SELECT COUNT(*) FROM agent_context_files WHERE file_name = 'AGENTS_MINIMAL.md'").Scan(&minCount)
 	if minCount != 0 {
 		t.Errorf("AGENTS_MINIMAL.md count = %d, want 0 (should be deleted)", minCount)
+	}
+}
+
+// TestSQLiteSchemaUpgrade_23_to_24 verifies the v23→24 migration creates both
+// scope-consistency triggers on an existing DB.
+func TestSQLiteSchemaUpgrade_23_to_24(t *testing.T) {
+	db := openTestDBAtVersion(t, 23)
+
+	if err := EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema (v23→24) failed: %v", err)
+	}
+
+	var version int
+	db.QueryRow("SELECT version FROM schema_version LIMIT 1").Scan(&version)
+	if version != SchemaVersion {
+		t.Errorf("schema version = %d, want %d", version, SchemaVersion)
+	}
+
+	// Verify both triggers exist in sqlite_master.
+	for _, trigName := range []string{
+		"trg_vault_docs_scope_consistency_ins",
+		"trg_vault_docs_scope_consistency_upd",
+	} {
+		var count int
+		db.QueryRow(
+			`SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name=?`, trigName,
+		).Scan(&count)
+		if count != 1 {
+			t.Errorf("trigger %q not found after migration", trigName)
+		}
+	}
+}
+
+// TestSQLiteVaultStore_UpsertTriggerEnforcesCheck verifies the v24 triggers
+// fire on both the INSERT path and the UPDATE path (UPSERT ON CONFLICT).
+func TestSQLiteVaultStore_UpsertTriggerEnforcesCheck(t *testing.T) {
+	db := openTestDB(t)
+	if err := EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	// Seed required FK rows: tenant + agent.
+	tenantID := "00000000-0000-0000-0000-000000000001"
+	agentID := "00000000-0000-0000-0000-000000000002"
+	db.Exec(`INSERT INTO tenants (id, name, slug, status) VALUES (?, 'T', 't', 'active')`, tenantID)
+	db.Exec(`INSERT INTO agents (id, agent_key, display_name, status, tenant_id, owner_id, model, provider)
+		VALUES (?, 'agt', 'A', 'active', ?, 'owner', 'gpt-4o', 'openai')`, agentID, tenantID)
+
+	// 1. Valid INSERT (personal + agent_id set) must succeed.
+	_, err := db.Exec(
+		`INSERT INTO vault_documents (id, tenant_id, agent_id, team_id, scope, path, path_basename, title, doc_type, content_hash)
+		 VALUES ('doc-1', ?, ?, NULL, 'personal', '/a/b.md', 'b.md', 'T', 'note', 'h1')`,
+		tenantID, agentID)
+	if err != nil {
+		t.Fatalf("valid INSERT failed: %v", err)
+	}
+
+	// 2. Invalid fresh INSERT (personal + agent_id NULL) must abort.
+	_, err = db.Exec(
+		`INSERT INTO vault_documents (id, tenant_id, agent_id, team_id, scope, path, path_basename, title, doc_type, content_hash)
+		 VALUES ('doc-2', ?, NULL, NULL, 'personal', '/a/c.md', 'c.md', 'T2', 'note', 'h2')`,
+		tenantID)
+	if err == nil {
+		t.Fatal("expected INSERT to fail scope_consistency check, but it succeeded")
+	}
+
+	// 3. UPSERT that would make scope inconsistent must abort on UPDATE path.
+	_, err = db.Exec(
+		`INSERT INTO vault_documents (id, tenant_id, agent_id, team_id, scope, path, path_basename, title, doc_type, content_hash)
+		 VALUES ('doc-1', ?, NULL, NULL, 'personal', '/a/b.md', 'b.md', 'T-upd', 'note', 'h1')
+		 ON CONFLICT(id) DO UPDATE SET agent_id = NULL, scope = 'personal'`,
+		tenantID)
+	if err == nil {
+		t.Fatal("expected UPSERT to fail scope_consistency check on UPDATE path, but it succeeded")
 	}
 }
 
@@ -254,6 +364,13 @@ func openTestDBAtVersion(t *testing.T, targetVersion int) *sql.DB {
 			expires_at TEXT, promoted_at TEXT)`)
 		db.Exec(`INSERT INTO episodic_summaries SELECT * FROM episodic_summaries_old`)
 		db.Exec(`DROP TABLE episodic_summaries_old`)
+	}
+
+	if targetVersion < 25 {
+		// Migration 24→25 adds vault_documents.chat_id + idx_vault_docs_team_chat.
+		// Drop both so the migration's ALTER TABLE / CREATE INDEX succeed.
+		db.Exec(`DROP INDEX IF EXISTS idx_vault_docs_team_chat`)
+		db.Exec(`ALTER TABLE vault_documents DROP COLUMN chat_id`)
 	}
 
 	// Set version back to target.

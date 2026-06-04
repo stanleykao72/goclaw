@@ -26,7 +26,7 @@ func NewCodexAdapter(cfg ProviderConfig) (ProviderAdapter, error) {
 
 	model := cfg.Model
 	if model == "" {
-		model = "gpt-5.4"
+		model = DefaultCodexModel
 	}
 
 	var ts TokenSource
@@ -52,7 +52,8 @@ func (a *CodexAdapter) Capabilities() ProviderCapabilities {
 		Thinking:         true,
 		Vision:           true,
 		CacheControl:     false,
-		MaxContextWindow: 1_000_000,
+		ImageGeneration:  true, // Codex (OpenAI Responses API) supports native image_generation tool
+		MaxContextWindow: 1_050_000,
 		TokenizerID:      "o200k_base",
 	}
 }

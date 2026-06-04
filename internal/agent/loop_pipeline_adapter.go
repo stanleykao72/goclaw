@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 
+	"github.com/nextlevelbuilder/goclaw/internal/config"
 	"github.com/nextlevelbuilder/goclaw/internal/eventbus"
 	"github.com/nextlevelbuilder/goclaw/internal/memory"
 	"github.com/nextlevelbuilder/goclaw/internal/pipeline"
@@ -26,6 +27,10 @@ func (l *Loop) runViaPipeline(ctx context.Context, req RunRequest) (*RunResult, 
 	provider := l.provider
 	if req.ProviderOverride != nil {
 		provider = req.ProviderOverride
+	} else if req.ModelOverride != "" {
+		if fallback, ok := provider.(interface{ PrimaryProvider() providers.Provider }); ok {
+			provider = fallback.PrimaryProvider()
+		}
 	}
 
 	p := pipeline.NewDefaultPipeline(deps)
@@ -50,12 +55,14 @@ func (l *Loop) buildPipelineDeps(req *RunRequest, bridgeRS *runState) pipeline.P
 	return pipeline.PipelineDeps{
 		TokenCounter: tokencount.NewTiktokenCounter(),
 		EventBus:     l.domainBus,
+		Hooks:        l.hookDispatcher,
 		Config: pipeline.PipelineConfig{
 			MaxIterations:      maxIter,
 			MaxToolCalls:       l.maxToolCalls,
 			CheckpointInterval: 5,
 			ContextWindow:      l.contextWindow,
 			MaxTokens:          l.effectiveMaxTokens(),
+			ReserveTokens:      l.resolveReserveTokens(),
 			Compaction:         l.compactionCfg,
 			// V3 memory/retrieval flags removed — always true at runtime.
 		},
@@ -111,7 +118,21 @@ func (l *Loop) buildPipelineDeps(req *RunRequest, bridgeRS *runState) pipeline.P
 
 		// Prune callbacks
 		PruneMessages:   cb.pruneMessages,
+		SanitizeHistory: cb.sanitizeHistory,
 		CompactMessages: cb.compactMessages,
+
+		// Cache-TTL gate callbacks (Phase 06)
+		GetProviderCaps: func() providers.ProviderCapabilities {
+			if ca, ok := l.provider.(providers.CapabilitiesAware); ok {
+				return ca.Capabilities()
+			}
+			return providers.ProviderCapabilities{}
+		},
+		GetPruningConfig: func() *config.ContextPruningConfig {
+			return l.contextPruningCfg
+		},
+		GetCacheTouch:    l.cacheTouchAt,
+		MarkCacheTouched: l.markCacheTouched,
 
 		// Memory flush
 		RunMemoryFlush: cb.runMemoryFlush,
@@ -120,7 +141,10 @@ func (l *Loop) buildPipelineDeps(req *RunRequest, bridgeRS *runState) pipeline.P
 		ExecuteToolCall:   cb.executeToolCall,
 		ExecuteToolRaw:    cb.executeToolRaw,
 		ProcessToolResult: cb.processToolResult,
-		CheckReadOnly:     cb.checkReadOnly,
+		SequentialToolCall: func(tc providers.ToolCall) bool {
+			return l.resolveToolCallName(tc.Name) == "wait"
+		},
+		CheckReadOnly: cb.checkReadOnly,
 
 		// Observe: drain InjectCh
 		DrainInjectCh: func() []providers.Message {
@@ -143,6 +167,7 @@ func (l *Loop) buildPipelineDeps(req *RunRequest, bridgeRS *runState) pipeline.P
 
 		// Checkpoint + Finalize
 		FlushMessages:          cb.flushMessages,
+		PersistAssistantImages: persistAssistantImages,
 		SkillPostscript:        l.makeSkillPostscript(),
 		SanitizeContent:        cb.sanitizeContent,
 		StripMessageDirectives: StripMessageDirectives,
@@ -228,6 +253,7 @@ func convertRunResult(pr *pipeline.RunResult) *RunResult {
 			ContentType: m.ContentType,
 			Size:        m.Size,
 			AsVoice:     m.AsVoice,
+			Prompt:      m.Prompt,
 		}
 	}
 	return &RunResult{

@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "GoClaw Gateway API",
-    "description": "PostgreSQL multi-tenant AI agent gateway with WebSocket RPC + HTTP API.\n\n## Authentication\n\nAll endpoints require a Bearer token in the `Authorization` header:\n\n```\nAuthorization: Bearer <gateway-token-or-api-key>\n```\n\nYou can use either the **gateway token** (grants admin access) or an **API key** created via the API Keys endpoints (grants scoped access).\n\nIf no token is configured on the server, authentication is disabled (backward compatibility).\n\n## Common Headers\n\n| Header | Description |\n|--------|-------------|\n| `X-GoClaw-User-Id` | External user ID for multi-tenant context |\n| `X-GoClaw-Agent-Id` | Target agent ID (alternative to model prefix) |\n| `X-GoClaw-Tenant-Id` | Tenant scope — UUID or slug (gateway token / cross-tenant API keys) |\n| `Accept-Language` | Locale for error messages (`en`, `vi`, `zh`) |\n\n## WebSocket Protocol\n\nConnect via `POST /ws` (upgrade). Protocol v3 uses frame types: `req`, `res`, `event`.\nFirst request must be `connect` with `{\"token\": \"...\", \"user_id\": \"...\", \"locale\": \"en\"}`.",
+    "description": "PostgreSQL multi-tenant AI agent gateway with WebSocket RPC + HTTP API.\n\n## Authentication\n\nAll endpoints require a Bearer token in the `Authorization` header:\n\n```\nAuthorization: Bearer <gateway-token-or-api-key>\n```\n\nYou can use either the **gateway token** (grants admin access) or an **API key** created via the API Keys endpoints (grants scoped access).\n\nIf no gateway token is configured, empty-token admin access is limited to loopback local development or explicit `GOCLAW_ALLOW_INSECURE_NO_AUTH=1`; externally reachable deployments require `GOCLAW_GATEWAY_TOKEN`.\n\n## Common Headers\n\n| Header | Description |\n|--------|-------------|\n| `X-GoClaw-User-Id` | External user ID for multi-tenant context |\n| `X-GoClaw-Agent-Id` | Target agent ID (alternative to model prefix) |\n| `X-GoClaw-Tenant-Id` | Tenant scope — UUID or slug (gateway token / cross-tenant API keys) |\n| `Accept-Language` | Locale for error messages (`en`, `vi`, `zh`) |\n\n## WebSocket Protocol\n\nConnect via `POST /ws` (upgrade). Protocol v3 uses frame types: `req`, `res`, `event`.\nFirst request must be `connect` with `{\"token\": \"...\", \"user_id\": \"...\", \"locale\": \"en\"}`.",
     "version": "0.2.0",
     "contact": {
       "name": "GoClaw",
@@ -373,7 +373,7 @@
                   "type": "object",
                   "required": ["strategy", "pool_providers", "stats_sample_size", "provider_counts", "recent_requests"],
                   "properties": {
-                    "strategy": { "type": "string", "enum": ["primary_first", "round_robin", "priority_order"] },
+                    "strategy": { "type": "string", "enum": ["round_robin", "priority_order"] },
                     "pool_providers": {
                       "type": "array",
                       "items": { "type": "string" }
@@ -543,9 +543,9 @@
       "post": {
         "tags": ["Providers"],
         "summary": "Verify provider connection",
-        "description": "Test provider connectivity with a minimal LLM call.",
+        "description": "Empty body or omitted model = ping mode (provider registered/reachable check). With model = full chat-verify against the upstream provider.",
         "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
-        "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "model": { "type": "string" } } } } } },
+        "requestBody": { "required": false, "content": { "application/json": { "schema": { "type": "object", "properties": { "model": { "type": "string", "description": "Optional. Omit (or send empty body) for ping mode." } } } } } },
         "responses": { "200": { "description": "Verification result", "content": { "application/json": { "schema": { "type": "object", "properties": { "valid": { "type": "boolean" }, "error": { "type": "string" } } } } } } }
       }
     },
@@ -887,42 +887,35 @@
           "provider": { "type": "string", "description": "LLM provider name" },
           "model": { "type": "string", "description": "Model ID" },
                   "system_prompt": { "type": "string" },
-                  "other_config": {
-                    "type": "object",
-                    "description": "Optional per-agent JSON config.",
-                    "properties": {
-                      "thinking_level": {
-                        "type": "string",
-                        "enum": ["off", "low", "medium", "high"],
-                        "description": "Legacy coarse reasoning shim. Unset means off."
-                      },
-                      "reasoning": {
-                        "type": "object",
-                        "description": "Capability-aware reasoning policy for GPT-5/Codex models.",
-                        "properties": {
-                          "override_mode": {
-                            "type": "string",
-                            "enum": ["inherit", "custom"]
-                          },
-                          "effort": {
-                            "type": "string",
-                            "enum": ["off", "auto", "none", "minimal", "low", "medium", "high", "xhigh"]
-                          },
-                          "fallback": {
-                            "type": "string",
-                            "enum": ["downgrade", "off", "provider_default"]
-                          }
-                        }
-                      },
-                      "chatgpt_oauth_routing": {
-                        "type": "object",
-                        "description": "Optional agent-side routing override for ChatGPT OAuth providers. The main provider field remains the preferred/default account, while provider settings may supply inherited defaults.",
-                "properties": {
-                  "override_mode": { "type": "string", "enum": ["inherit", "custom"] },
-                  "strategy": { "type": "string", "enum": ["manual", "primary_first", "round_robin", "priority_order"] },
-                  "extra_provider_names": { "type": "array", "items": { "type": "string" } }
-                }
+          "other_config": {
+            "type": "object",
+            "description": "Optional legacy/extensibility bag. Do not nest reasoning or Codex routing here in new writes."
+          },
+          "reasoning_config": {
+            "type": "object",
+            "description": "Capability-aware reasoning policy for GPT-5/Codex models.",
+            "properties": {
+              "override_mode": {
+                "type": "string",
+                "enum": ["inherit", "custom"]
+              },
+              "effort": {
+                "type": "string",
+                "enum": ["off", "auto", "none", "minimal", "low", "medium", "high", "xhigh"]
+              },
+              "fallback": {
+                "type": "string",
+                "enum": ["downgrade", "off", "provider_default"]
               }
+            }
+          },
+          "chatgpt_oauth_routing": {
+            "type": "object",
+            "description": "Optional agent-side routing override for ChatGPT OAuth providers. The main provider field remains the preferred/default account, while provider settings may supply inherited defaults.",
+            "properties": {
+              "override_mode": { "type": "string", "enum": ["inherit", "custom"] },
+              "strategy": { "type": "string", "enum": ["round_robin", "priority_order"] },
+              "extra_provider_names": { "type": "array", "items": { "type": "string" } }
             }
           }
         }
@@ -933,7 +926,7 @@
         "properties": {
           "name": { "type": "string", "description": "Unique provider slug" },
           "display_name": { "type": "string" },
-          "provider_type": { "type": "string", "enum": ["anthropic_native", "openai_compat", "gemini_native", "openrouter", "groq", "deepseek", "mistral", "xai", "minimax_native", "cohere", "perplexity", "dashscope", "bailian", "chatgpt_oauth", "claude_cli", "suno", "yescale", "zai", "zai_coding", "ollama", "ollama_cloud", "acp"] },
+          "provider_type": { "type": "string", "enum": ["anthropic_native", "openai_compat", "gemini_native", "openrouter", "groq", "deepseek", "mistral", "xai", "minimax_native", "cohere", "perplexity", "dashscope", "bailian", "chatgpt_oauth", "claude_cli", "yescale", "zai", "zai_coding", "ollama", "ollama_cloud", "acp"] },
           "api_base": { "type": "string" },
           "api_key": { "type": "string" },
           "enabled": { "type": "boolean", "default": true },
@@ -959,7 +952,7 @@
                 "properties": {
                   "strategy": {
                     "type": "string",
-                    "enum": ["manual", "primary_first", "round_robin", "priority_order"]
+                    "enum": ["round_robin", "priority_order"]
                   },
                   "extra_provider_names": {
                     "type": "array",
