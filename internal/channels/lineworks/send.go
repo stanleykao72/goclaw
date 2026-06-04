@@ -50,6 +50,17 @@ func (c *Channel) Send(ctx context.Context, msg bus.OutboundMessage) error {
 		return nil
 	}
 
+	// In a group, prefix the reply with a mention of the most recent asker so
+	// the reply notifies + addresses them. The <m userId="..."> tag is appended
+	// AFTER formatForLineWorks so it reaches LINE WORKS verbatim (renders @name).
+	if channelID != "" && text != "" {
+		if v, ok := c.groupLastSender.Load(msg.ChatID); ok {
+			if uid, _ := v.(string); uid != "" {
+				text = "<m userId=\"" + uid + "\"> " + text
+			}
+		}
+	}
+
 	if text != "" {
 		chunks := splitMessage(text, maxTextLength)
 		if len(chunks) > maxSendChunks {
@@ -132,6 +143,13 @@ func (c *Channel) routePeer(chatID string, metadata map[string]string) (userID, 
 		if uid := metadata[metaUserID]; uid != "" {
 			return uid, ""
 		}
+	}
+	// No inbound metadata (the common agent-reply path: the bus delivers an
+	// OutboundMessage carrying only ChatID). Fall back to the remembered peer
+	// kind so group replies route to the channel endpoint — without this a
+	// group chatID is mis-sent to /users/{id} and rejected (HTTP 400).
+	if _, ok := c.groupChats.Load(chatID); ok {
+		return "", chatID
 	}
 	return chatID, ""
 }

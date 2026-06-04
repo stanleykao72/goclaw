@@ -100,7 +100,10 @@ func peerOf(src callbackSource) (chatID, peerKind string) {
 // interpret ev.Data (TOP-LEVEL per the callback contract) and drive their own
 // state machine (待辦/日報 flow).
 func (c *Channel) handlePostback(ev callbackEvent) {
-	chatID, _ := peerOf(ev.Source)
+	chatID, peerKind := peerOf(ev.Source)
+	if peerKind == peerGroup {
+		c.groupChats.Store(chatID, struct{}{})
+	}
 	c.fanOutPostback(PostbackEvent{
 		UserID:    ev.Source.UserID,
 		ChatID:    chatID,
@@ -113,6 +116,12 @@ func (c *Channel) handlePostback(ev callbackEvent) {
 // for text, then forward to the bus via HandleMessage for the agent path.
 func (c *Channel) handleMessageEvent(ev callbackEvent) {
 	chatID, peerKind := peerOf(ev.Source)
+	if peerKind == peerGroup {
+		c.groupChats.Store(chatID, struct{}{})
+		if ev.Source.UserID != "" {
+			c.groupLastSender.Store(chatID, ev.Source.UserID)
+		}
+	}
 	senderID := senderPrefix + ev.Source.UserID
 
 	// Policy check — same gate as the line channel (DM allowlist / group
@@ -131,6 +140,26 @@ func (c *Channel) handleMessageEvent(ev callbackEvent) {
 	}
 
 	text := ev.Content.Text
+
+	// Gate: a synchronous access check that runs before plugins and the agent.
+	// A deny blocks the message entirely and (optionally) replies a hint, so an
+	// unrecognized sender reaches neither the workflow hooks nor the agent.
+	if c.gate != nil {
+		gateEv := TextEvent{UserID: ev.Source.UserID, ChatID: chatID, ChannelID: ev.Source.ChannelID, Text: text}
+		allow, reply := c.gate.Gate(c.hookContext(), gateEv)
+		// A reply (block hint, DM-bind prompt, or bind-success confirmation) is
+		// sent whenever present — including when allow=true (success → still
+		// proceeds to the agent).
+		if reply != "" {
+			if err := c.SendText(c.hookContext(), ev.Source.UserID, ev.Source.ChannelID, reply); err != nil {
+				slog.Error("LINEWORKS: gate reply send failed", "sender", senderID, "err", err)
+			}
+		}
+		if !allow {
+			slog.Info("LINEWORKS: message blocked by gate", "sender", senderID, "peerKind", peerKind)
+			return
+		}
+	}
 
 	// Fan out to hooks (workflow plugin) in parallel with the agent path,
 	// mirroring line.handleEvent. The hook event carries UserID + ChannelID so

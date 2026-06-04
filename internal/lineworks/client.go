@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -118,9 +119,27 @@ func (c *Client) sendText(ctx context.Context, path, text string) error {
 }
 
 // User is the subset of a LINE WORKS directory user we consume.
+//
+// Email is the LINE WORKS account id ("<local>@<domain>", internal — rarely
+// matches an external system's login). PrivateEmail is the directory's
+// "個人電子郵件地址" field, which e-smith populates with the person's real
+// login email — it equals the Odoo res.users login for both synced and
+// pre-existing accounts, making it the reliable cross-system identity key.
 type User struct {
 	UserID          string `json:"userId"`
 	UserExternalKey string `json:"userExternalKey"`
+	Email           string `json:"email"`
+	PrivateEmail    string `json:"privateEmail"`
+	UserName        struct {
+		LastName  string `json:"lastName"`
+		FirstName string `json:"firstName"`
+	} `json:"userName"`
+}
+
+// DisplayName returns the LINE WORKS display name ("lastName"+"firstName",
+// e.g. 高玉明). Empty when the directory has no name set.
+func (u *User) DisplayName() string {
+	return strings.TrimSpace(u.UserName.LastName + u.UserName.FirstName)
 }
 
 // GetUser looks up a directory user via GET /users/{userId}. The userId may be

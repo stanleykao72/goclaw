@@ -85,3 +85,18 @@ type Lifecycle interface {
 	Start(ctx context.Context) error
 	Stop() error
 }
+
+// MessageGate decides, synchronously and BEFORE the agent path runs, whether an
+// inbound text message may proceed. Unlike MessageHook (parallel, observe-only)
+// a gate can BLOCK the message: returning allow=false stops the channel from
+// forwarding the message to the agent, and the channel sends `reply` (when
+// non-empty) back to the sender instead.
+//
+// At most one gate is installed per channel (via SetGate). It runs after the
+// policy + content-type checks and before hook fan-out and HandleMessage, so a
+// blocked sender reaches neither plugins nor the agent. Gates should fail OPEN
+// (allow=true) on transient/internal errors so an outage does not lock out
+// legitimate users.
+type MessageGate interface {
+	Gate(ctx context.Context, ev TextEvent) (allow bool, reply string)
+}
