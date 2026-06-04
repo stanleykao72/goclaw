@@ -179,6 +179,11 @@ func (c *Channel) handleMessageEvent(ev callbackEvent) {
 		metaChannelID: ev.Source.ChannelID,
 	}
 
+	// Arm a delayed "processing" ack: if the agent's reply is slow (e.g. an Odoo
+	// MCP query), the user gets a one-off acknowledgement instead of silence.
+	// A reply within defaultAckDelay clears it before it fires.
+	c.scheduleAck(ev.Source.UserID, ev.Source.ChannelID, chatID)
+
 	c.HandleMessage(senderID, chatID, text, nil, metadata, peerKind)
 }
 

@@ -43,6 +43,11 @@ type botClient interface {
 // we fall back to treating msg.ChatID as a 1:1 userId — the common
 // workflow-plugin case where 待辦/日報 replies go back to the requesting user.
 func (c *Channel) Send(ctx context.Context, msg bus.OutboundMessage) error {
+	// The agent reply has arrived — cancel any pending "processing" ack for this
+	// chat (the ack itself is sent via SendText, not Send, so it never self-
+	// cancels here).
+	c.ackPending.Delete(msg.ChatID)
+
 	userID, channelID := c.routePeer(msg.ChatID, msg.Metadata)
 
 	text := formatForLineWorks(msg.Content)
