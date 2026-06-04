@@ -80,6 +80,7 @@ const (
 	TypeZaloOA       = "zalo_oa"
 	TypeZaloPersonal = "zalo_personal"
 	TypeLine         = "line"
+	TypeLineWorks    = "lineworks"
 )
 
 // Channel defines the interface that all channel implementations must satisfy.
