@@ -290,24 +290,109 @@ func TestTruncateForBudget(t *testing.T) {
 	}
 }
 
-func TestGrepMemoryVault(t *testing.T) {
-	dir := t.TempDir()
-	ctx := vaultTestCtx("vault", "lineworks", "group", "Cgrep", "")
-	mi := NewMemoryInterceptor(newMockMemoryStore(), "/workspace", dir)
-	if _, err := mi.WriteFile(ctx, "topics/pref.md", "使用者偏好正體中文\n喜歡簡潔回覆", false); err != nil {
-		t.Fatalf("seed write: %v", err)
+func TestAutoInjectReadsMEMORYmdFallback(t *testing.T) {
+	scope := filepath.Join("lineworks", "group-Cfallback")
+
+	t.Run("MEMORY.md-only scope recalls", func(t *testing.T) {
+		dir := t.TempDir()
+		content := "## 偏好\n- 使用者偏好正體中文回覆"
+		writeScopeFile(t, dir, scope, "MEMORY.md", content)
+		idx, _, err := ReadMemoryVaultIndexForScope(dir, scope, 200, 8192)
+		if err != nil {
+			t.Fatalf("index read: %v", err)
+		}
+		if idx != content {
+			t.Fatalf("MEMORY.md fallback must be injected:\n got=%q\nwant=%q", idx, content)
+		}
+	})
+
+	t.Run("LONGTERM.md preferred when both exist", func(t *testing.T) {
+		dir := t.TempDir()
+		longterm := "## 策展索引\n- curated 正體中文"
+		memory := "## 原生\n- native MEMORY content"
+		writeScopeFile(t, dir, scope, "LONGTERM.md", longterm)
+		writeScopeFile(t, dir, scope, "MEMORY.md", memory)
+		idx, _, err := ReadMemoryVaultIndexForScope(dir, scope, 200, 8192)
+		if err != nil {
+			t.Fatalf("index read: %v", err)
+		}
+		if idx != longterm {
+			t.Fatalf("LONGTERM.md must win precedence:\n got=%q\nwant=%q", idx, longterm)
+		}
+	})
+
+	t.Run("cold-start when neither exists", func(t *testing.T) {
+		dir := t.TempDir()
+		idx, trunc, err := ReadMemoryVaultIndexForScope(dir, scope, 200, 8192)
+		if err != nil {
+			t.Fatalf("cold-start must not error: %v", err)
+		}
+		if idx != "" || trunc {
+			t.Fatalf("cold-start = (%q, trunc=%v), want empty/false", idx, trunc)
+		}
+	})
+
+	t.Run("empty index file is treated as cold-start", func(t *testing.T) {
+		dir := t.TempDir()
+		writeScopeFile(t, dir, scope, "LONGTERM.md", "")
+		writeScopeFile(t, dir, scope, "MEMORY.md", "native after empty curated")
+		idx, _, err := ReadMemoryVaultIndexForScope(dir, scope, 200, 8192)
+		if err != nil {
+			t.Fatalf("index read: %v", err)
+		}
+		if idx != "native after empty curated" {
+			t.Fatalf("empty LONGTERM.md must fall through to MEMORY.md: got=%q", idx)
+		}
+	})
+}
+
+func TestMemoryVaultMapForScope(t *testing.T) {
+	scope := filepath.Join("lineworks", "group-Cmap")
+
+	t.Run("map contains index plus topics/journal listing", func(t *testing.T) {
+		dir := t.TempDir()
+		writeScopeFile(t, dir, scope, "MEMORY.md", "## 偏好\n- 使用者偏好正體中文")
+		writeScopeFile(t, dir, scope, "topics/pref.md", "深入偏好")
+		writeScopeFile(t, dir, scope, "journal/2026-06-05.md", "今日筆記")
+		got, err := MemoryVaultMapForScope(dir, scope, 200, 8192)
+		if err != nil {
+			t.Fatalf("map: %v", err)
+		}
+		// Index content present (not gated on a query substring).
+		if !strings.Contains(got, "正體中文") {
+			t.Fatalf("map must include index content: %q", got)
+		}
+		// Files listed so the agent can read_file them.
+		if !strings.Contains(got, "## Memory files") {
+			t.Fatalf("map must have a Memory files section: %q", got)
+		}
+		if !strings.Contains(got, "topics/pref.md") || !strings.Contains(got, "journal/2026-06-05.md") {
+			t.Fatalf("map must list topics/journal files: %q", got)
+		}
+	})
+
+	t.Run("cold-start map is empty", func(t *testing.T) {
+		dir := t.TempDir()
+		got, err := MemoryVaultMapForScope(dir, scope, 200, 8192)
+		if err != nil {
+			t.Fatalf("cold-start map must not error: %v", err)
+		}
+		if got != "" {
+			t.Fatalf("cold-start map must be empty: %q", got)
+		}
+	})
+}
+
+// writeScopeFile writes a file under vaultDir/scope/rel for tests that need an
+// explicit on-disk scope layout (bypassing the tool ctx).
+func writeScopeFile(t *testing.T, vaultDir, scope, rel, content string) {
+	t.Helper()
+	full := filepath.Join(vaultDir, scope, rel)
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		t.Fatalf("mkdir for %s: %v", rel, err)
 	}
-	hits, err := grepMemoryVault(ctx, dir, "正體中文", 10)
-	if err != nil {
-		t.Fatalf("grep: %v", err)
-	}
-	if !strings.Contains(hits, "正體中文") || !strings.Contains(hits, "topics/pref.md") {
-		t.Fatalf("grep should locate the Chinese line with path: %q", hits)
-	}
-	// No match → empty.
-	none, _ := grepMemoryVault(ctx, dir, "nonexistent-xyz", 10)
-	if none != "" {
-		t.Fatalf("no-match grep should be empty: %q", none)
+	if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", rel, err)
 	}
 }
 

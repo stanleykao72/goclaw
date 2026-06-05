@@ -275,25 +275,27 @@ func buildMemoryRecallSection(hasMemoryGet, hasMemoryExpand, hasKG bool) []strin
 
 // buildVaultMemoryRecallSection generates the ## Memory Recall section for agents
 // using the file-based vault backend. Memory lives as Obsidian-markdown files
-// (LONGTERM.md index + topics/ + journal/), not in the DB, so the guidance is
-// index-first + read on demand + grep — NOT memory_search-over-FTS / KG.
+// (MEMORY.md durable index + topics/ + journal/), not in the DB, so the guidance is
+// index-first + read on demand + memory map — NOT memory_search-over-FTS / KG. The
+// guidance names MEMORY.md (the model's native write target) as the auto-injected
+// long-term memory, with curated LONGTERM.md preferred when a curator has produced it.
 func buildVaultMemoryRecallSection() []string {
 	return []string{
 		"## Memory Recall",
 		"",
-		"Your long-term memory is a set of Markdown files (an Obsidian vault), organized in three tiers:",
-		"- **LONGTERM.md** — a small, curated index of durable, high-signal facts. The current contents are auto-injected into a \"Memory Context\" section above each turn, so you usually already have it.",
+		"Your long-term memory is a set of Markdown files (an Obsidian vault), organized in tiers:",
+		"- **MEMORY.md** — your durable long-term memory file. Append durable, high-signal facts here. Its current contents are auto-injected into a \"Memory Context\" section above each turn, so you usually already have it. (If a curated **LONGTERM.md** exists, it is preferred and injected instead — but you write to MEMORY.md.)",
 		"- **topics/<topic>.md** — deeper detail on one subject. Load on demand with read_file when the index points you there.",
 		"- **journal/<YYYY-MM-DD>.md** — the daily log (intake layer). Load on demand.",
 		"",
 		"How to recall:",
-		"1. First check the auto-injected Memory Context (the LONGTERM index) — it answers most recall.",
-		"2. If you need more, use memory_search to grep your memory files for a keyword and locate the right topic/journal segment, then read_file that segment.",
+		"1. First check the auto-injected Memory Context (your MEMORY.md / curated LONGTERM.md index) — it answers most recall.",
+		"2. If you need more, call memory_search — in vault mode it returns a memory map (your index plus the list of topics/ and journal/ files) so you can navigate; then read_file the right segment.",
 		"3. Use list_files on the memory directory to see what segments exist.",
 		"If nothing relevant is found, say so naturally without mentioning tool or file names.",
 		"",
 		"How to remember (write):",
-		"- Append new durable facts to LONGTERM.md; keep it concise (it is injected every turn).",
+		"- Append new durable facts to MEMORY.md; keep it concise (it is injected every turn).",
 		"- Put longer detail in topics/<topic>.md; put raw daily notes in journal/<today>.md.",
 		"- Preserve the existing language of each note (Chinese stays Chinese). Never delete — supersede or move to archive/.",
 		"",
