@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"time"
+
+	"github.com/nextlevelbuilder/goclaw/internal/channels"
 )
 
 // Callback event type discriminators (the top-level "type" field of a callback
@@ -171,6 +174,59 @@ func (c *Channel) handleMessageEvent(ev callbackEvent) {
 		Text:      text,
 	})
 
+	// --- Group @-mention gating ---
+	// localKey: the group history key. LINE WORKS has no per-topic threading, so
+	// the chat key (= the room/channel id for a group) is the history key.
+	// senderLabel: a human-readable asker label for history + the [From: ...]
+	// annotation. The userId is all we reliably have inbound (no display-name
+	// lookup in this path), so use it directly.
+	localKey := chatID
+	senderLabel := ev.Source.UserID
+
+	// agentContent is what the agent ultimately receives. For a group it may be
+	// enriched with recent non-mention history (BuildContext); for a 1:1 it is
+	// the raw text.
+	agentContent := text
+
+	// Slash-command dispatch runs BEFORE the group mention gate: a command is
+	// self-addressing, so "/reset", "/new", "/stop", "/stopall", "/help",
+	// "/status" (and Tier 2 admin commands) work with or without an explicit
+	// @bot — handleBotCommand strips a leading mention defensively. A handled
+	// command stops here (no ack, no agent). Non-command messages fall through
+	// to the mention gate below. Mirrors the telegram channel's command-first
+	// ordering.
+	if c.handleBotCommand(c.hookContext(), ev) {
+		return
+	}
+
+	if peerKind == peerGroup && c.RequireMention() && c.botNamesResolved() {
+		if !c.mentionsBot(text) {
+			// Not addressed to the bot: record into history for later context and
+			// stop. No ack, no agent dispatch, no reply — this is the whole point
+			// of the gate (silence spurious group replies).
+			if gh := c.GroupHistory(); gh != nil {
+				gh.Record(localKey, channels.HistoryEntry{
+					Sender:    senderLabel,
+					SenderID:  senderID,
+					Body:      text,
+					Timestamp: time.Now(),
+				}, c.HistoryLimit())
+			}
+			slog.Debug("LINEWORKS: group message recorded (no mention)", "chatID", chatID, "sender", senderLabel)
+			return
+		}
+		// Mentioned: strip the leading @bot token, then fold accumulated group
+		// history into the prompt so the agent has conversational context.
+		text = stripBotMention(text, c.botNamesSnapshot())
+		annotated := "[From: " + senderLabel + "]\n" + text
+		if gh := c.GroupHistory(); gh != nil {
+			agentContent = gh.BuildContext(localKey, annotated, c.HistoryLimit())
+		} else {
+			agentContent = annotated
+		}
+	}
+	// (1:1 chats and gating-disabled groups fall through with agentContent=text.)
+
 	// Metadata carries peer routing so Send() can address the reply to the
 	// correct Bot endpoint (users/ vs channels/).
 	metadata := map[string]string{
@@ -184,7 +240,7 @@ func (c *Channel) handleMessageEvent(ev callbackEvent) {
 	// A reply within defaultAckDelay clears it before it fires.
 	c.scheduleAck(ev.Source.UserID, ev.Source.ChannelID, chatID)
 
-	c.HandleMessage(senderID, chatID, text, nil, metadata, peerKind)
+	c.HandleMessage(senderID, chatID, agentContent, nil, metadata, peerKind)
 }
 
 // hookContext returns c.hookCtx or context.Background() if the channel has not

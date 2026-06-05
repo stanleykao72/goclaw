@@ -504,14 +504,20 @@ func registerLineWorksAutobindHook(ch *lineworkschannel.Channel, name string, cr
 // builds the LINE WORKS channel via the channel package's own Factory, then
 // registers the lineworks-workflow and autobind plugin hooks on the resulting
 // channel instance.
-func makeLineWorksFactory(_ *gateway.Server, mcpStore store.MCPServerStore, chanStore store.ChannelInstanceStore, agentStore store.AgentStore) channels.ChannelFactory {
+func makeLineWorksFactory(_ *gateway.Server, mcpStore store.MCPServerStore, chanStore store.ChannelInstanceStore, agentStore store.AgentStore, pendingStore store.PendingMessageStore, configPermStore store.ConfigPermissionStore, teamStore store.TeamStore, subagentTaskStore store.SubagentTaskStore) channels.ChannelFactory {
 	return func(name string, creds json.RawMessage, cfg json.RawMessage,
 		msgBus *bus.MessageBus, pairingSvc store.PairingStore) (channels.Channel, error) {
-		ch, err := lineworkschannel.Factory(name, creds, cfg, msgBus, pairingSvc)
+		ch, err := lineworkschannel.Factory(name, creds, cfg, msgBus, pairingSvc, pendingStore)
 		if err != nil {
 			return nil, err
 		}
 		if lc, ok := ch.(*lineworkschannel.Channel); ok {
+			// Tier 2 admin command stores. All optional: a nil store leaves the
+			// corresponding command replying "unavailable" (nil-safe handlers).
+			lc.SetAgentStore(agentStore)
+			lc.SetConfigPermStore(configPermStore)
+			lc.SetTeamStore(teamStore)
+			lc.SetSubagentTaskStore(subagentTaskStore)
 			registerLineWorksWorkflowHook(lc, creds, cfg)
 			registerLineWorksAutobindHook(lc, name, creds, cfg, mcpStore, chanStore, agentStore)
 		}

@@ -13,6 +13,7 @@ import (
 
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/channels"
+	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
 
 // Config holds the non-secret runtime settings for a LINE WORKS channel
@@ -43,6 +44,30 @@ type Channel struct {
 	client    botClient // outbound sender (wraps *lineworks.Client); nil in unit tests
 	botSecret string    // HMAC key for X-WORKS-Signature verification
 	cfg       Config
+
+	// Admin-command stores (Tier 2). All optional: a nil store makes the
+	// corresponding command reply "unavailable" instead of panicking. Wired at
+	// construction by makeLineWorksFactory; left nil in unit tests unless a
+	// fake is injected via the setters below.
+	agentStore        store.AgentStore            // agent key → UUID for /addwriter /removewriter /writers /tasks /task_detail
+	configPermStore   store.ConfigPermissionStore // group file-writer ACL for /addwriter /removewriter /writers
+	teamStore         store.TeamStore             // team task lookup for /tasks /task_detail
+	subagentTaskStore store.SubagentTaskStore     // subagent task lookup for /subagents /subagent
+
+	// pendingStore backs the group PendingHistory with DB persistence. nil →
+	// RAM-only history (unit tests / send-disabled instances). Threaded from
+	// FactoryWithPendingStore through New so Start can build the history with
+	// the right tenant id.
+	pendingStore store.PendingMessageStore
+
+	// botNames is the set of the bot's display names (default + i18n variants)
+	// used for group @-mention gating. Resolved once at Start from GetBot. Empty
+	// → mention gating disabled (fail-safe), so the bot never goes silent in a
+	// group when its name cannot be resolved. Guarded by botNamesMu: written once
+	// at Start (possibly from the startup goroutine on the Reload path) and read
+	// from concurrent webhook handler goroutines.
+	botNames   []string
+	botNamesMu sync.RWMutex
 
 	// hooks are MessageHook plugins registered via RegisterHook. Events fan out
 	// to every hook in registration order. Populated before Start(); not mutated
@@ -120,6 +145,49 @@ func New(client botClient, cfg Config, msgBus *bus.MessageBus) *Channel {
 	}
 }
 
+// SetPendingStore wires the DB-backed pending-message store used to persist
+// group history. Must be called before Start() (Start builds the PendingHistory
+// from it). A nil store leaves history RAM-only.
+func (c *Channel) SetPendingStore(s store.PendingMessageStore) {
+	c.pendingStore = s
+}
+
+// SetAgentStore wires the agent store used to resolve the channel's agent key
+// to a UUID for writer / task admin commands. Optional: when nil, commands that
+// need a resolved agent reply "unavailable".
+func (c *Channel) SetAgentStore(s store.AgentStore) { c.agentStore = s }
+
+// SetConfigPermStore wires the group file-writer ACL store backing
+// /addwriter, /removewriter and /writers. Optional: nil → those commands reply
+// "unavailable".
+func (c *Channel) SetConfigPermStore(s store.ConfigPermissionStore) { c.configPermStore = s }
+
+// SetTeamStore wires the team store backing /tasks and /task_detail. Optional:
+// nil → those commands reply "unavailable".
+func (c *Channel) SetTeamStore(s store.TeamStore) { c.teamStore = s }
+
+// SetSubagentTaskStore wires the subagent task store backing /subagents and
+// /subagent. Optional: nil → those commands reply "unavailable".
+func (c *Channel) SetSubagentTaskStore(s store.SubagentTaskStore) { c.subagentTaskStore = s }
+
+// SetPendingCompaction configures LLM-based auto-compaction for the group
+// pending history, so discussion that exceeds the history limit is summarized
+// (not dropped) and remains available as context on the next mention. Mirrors
+// the telegram/zalo/feishu/discord channels; the gateway InstanceLoader calls
+// this for any channel implementing channels.PendingCompactable.
+func (c *Channel) SetPendingCompaction(cfg *channels.CompactionConfig) {
+	if gh := c.GroupHistory(); gh != nil {
+		gh.SetCompactionConfig(cfg)
+	}
+}
+
+// botInfoLookup is the inbound-side capability the channel needs to resolve its
+// own display name(s) for mention gating. The SDK's *lineworks.Client satisfies
+// it (via the clientAdapter's embedded client); a fake implements it in tests.
+type botInfoLookup interface {
+	GetBot(ctx context.Context) (*lw.BotInfo, error)
+}
+
 // Type returns the platform type. Always "lineworks", independent from "line".
 func (c *Channel) Type() string { return ChannelType }
 
@@ -151,6 +219,42 @@ func (c *Channel) Start(ctx context.Context) error {
 	// by Stop, mirroring line.Channel.Start.
 	c.hookCtx, c.hookCancel = context.WithCancel(context.Background())
 
+	// Group history: accumulate non-mention group messages so that, when the bot
+	// IS mentioned, the recent conversation is folded into the agent prompt. The
+	// store may be nil (RAM-only). Idempotent: skip if already wired (tests may
+	// preset a history via SetGroupHistory).
+	if c.GroupHistory() == nil {
+		c.SetGroupHistory(channels.MakeHistory(channels.TypeLineWorks, c.pendingStore, c.TenantID()))
+	}
+	if c.HistoryLimit() <= 0 {
+		c.SetHistoryLimit(channels.DefaultGroupHistoryLimit)
+	}
+	if gh := c.GroupHistory(); gh != nil {
+		gh.StartFlusher()
+	}
+	// Require an explicit @-mention in groups by default. The whole point of the
+	// gate is to stop the bot from replying to every group message; 1:1 chats are
+	// never gated. (No per-instance config field today — default true.)
+	c.SetRequireMention(true)
+
+	// Resolve the bot's display name(s) for mention matching. On error we leave
+	// botNames empty, which DISABLES gating (fail-safe) so the bot still answers
+	// in groups rather than going silent.
+	if bl, ok := c.client.(botInfoLookup); ok && bl != nil {
+		if info, err := bl.GetBot(ctx); err != nil {
+			slog.Warn("LINEWORKS: GetBot failed; group mention gating disabled (fail-safe)", "err", err)
+		} else if info != nil {
+			names := []string{info.BotName}
+			for _, n := range info.I18nBotNames {
+				names = append(names, n.BotName)
+			}
+			c.SetBotNames(names)
+			slog.Info("LINEWORKS: resolved bot names for mention gating", "count", len(names))
+		}
+	} else {
+		slog.Warn("LINEWORKS: client does not support GetBot; group mention gating disabled (fail-safe)")
+	}
+
 	for _, h := range c.hooks {
 		if lc, ok := h.(Lifecycle); ok {
 			if err := lc.Start(ctx); err != nil {
@@ -176,6 +280,12 @@ func (c *Channel) Stop(_ context.Context) error {
 				slog.Error("LINEWORKS: hook Stop failed", "err", err)
 			}
 		}
+	}
+
+	// Drain the group-history flusher (no-op for RAM-only history), matching the
+	// telegram channel's shutdown handling.
+	if gh := c.GroupHistory(); gh != nil {
+		gh.StopFlusher()
 	}
 
 	drained := make(chan struct{})
