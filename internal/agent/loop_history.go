@@ -213,6 +213,7 @@ func (l *Loop) buildMessages(ctx context.Context, history []providers.Message, s
 		SkillsSummary:          l.resolveSkillsSummary(ctx, skillFilter),
 		PinnedSkillsSummary:    l.resolvePinnedSkillsSummary(ctx),
 		HasMemory:              l.hasMemory,
+		MemoryBackend:          l.memoryBackend,
 		HasSpawn:               l.tools != nil && hasSpawn,
 		IsTeamContext:          injectTeamContext,
 		TeamWorkspace:          tools.ToolTeamWorkspaceFromCtx(ctx),

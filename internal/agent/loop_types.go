@@ -80,13 +80,13 @@ type Loop struct {
 	// agentUUID is the canonical DB primary key. Use for SQL WHERE/JOIN,
 	// DomainEvent.AgentID, OTel span attributes, and context propagation via
 	// store.WithAgentID. See docs/agent-identity-conventions.md.
-	agentUUID        uuid.UUID
-	tenantID         uuid.UUID // agent's owning tenant
+	agentUUID uuid.UUID
+	tenantID  uuid.UUID // agent's owning tenant
 	// agentOtherConfig is a defensive byte copy of agents.other_config JSONB.
 	// Copied once at Loop construction; used to build AgentAudioSnapshot at tool dispatch.
 	agentOtherConfig json.RawMessage
-	agentType        string    // "open" or "predefined"
-	defaultTimezone  string    // system default timezone for bootstrap pre-fill
+	agentType        string // "open" or "predefined"
+	defaultTimezone  string // system default timezone for bootstrap pre-fill
 	provider         providers.Provider
 	model            string
 	modelRegistry    providers.ModelRegistry // resolves per-model context window at run time (nil = use static contextWindow)
@@ -108,7 +108,7 @@ type Loop struct {
 	// Memory flush runs if callback != nil; auto-inject runs if AutoInjector != nil.
 	autoInjector memory.AutoInjector // v3 L0 memory auto-inject (nil = disabled)
 
-	eventPub        bus.EventPublisher // currently unused by Loop; kept for future use
+	eventPub        bus.EventPublisher      // currently unused by Loop; kept for future use
 	domainBus       eventbus.DomainEventBus // V3 domain event bus for consolidation pipeline
 	sessions        store.SessionStore
 	tools           tools.ToolExecutor
@@ -137,11 +137,11 @@ type Loop struct {
 	userSetups        sync.Map            // userID → *userSetup (workspace + seeding state, per Loop instance)
 
 	// Per-user MCP tools: servers requiring user credentials get connected per-request.
-	mcpStore        store.MCPServerStore    // for credential lookup
-	mcpPool         *mcpbridge.Pool         // user-keyed connection pool
-	mcpUserCredSrvs []store.MCPAccessInfo   // servers needing per-user creds
-	mcpUserTools    sync.Map                // userID → []tools.Tool (cached per-user tools)
-	mcpGrantChecker mcpbridge.GrantChecker  // runtime grant verification (nil = skip)
+	mcpStore        store.MCPServerStore   // for credential lookup
+	mcpPool         *mcpbridge.Pool        // user-keyed connection pool
+	mcpUserCredSrvs []store.MCPAccessInfo  // servers needing per-user creds
+	mcpUserTools    sync.Map               // userID → []tools.Tool (cached per-user tools)
+	mcpGrantChecker mcpbridge.GrantChecker // runtime grant verification (nil = skip)
 
 	// Compaction config (memory flush settings)
 	compactionCfg *config.CompactionConfig
@@ -194,6 +194,12 @@ type Loop struct {
 	// Prompt mode from agent other_config (empty = full).
 	promptMode PromptMode
 
+	// Memory backend from agent other_config ("db" | "vault"; empty = "db").
+	memoryBackend string
+
+	// Deployment-global vault backend root ("" = vault disabled → db fallback).
+	memoryVaultDir string
+
 	// Pinned skills from agent other_config (always inline, max 10).
 	pinnedSkills []string
 
@@ -244,8 +250,8 @@ type Loop struct {
 	memStore store.MemoryStore
 
 	// v3 orchestration mode (spawn/delegate/team) — controls tool visibility
-	orchMode          OrchestrationMode
-	delegateTargets   []DelegateTargetEntry // delegation targets for prompt injection
+	orchMode        OrchestrationMode
+	delegateTargets []DelegateTargetEntry // delegation targets for prompt injection
 
 	// v3 evolution metrics store (nil = disabled)
 	evolutionMetricsStore store.EvolutionMetricsStore
@@ -350,11 +356,11 @@ type LoopConfig struct {
 
 	// Agent UUID + tenant for context propagation to tools
 	AgentUUID        uuid.UUID
-	TenantID         uuid.UUID        // agent's owning tenant — injected into execution context
-	AgentOtherConfig json.RawMessage  // raw other_config JSONB — copied defensively in NewLoop
-	AgentType        string           // "open" or "predefined"
-	DisplayName string    // human-readable agent display name (for runtime section)
-	IsTeamLead bool      // agent leads a team (from resolver detection)
+	TenantID         uuid.UUID       // agent's owning tenant — injected into execution context
+	AgentOtherConfig json.RawMessage // raw other_config JSONB — copied defensively in NewLoop
+	AgentType        string          // "open" or "predefined"
+	DisplayName      string          // human-readable agent display name (for runtime section)
+	IsTeamLead       bool            // agent leads a team (from resolver detection)
 
 	// Per-user profile + file seeding + dynamic context loading
 	EnsureUserProfile EnsureUserProfileFunc // preferred: separate profile + workspace
@@ -390,6 +396,12 @@ type LoopConfig struct {
 
 	// Prompt mode from agent other_config ("full", "task", "minimal", "none")
 	PromptMode PromptMode
+
+	// Memory backend from agent other_config ("db" | "vault"; empty = "db")
+	MemoryBackend string
+
+	// MemoryVaultDir is the deployment-global vault backend root ("" = disabled).
+	MemoryVaultDir string
 
 	// Pinned skills from agent other_config (always inline, max 10)
 	PinnedSkills []string
@@ -435,14 +447,14 @@ type LoopConfig struct {
 	MemoryStore store.MemoryStore
 
 	// Per-user MCP tools (servers requiring per-user credentials)
-	MCPStore        store.MCPServerStore    // for credential lookup
-	MCPPool         *mcpbridge.Pool         // user-keyed connection pool
-	MCPUserCredSrvs []store.MCPAccessInfo   // servers needing per-user creds
-	MCPGrantChecker mcpbridge.GrantChecker  // runtime grant verification (nil = skip)
+	MCPStore        store.MCPServerStore   // for credential lookup
+	MCPPool         *mcpbridge.Pool        // user-keyed connection pool
+	MCPUserCredSrvs []store.MCPAccessInfo  // servers needing per-user creds
+	MCPGrantChecker mcpbridge.GrantChecker // runtime grant verification (nil = skip)
 
 	// V3 orchestration mode (resolved by resolver, controls tool visibility)
-	OrchMode          OrchestrationMode
-	DelegateTargets   []DelegateTargetEntry // delegation targets for prompt injection
+	OrchMode        OrchestrationMode
+	DelegateTargets []DelegateTargetEntry // delegation targets for prompt injection
 
 	// V3 evolution metrics store for recording tool/retrieval/feedback metrics
 	EvolutionMetricsStore store.EvolutionMetricsStore
@@ -553,6 +565,8 @@ func NewLoop(cfg LoopConfig) *Loop {
 		disabledTools:          cfg.DisabledTools,
 		reasoningConfig:        cfg.ReasoningConfig,
 		promptMode:             cfg.PromptMode,
+		memoryBackend:          cfg.MemoryBackend,
+		memoryVaultDir:         cfg.MemoryVaultDir,
 		pinnedSkills:           cfg.PinnedSkills,
 		selfEvolve:             cfg.SelfEvolve,
 		allowImageGeneration:   cfg.AllowImageGeneration,
@@ -645,7 +659,7 @@ type RunRequest struct {
 // RunResult is the output of a completed agent run.
 type RunResult struct {
 	Content        string           `json:"content"`
-	Thinking       string           `json:"thinking,omitempty"`       // reasoning content from thinking models (Claude, o3, DeepSeek-R1, Kimi)
+	Thinking       string           `json:"thinking,omitempty"` // reasoning content from thinking models (Claude, o3, DeepSeek-R1, Kimi)
 	RunID          string           `json:"runId"`
 	Iterations     int              `json:"iterations"`
 	Usage          *providers.Usage `json:"usage,omitempty"`

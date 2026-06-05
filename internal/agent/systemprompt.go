@@ -107,6 +107,7 @@ type SystemPromptConfig struct {
 	ToolNames     []string                // registered tool names
 	SkillsSummary string                  // XML from skills.Loader.BuildSummary()
 	HasMemory     bool                    // memory_search/memory_get available?
+	MemoryBackend string                  // "db" | "vault" (empty = "db") — selects recall guidance
 	HasSpawn      bool                    // spawn tool available?
 	IsTeamContext bool                    // inject team sections (leader inbound OR team dispatch)
 	TeamWorkspace string                  // absolute path to team shared workspace (empty if not in team)
@@ -440,9 +441,13 @@ func BuildSystemPrompt(cfg SystemPromptConfig) string {
 		lines = append(lines, buildUserIdentitySection(cfg.OwnerIDs)...)
 	}
 
-	// 12.5. ## Memory Recall — full=detailed, task=slim, minimal=essential
+	// 12.5. ## Memory Recall — full=detailed, task=slim, minimal=essential.
+	// Vault-backend agents get a distinct recall guide (index-first + read_file +
+	// grep) for every prompt mode, since their memory lives in files, not the DB.
 	if cfg.HasMemory {
-		if isFull {
+		if cfg.MemoryBackend == "vault" {
+			lines = append(lines, buildVaultMemoryRecallSection()...)
+		} else if isFull {
 			hasMemoryGet := slices.Contains(cfg.ToolNames, "memory_get")
 			lines = append(lines, buildMemoryRecallSection(hasMemoryGet, cfg.HasMemoryExpand, cfg.HasKnowledgeGraph)...)
 		} else if isTask {

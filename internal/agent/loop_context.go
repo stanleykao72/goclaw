@@ -363,6 +363,7 @@ func (l *Loop) injectContext(ctx context.Context, req *RunRequest) (contextSetup
 		CredentialUserID:    credUserID,
 		AgentType:           l.agentType,
 		SenderID:            req.SenderID,
+		MemoryBackend:       l.memoryBackend,
 		SelfEvolve:          l.selfEvolve,
 		SharedMemory:        store.IsSharedMemory(ctx),
 		SharedKG:            store.IsSharedKG(ctx),

@@ -91,7 +91,7 @@ func memCtx(agentID uuid.UUID, userID, leaderID string) context.Context {
 
 func TestReadFile_NoLeader_OwnMemory(t *testing.T) {
 	ms := newMockMemoryStore()
-	mi := NewMemoryInterceptor(ms, "/workspace")
+	mi := NewMemoryInterceptor(ms, "/workspace", "")
 	agentID := uuid.New()
 
 	ms.docs[docKey(agentID.String(), "user1", "MEMORY.md")] = "my notes"
@@ -111,7 +111,7 @@ func TestReadFile_NoLeader_OwnMemory(t *testing.T) {
 
 func TestReadFile_LeaderFallback(t *testing.T) {
 	ms := newMockMemoryStore()
-	mi := NewMemoryInterceptor(ms, "/workspace")
+	mi := NewMemoryInterceptor(ms, "/workspace", "")
 	memberID := uuid.New()
 	leaderID := uuid.New()
 
@@ -133,7 +133,7 @@ func TestReadFile_LeaderFallback(t *testing.T) {
 
 func TestReadFile_LeaderFallback_SharedScope(t *testing.T) {
 	ms := newMockMemoryStore()
-	mi := NewMemoryInterceptor(ms, "/workspace")
+	mi := NewMemoryInterceptor(ms, "/workspace", "")
 	memberID := uuid.New()
 	leaderID := uuid.New()
 
@@ -155,7 +155,7 @@ func TestReadFile_LeaderFallback_SharedScope(t *testing.T) {
 
 func TestReadFile_LeaderIsSelf(t *testing.T) {
 	ms := newMockMemoryStore()
-	mi := NewMemoryInterceptor(ms, "/workspace")
+	mi := NewMemoryInterceptor(ms, "/workspace", "")
 	agentID := uuid.New()
 
 	ms.docs[docKey(agentID.String(), "user1", "MEMORY.md")] = "own notes"
@@ -176,7 +176,7 @@ func TestReadFile_LeaderIsSelf(t *testing.T) {
 
 func TestReadFile_NonMemoryPath(t *testing.T) {
 	ms := newMockMemoryStore()
-	mi := NewMemoryInterceptor(ms, "/workspace")
+	mi := NewMemoryInterceptor(ms, "/workspace", "")
 
 	ctx := memCtx(uuid.New(), "user1", "")
 	_, handled, err := mi.ReadFile(ctx, "README.md")
@@ -190,7 +190,7 @@ func TestReadFile_NonMemoryPath(t *testing.T) {
 
 func TestReadFile_MemberNoMemory_NoLeader_Empty(t *testing.T) {
 	ms := newMockMemoryStore()
-	mi := NewMemoryInterceptor(ms, "/workspace")
+	mi := NewMemoryInterceptor(ms, "/workspace", "")
 
 	ctx := memCtx(uuid.New(), "user1", "")
 	content, handled, err := mi.ReadFile(ctx, "MEMORY.md")
@@ -209,7 +209,7 @@ func TestReadFile_MemberNoMemory_NoLeader_Empty(t *testing.T) {
 
 func TestWriteFile_NoLeader_AllowWrite(t *testing.T) {
 	ms := newMockMemoryStore()
-	mi := NewMemoryInterceptor(ms, "/workspace")
+	mi := NewMemoryInterceptor(ms, "/workspace", "")
 	agentID := uuid.New()
 
 	ctx := memCtx(agentID, "user1", "")
@@ -230,7 +230,7 @@ func TestWriteFile_NoLeader_AllowWrite(t *testing.T) {
 
 func TestWriteFile_LeaderPresent_BlockWrite(t *testing.T) {
 	ms := newMockMemoryStore()
-	mi := NewMemoryInterceptor(ms, "/workspace")
+	mi := NewMemoryInterceptor(ms, "/workspace", "")
 	memberID := uuid.New()
 	leaderID := uuid.New()
 
@@ -249,7 +249,7 @@ func TestWriteFile_LeaderPresent_BlockWrite(t *testing.T) {
 
 func TestWriteFile_LeaderIsSelf_AllowWrite(t *testing.T) {
 	ms := newMockMemoryStore()
-	mi := NewMemoryInterceptor(ms, "/workspace")
+	mi := NewMemoryInterceptor(ms, "/workspace", "")
 	agentID := uuid.New()
 
 	// Leader is the same agent — should allow write.
@@ -330,7 +330,7 @@ func TestMemorySearch_LeaderFallback(t *testing.T) {
 
 func TestListFiles_MergeLeaderDocs(t *testing.T) {
 	ms := newMockMemoryStore()
-	mi := NewMemoryInterceptor(ms, "/workspace")
+	mi := NewMemoryInterceptor(ms, "/workspace", "")
 	memberID := uuid.New()
 	leaderID := uuid.New()
 
@@ -356,7 +356,7 @@ func TestListFiles_MergeLeaderDocs(t *testing.T) {
 
 func TestListFiles_LeaderGlobalScopeFallback(t *testing.T) {
 	ms := newMockMemoryStore()
-	mi := NewMemoryInterceptor(ms, "/workspace")
+	mi := NewMemoryInterceptor(ms, "/workspace", "")
 	memberID := uuid.New()
 	leaderID := uuid.New()
 
@@ -378,7 +378,7 @@ func TestListFiles_LeaderGlobalScopeFallback(t *testing.T) {
 
 func TestReadFile_LeaderFallback_MemorySubpath(t *testing.T) {
 	ms := newMockMemoryStore()
-	mi := NewMemoryInterceptor(ms, "/workspace")
+	mi := NewMemoryInterceptor(ms, "/workspace", "")
 	memberID := uuid.New()
 	leaderID := uuid.New()
 
@@ -400,7 +400,7 @@ func TestReadFile_LeaderFallback_MemorySubpath(t *testing.T) {
 
 func TestListFiles_LeaderIsSelf_NoDuplication(t *testing.T) {
 	ms := newMockMemoryStore()
-	mi := NewMemoryInterceptor(ms, "/workspace")
+	mi := NewMemoryInterceptor(ms, "/workspace", "")
 	agentID := uuid.New()
 
 	ms.docs[docKey(agentID.String(), "user1", "MEMORY.md")] = "own mem"

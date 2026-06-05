@@ -245,6 +245,11 @@ type MemoryConfig struct {
 	TextWeight        float64 `json:"text_weight,omitempty"`        // hybrid search FTS weight (default 0.3)
 	MinScore          float64 `json:"min_score,omitempty"`          // minimum relevance score (default 0.35)
 
+	// VaultDir is the filesystem root for the Obsidian-markdown memory backend.
+	// Empty = vault backend unavailable (agents with memory_backend="vault" fall
+	// back to db). Deployment-global; set via config or env GOCLAW_MEMORY_VAULT_DIR.
+	VaultDir string `json:"vault_dir,omitempty"`
+
 	// Dreaming configures the episodic → long-term consolidation worker.
 	// nil = use hardcoded defaults (threshold=5, debounce=10min, enabled).
 	Dreaming *DreamingConfig `json:"dreaming,omitempty"`

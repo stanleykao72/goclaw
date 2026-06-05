@@ -107,7 +107,12 @@ func (t *ReadFileTool) Execute(ctx context.Context, args map[string]any) *Result
 		return ErrorResult("path is required")
 	}
 
-	// Group read restriction: block non-writers from reading SOUL.md/AGENTS.md
+	// Group read restriction: block non-writers from reading SOUL.md/AGENTS.md.
+	// NOTE: this is the third CheckFileWriterPermission call site, but it only
+	// gates reads of SOUL.md / AGENTS.md — never memory paths (a memory file's
+	// base is never SoulFile/AgentsFile). So vault memory recall needs no
+	// exemption here; the ACL exemption lives only at the two write sites
+	// (edit.go, filesystem_write.go).
 	if t.permStore != nil {
 		base := filepath.Base(path)
 		if base == bootstrap.SoulFile || base == bootstrap.AgentsFile {

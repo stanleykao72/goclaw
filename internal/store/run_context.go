@@ -29,6 +29,11 @@ type RunContext struct {
 	AgentType        string
 	SenderID         string
 
+	// MemoryBackend selects the per-agent memory backend ("db" | "vault").
+	// Empty is treated as "db". Single carrier for the backend flag — read via
+	// MemoryBackendFromCtx.
+	MemoryBackend string
+
 	// Flags
 	SelfEvolve          bool
 	SharedMemory        bool

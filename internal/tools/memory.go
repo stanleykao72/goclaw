@@ -15,10 +15,11 @@ import (
 
 // MemorySearchTool implements the memory_search tool for hybrid semantic + FTS search.
 type MemorySearchTool struct {
-	memStore      store.MemoryStore              // Postgres-backed
-	episodicStore store.EpisodicStore             // v3 episodic memory (nil = v2 fallback)
-	metricsStore  store.EvolutionMetricsStore     // evolution metrics (nil = disabled)
-	hasKG         bool                           // knowledge_graph_search tool is available
+	memStore      store.MemoryStore           // Postgres-backed
+	episodicStore store.EpisodicStore         // v3 episodic memory (nil = v2 fallback)
+	metricsStore  store.EvolutionMetricsStore // evolution metrics (nil = disabled)
+	hasKG         bool                        // knowledge_graph_search tool is available
+	vaultDir      string                      // vault backend root ("" = vault disabled)
 }
 
 func NewMemorySearchTool() *MemorySearchTool {
@@ -38,6 +39,12 @@ func (t *MemorySearchTool) SetEpisodicStore(es store.EpisodicStore) {
 // SetEvolutionMetricsStore enables retrieval metric recording.
 func (t *MemorySearchTool) SetEvolutionMetricsStore(ms store.EvolutionMetricsStore) {
 	t.metricsStore = ms
+}
+
+// SetVaultDir sets the vault backend root so vault-mode agents grep their memory
+// files instead of querying Postgres FTS.
+func (t *MemorySearchTool) SetVaultDir(dir string) {
+	t.vaultDir = dir
 }
 
 // SetHasKG enables the KG hint in search results.
@@ -90,6 +97,21 @@ func (t *MemorySearchTool) Execute(ctx context.Context, args map[string]any) *Re
 	}
 	if ms, ok := args["minScore"].(float64); ok {
 		minScore = ms
+	}
+
+	// Vault backend: grep the scope's markdown files instead of Postgres FTS
+	// (which cannot segment CJK). Falls through to db when the vault dir is unset.
+	if store.MemoryBackendFromCtx(ctx) == "vault" && t.vaultDir != "" {
+		hits, err := grepMemoryVault(ctx, t.vaultDir, query, maxResults)
+		if err != nil {
+			return ErrorResult(fmt.Sprintf("memory search failed: %v", err))
+		}
+		if hits == "" {
+			return NewResult("No memory results found for query: " + query)
+		}
+		// Group-shared vault memory is multi-writer; wrap recalled content as
+		// untrusted so a poisoned note cannot act as instructions.
+		return NewResult(WrapUntrustedMemory(hits))
 	}
 
 	agentID := store.AgentIDFromContext(ctx)

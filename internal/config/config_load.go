@@ -328,6 +328,14 @@ func (c *Config) applyEnvOverrides() {
 		c.Agents.Defaults.Sandbox.NetworkEnabled = v == "true" || v == "1"
 	}
 
+	// Memory (Obsidian-markdown vault backend root)
+	if v := os.Getenv("GOCLAW_MEMORY_VAULT_DIR"); v != "" {
+		if c.Agents.Defaults.Memory == nil {
+			c.Agents.Defaults.Memory = &MemoryConfig{}
+		}
+		c.Agents.Defaults.Memory.VaultDir = ExpandHome(v)
+	}
+
 	// Browser (for Docker-compose browser sidecar overlay)
 	envStr("GOCLAW_BROWSER_REMOTE_URL", &c.Tools.Browser.RemoteURL)
 	if c.Tools.Browser.RemoteURL != "" {

@@ -52,6 +52,8 @@ const (
 	SenderNameKey contextKey = "goclaw_sender_name"
 	// AgentAudioKey carries the immutable agent audio snapshot for TTS tool dispatch.
 	AgentAudioKey contextKey = "goclaw_agent_audio"
+	// MemoryBackendKey carries the per-agent memory backend ("db" | "vault").
+	MemoryBackendKey contextKey = "goclaw_memory_backend"
 )
 
 // AgentAudioSnapshot is an immutable snapshot of agent audio config carried through
@@ -109,6 +111,24 @@ func UserIDFromContext(ctx context.Context) string {
 		return rc.UserID
 	}
 	return ""
+}
+
+// WithMemoryBackend returns a new context carrying the per-agent memory backend.
+func WithMemoryBackend(ctx context.Context, backend string) context.Context {
+	return context.WithValue(ctx, MemoryBackendKey, backend)
+}
+
+// MemoryBackendFromCtx returns the per-agent memory backend ("db" | "vault").
+// Reads the direct key first, then falls back to RunContext. Any unset/empty
+// value resolves to "db" so the native Postgres memory path is the default.
+func MemoryBackendFromCtx(ctx context.Context) string {
+	if v, ok := ctx.Value(MemoryBackendKey).(string); ok && v != "" {
+		return v
+	}
+	if rc := RunContextFromCtx(ctx); rc != nil && rc.MemoryBackend != "" {
+		return rc.MemoryBackend
+	}
+	return "db"
 }
 
 // WithCredentialUserID returns a new context with the resolved tenant user identity for credential lookups.

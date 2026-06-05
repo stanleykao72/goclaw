@@ -10,6 +10,7 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 	"github.com/nextlevelbuilder/goclaw/internal/tokencount"
+	"github.com/nextlevelbuilder/goclaw/internal/tools"
 	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
 )
 
@@ -85,9 +86,10 @@ func (l *Loop) buildPipelineDeps(req *RunRequest, bridgeRS *runState) pipeline.P
 			}
 		},
 
-		// V3 auto-inject: episodic memory L0 injection into system prompt.
-		// Captures agent/tenant context via closure for store scoping.
-		AutoInject: l.makeAutoInjectCallback(req),
+		// Auto-inject: memory L0 injection into system prompt. Vault-backend agents
+		// inject their bounded LONGTERM index from disk; db agents use the episodic
+		// vector injector.
+		AutoInject: l.autoInjectCallback(req),
 
 		// Context injection + session history
 		InjectContext:      cb.injectContext,
@@ -290,5 +292,43 @@ func (l *Loop) makeAutoInjectCallback(req *RunRequest) func(ctx context.Context,
 			return "", err
 		}
 		return result.Section, nil
+	}
+}
+
+// Auto-inject budget for the vault index (LONGTERM.md). Bounded so the per-turn
+// injection cost stays controlled regardless of how large the file grows.
+const (
+	vaultIndexMaxLines = 200
+	vaultIndexMaxBytes = 8192
+)
+
+// autoInjectCallback selects the per-turn memory auto-injector by backend: the
+// file-based vault index injector for vault agents (when a vault dir is set), else
+// the episodic vector injector (db agents — behavior unchanged; also the fail-safe
+// path when a vault agent has no vault dir configured).
+func (l *Loop) autoInjectCallback(req *RunRequest) func(ctx context.Context, userMessage, userID, recentContext string) (string, error) {
+	if l.memoryBackend == "vault" && l.memoryVaultDir != "" {
+		return l.makeVaultAutoInjectCallback(req)
+	}
+	return l.makeAutoInjectCallback(req)
+}
+
+// makeVaultAutoInjectCallback injects the scope's bounded LONGTERM index from the
+// vault each turn, wrapped as untrusted content.
+//
+// The scope is computed from the REQUEST (channel/peerKind/chatID/userID), not from
+// ctx: this callback runs in the pipeline context, which — unlike the tool-dispatch
+// context — does not carry the tool peerKind/chatID keys. Deriving the scope from
+// ctx here would land in the user branch for group chats and inject the wrong
+// scope's index. MemoryVaultSubdirFor reproduces exactly the scope a write produces.
+func (l *Loop) makeVaultAutoInjectCallback(req *RunRequest) func(ctx context.Context, userMessage, userID, recentContext string) (string, error) {
+	scope := tools.MemoryVaultSubdirFor(req.ChannelType, req.PeerKind, req.ChatID, req.UserID)
+	return func(ctx context.Context, userMessage, userID, recentContext string) (string, error) {
+		index, _, err := tools.ReadMemoryVaultIndexForScope(l.memoryVaultDir, scope, vaultIndexMaxLines, vaultIndexMaxBytes)
+		if err != nil || index == "" {
+			return "", err
+		}
+		return "## Memory Context\n\nRelevant long-term memory (your curated LONGTERM index):\n" +
+			tools.WrapUntrustedMemory(index) + "\n", nil
 	}
 }
