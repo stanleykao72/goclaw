@@ -99,19 +99,24 @@ func (t *MemorySearchTool) Execute(ctx context.Context, args map[string]any) *Re
 		minScore = ms
 	}
 
-	// Vault backend: grep the scope's markdown files instead of Postgres FTS
-	// (which cannot segment CJK). Falls through to db when the vault dir is unset.
+	// Vault backend: return a "memory map" (the scope's bounded index by contract
+	// precedence + a listing of topics/journal/archive files) instead of Postgres
+	// FTS (which cannot segment CJK) or a literal grep (which fails when the query
+	// string is not verbatim in the content). The agent uses it to read_file the
+	// right segment. Falls through to db when the vault dir is unset.
 	if store.MemoryBackendFromCtx(ctx) == "vault" && t.vaultDir != "" {
-		hits, err := grepMemoryVault(ctx, t.vaultDir, query, maxResults)
+		scope := MemoryVaultSubdir(ctx)
+		mapText, err := MemoryVaultMapForScope(t.vaultDir, scope, 200, 8192)
 		if err != nil {
 			return ErrorResult(fmt.Sprintf("memory search failed: %v", err))
 		}
-		if hits == "" {
+		if mapText == "" {
+			// Cold-start: no memory files yet — not an error.
 			return NewResult("No memory results found for query: " + query)
 		}
 		// Group-shared vault memory is multi-writer; wrap recalled content as
 		// untrusted so a poisoned note cannot act as instructions.
-		return NewResult(WrapUntrustedMemory(hits))
+		return NewResult(WrapUntrustedMemory(mapText))
 	}
 
 	agentID := store.AgentIDFromContext(ctx)

@@ -21,9 +21,17 @@ import (
 // "Knowledge Vault" (vault_interceptor.go / vault_search.go). Everything here is
 // prefixed memoryVault / MemoryVault to avoid conceptual collision.
 
-// memoryVaultIndexFile is the per-scope curated index that auto-inject reads each
-// turn and that the agent is guided to maintain (the three-tier layout's top).
+// memoryVaultIndexFile is the canonical curated index base name. It is still used
+// by isVaultLayoutPath's base-name check so a LONGTERM.md write is recognized as a
+// vault-layout (ACL-exempt) path.
 const memoryVaultIndexFile = "LONGTERM.md"
+
+// memoryVaultIndexFiles is the read precedence for the per-scope index that
+// auto-inject reads each turn: curated LONGTERM.md first, then the agent's native
+// MEMORY.md intake (also lower-case memory.md). The first existing non-empty file
+// wins. The write side is unchanged — the agent keeps writing MEMORY.md natively;
+// curation produces the bounded LONGTERM.md.
+var memoryVaultIndexFiles = []string{"LONGTERM.md", "MEMORY.md", "memory.md"}
 
 // MemoryVaultSubdir derives the per-conversation vault scope folder from the
 // conversation identity. Group conversations are shared per chat; direct (1:1)
@@ -226,8 +234,23 @@ func readMemoryVaultFile(ctx context.Context, vaultDir, workspace, path string) 
 // missing scope folder is cold-start: returns ("", true, nil).
 func listMemoryVaultFiles(ctx context.Context, vaultDir string) (string, bool, error) {
 	scope := MemoryVaultSubdir(ctx)
-	scopeDir := filepath.Join(vaultDir, scope)
+	files, err := walkMemoryVaultScopeFiles(vaultDir, scope)
+	if err != nil {
+		return "", true, err
+	}
+	var sb strings.Builder
+	for _, f := range files {
+		fmt.Fprintf(&sb, "[FILE] %s\n", f)
+	}
+	return sb.String(), true, nil
+}
 
+// walkMemoryVaultScopeFiles returns the sorted, slash-relative file list for an
+// explicit scope folder. A missing scope folder is cold-start: returns (nil, nil).
+// Factored out of listMemoryVaultFiles so callers (e.g. the memory map) that have
+// an explicit scope rather than a tool ctx can reuse the same walk.
+func walkMemoryVaultScopeFiles(vaultDir, scope string) ([]string, error) {
+	scopeDir := filepath.Join(vaultDir, scope)
 	var files []string
 	err := filepath.WalkDir(scopeDir, func(p string, d os.DirEntry, werr error) error {
 		if werr != nil {
@@ -245,38 +268,79 @@ func listMemoryVaultFiles(ctx context.Context, vaultDir string) (string, bool, e
 		return nil
 	})
 	if err != nil && !os.IsNotExist(err) {
-		return "", true, fmt.Errorf("memory vault: list: %w", err)
+		return nil, fmt.Errorf("memory vault: list: %w", err)
 	}
 	sort.Strings(files)
-	var sb strings.Builder
-	for _, f := range files {
-		fmt.Fprintf(&sb, "[FILE] %s\n", f)
-	}
-	return sb.String(), true, nil
+	return files, nil
 }
 
-// ReadMemoryVaultIndexForScope returns the scope's index file (LONGTERM.md)
-// content, truncated to the given line/byte caps (the auto-inject budget). The
-// second return is true when truncation occurred; cold-start returns ("", false,
-// nil). It takes an explicit scope (rather than deriving from ctx) because the
-// auto-injector's ctx does not carry the tool peerKind/chatID keys, so it must
-// pass the scope computed from the request via MemoryVaultSubdirFor.
+// ReadMemoryVaultIndexForScope returns the scope's index file content, truncated
+// to the given line/byte caps (the auto-inject budget). It tries each candidate in
+// memoryVaultIndexFiles in precedence order (curated LONGTERM.md first, then the
+// native MEMORY.md / memory.md) and returns the FIRST existing non-empty file. The
+// second return is true when truncation occurred; cold-start (none exist or all
+// empty) returns ("", false, nil). It takes an explicit scope (rather than deriving
+// from ctx) because the auto-injector's ctx does not carry the tool peerKind/chatID
+// keys, so it must pass the scope computed from the request via MemoryVaultSubdirFor.
 func ReadMemoryVaultIndexForScope(vaultDir, scope string, maxLines, maxBytes int) (string, bool, error) {
-	full, err := resolveMemoryVaultPath(vaultDir, scope, memoryVaultIndexFile)
-	if err != nil {
-		return "", false, err
-	}
-	data, rerr := os.ReadFile(full)
-	if rerr != nil {
-		if os.IsNotExist(rerr) {
-			return "", false, nil
+	for _, name := range memoryVaultIndexFiles {
+		full, err := resolveMemoryVaultPath(vaultDir, scope, name)
+		if err != nil {
+			return "", false, err
 		}
-		return "", false, rerr
+		data, rerr := os.ReadFile(full)
+		if rerr != nil {
+			if os.IsNotExist(rerr) {
+				continue
+			}
+			return "", false, rerr
+		}
+		if len(data) == 0 {
+			continue
+		}
+		return truncateForBudget(string(data), maxLines, maxBytes)
 	}
-	if len(data) == 0 {
-		return "", false, nil
+	return "", false, nil
+}
+
+// MemoryVaultMapForScope builds the vault-mode "memory map": the scope's index
+// (read by the contract precedence in ReadMemoryVaultIndexForScope, bounded to the
+// given caps) followed by a "## Memory files" section listing the scope's files
+// (topics/, journal/, archive/ and the index file itself) so the agent can
+// read_file the right segment on demand. This replaces the old literal grep —
+// recall does not depend on the query string appearing verbatim in stored content.
+// Cold-start (no index AND no files) returns "". Containment is preserved via
+// resolveMemoryVaultPath inside the index read.
+func MemoryVaultMapForScope(vaultDir, scope string, maxLines, maxBytes int) (string, error) {
+	index, _, err := ReadMemoryVaultIndexForScope(vaultDir, scope, maxLines, maxBytes)
+	if err != nil {
+		return "", err
 	}
-	return truncateForBudget(string(data), maxLines, maxBytes)
+	files, err := walkMemoryVaultScopeFiles(vaultDir, scope)
+	if err != nil {
+		return "", err
+	}
+	if index == "" && len(files) == 0 {
+		return "", nil
+	}
+
+	var sb strings.Builder
+	if index != "" {
+		sb.WriteString(index)
+		if !strings.HasSuffix(index, "\n") {
+			sb.WriteString("\n")
+		}
+	}
+	if len(files) > 0 {
+		if sb.Len() > 0 {
+			sb.WriteString("\n")
+		}
+		sb.WriteString("## Memory files\n")
+		for _, f := range files {
+			fmt.Fprintf(&sb, "- %s\n", f)
+		}
+	}
+	return sb.String(), nil
 }
 
 // WrapUntrustedMemory wraps memory content (especially group-shared, multi-writer
@@ -312,63 +376,4 @@ func truncateForBudget(content string, maxLines, maxBytes int) (string, bool, er
 		content = strings.TrimRight(content, "\n") + "\n\n[…truncated: read LONGTERM.md / topics / journal for the rest…]\n"
 	}
 	return content, truncated, nil
-}
-
-// grepMemoryVault does a case-insensitive substring search over the scope's
-// markdown files and returns a formatted, capped result block. Cold-start / no
-// match returns "". This is the vault-mode replacement for Postgres FTS (which
-// cannot segment CJK).
-func grepMemoryVault(ctx context.Context, vaultDir, query string, maxResults int) (string, error) {
-	if maxResults <= 0 {
-		maxResults = 20
-	}
-	scope := MemoryVaultSubdir(ctx)
-	scopeDir := filepath.Join(vaultDir, scope)
-	needle := strings.ToLower(strings.TrimSpace(query))
-	if needle == "" {
-		return "", nil
-	}
-
-	type hit struct {
-		file string
-		line int
-		text string
-	}
-	var hits []hit
-	err := filepath.WalkDir(scopeDir, func(p string, d os.DirEntry, werr error) error {
-		if werr != nil {
-			if os.IsNotExist(werr) {
-				return filepath.SkipDir
-			}
-			return werr
-		}
-		if d.IsDir() || !strings.HasSuffix(p, ".md") {
-			return nil
-		}
-		data, rerr := os.ReadFile(p)
-		if rerr != nil {
-			return nil // skip unreadable file, keep scanning
-		}
-		rel, _ := filepath.Rel(scopeDir, p)
-		for i, ln := range strings.Split(string(data), "\n") {
-			if strings.Contains(strings.ToLower(ln), needle) {
-				hits = append(hits, hit{file: filepath.ToSlash(rel), line: i + 1, text: strings.TrimSpace(ln)})
-				if len(hits) >= maxResults {
-					return filepath.SkipAll
-				}
-			}
-		}
-		return nil
-	})
-	if err != nil && !os.IsNotExist(err) {
-		return "", fmt.Errorf("memory vault: grep: %w", err)
-	}
-	if len(hits) == 0 {
-		return "", nil
-	}
-	var sb strings.Builder
-	for _, h := range hits {
-		fmt.Fprintf(&sb, "%s:%d: %s\n", h.file, h.line, h.text)
-	}
-	return sb.String(), nil
 }

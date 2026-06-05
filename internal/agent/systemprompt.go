@@ -443,7 +443,8 @@ func BuildSystemPrompt(cfg SystemPromptConfig) string {
 
 	// 12.5. ## Memory Recall — full=detailed, task=slim, minimal=essential.
 	// Vault-backend agents get a distinct recall guide (index-first + read_file +
-	// grep) for every prompt mode, since their memory lives in files, not the DB.
+	// memory_search returns a memory map) for every prompt mode, since their memory
+	// lives in files, not the DB.
 	if cfg.HasMemory {
 		if cfg.MemoryBackend == "vault" {
 			lines = append(lines, buildVaultMemoryRecallSection()...)
