@@ -161,6 +161,36 @@ func (c *Client) GetUser(ctx context.Context, userID string) (*User, error) {
 	return &u, nil
 }
 
+// BotInfo is the subset of a bot's profile we consume from GET /bots/{botId}.
+//
+// BotName is the default display name. I18nBotNames carries the per-language
+// localized names (e.g. a Japanese name + an English name); the channel folds
+// every variant into its mention-matching set so an @-mention typed in any
+// locale's name is recognized.
+type BotInfo struct {
+	BotName      string `json:"botName"`
+	I18nBotNames []struct {
+		Language string `json:"language"`
+		BotName  string `json:"botName"`
+	} `json:"i18nBotNames"`
+}
+
+// GetBot looks up the bot's own profile via GET /bots/{botId}. Used to resolve
+// the bot's display name(s) for group @-mention gating. Requires the bot (read)
+// scope on the access token.
+func (c *Client) GetBot(ctx context.Context) (*BotInfo, error) {
+	path := fmt.Sprintf("/bots/%s", c.botID)
+	respBody, err := c.do(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	var b BotInfo
+	if err := json.Unmarshal(respBody, &b); err != nil {
+		return nil, fmt.Errorf("lineworks: decode bot: %w", err)
+	}
+	return &b, nil
+}
+
 // do performs an authenticated request against the API base and returns the
 // response body. Non-2xx responses become errors carrying the status and a
 // snippet of the body.

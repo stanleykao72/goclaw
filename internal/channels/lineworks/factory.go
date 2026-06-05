@@ -41,9 +41,11 @@ type lineWorksInstanceConfig struct {
 //
 // pairingSvc is accepted for signature compatibility and wired into the channel
 // via the embedded BaseChannel; LINE WORKS uses the same DM/group policy gate
-// as the other channels.
+// as the other channels. pendingStore (when non-nil) backs the group history
+// with DB persistence — see FactoryWithPendingStore.
 func Factory(name string, creds json.RawMessage, cfg json.RawMessage,
-	msgBus *bus.MessageBus, pairingSvc store.PairingStore) (channels.Channel, error) {
+	msgBus *bus.MessageBus, pairingSvc store.PairingStore,
+	pendingStore store.PendingMessageStore) (channels.Channel, error) {
 
 	var cr lineWorksCreds
 	if len(creds) > 0 {
@@ -97,16 +99,21 @@ func Factory(name string, creds json.RawMessage, cfg json.RawMessage,
 	if pairingSvc != nil {
 		ch.SetPairingService(pairingSvc)
 	}
+	// Wire the pending-message store so Start builds a DB-backed group history.
+	if pendingStore != nil {
+		ch.SetPendingStore(pendingStore)
+	}
 	return ch, nil
 }
 
 // FactoryWithPendingStore returns a ChannelFactory, matching the line channel's
-// helper shape so the gateway can register lineworks uniformly. LINE WORKS has
-// no pending-history requirement in v1, so the store is currently unused.
-func FactoryWithPendingStore(_ store.PendingMessageStore) channels.ChannelFactory {
+// helper shape so the gateway can register lineworks uniformly. The pending
+// store is threaded into the channel so group-history is DB-backed (used for
+// @-mention gating context accumulation).
+func FactoryWithPendingStore(pendingStore store.PendingMessageStore) channels.ChannelFactory {
 	return func(name string, creds json.RawMessage, cfg json.RawMessage,
 		msgBus *bus.MessageBus, pairingSvc store.PairingStore) (channels.Channel, error) {
-		return Factory(name, creds, cfg, msgBus, pairingSvc)
+		return Factory(name, creds, cfg, msgBus, pairingSvc, pendingStore)
 	}
 }
 

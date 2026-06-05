@@ -492,7 +492,7 @@ func runGateway() {
 		instanceLoader.RegisterFactory(channels.TypeWhatsApp, whatsapp.FactoryWithDBAudio(pgStores.DB, pgStores.PendingMessages, "pgx", audioMgr, pgStores.BuiltinTools))
 		instanceLoader.RegisterFactory(channels.TypeSlack, slackchannel.FactoryWithPendingStore(pgStores.PendingMessages))
 		instanceLoader.RegisterFactory(channels.TypeLine, makeLineFactoryWithEsmithKm(server))
-		instanceLoader.RegisterFactory(channels.TypeLineWorks, makeLineWorksFactory(server, pgStores.MCP, pgStores.ChannelInstances, pgStores.Agents))
+		instanceLoader.RegisterFactory(channels.TypeLineWorks, makeLineWorksFactory(server, pgStores.MCP, pgStores.ChannelInstances, pgStores.Agents, pgStores.PendingMessages, pgStores.ConfigPermissions, pgStores.Teams, pgStores.SubagentTasks))
 		instanceLoader.RegisterFactory(channels.TypeFacebook, facebook.Factory)
 		instanceLoader.RegisterFactory(channels.TypePancake, pancake.Factory)
 		if err := instanceLoader.LoadAll(context.Background()); err != nil {
