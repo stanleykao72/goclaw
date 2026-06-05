@@ -18,12 +18,12 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/eventbus"
 	"github.com/nextlevelbuilder/goclaw/internal/hooks"
 	hookbuiltin "github.com/nextlevelbuilder/goclaw/internal/hooks/builtin"
-	"github.com/nextlevelbuilder/goclaw/internal/orchestration"
 	httpapi "github.com/nextlevelbuilder/goclaw/internal/http"
 	kg "github.com/nextlevelbuilder/goclaw/internal/knowledgegraph"
 	mcpbridge "github.com/nextlevelbuilder/goclaw/internal/mcp"
 	"github.com/nextlevelbuilder/goclaw/internal/media"
 	memorypkg "github.com/nextlevelbuilder/goclaw/internal/memory"
+	"github.com/nextlevelbuilder/goclaw/internal/orchestration"
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
 	"github.com/nextlevelbuilder/goclaw/internal/sandbox"
 	"github.com/nextlevelbuilder/goclaw/internal/skills"
@@ -190,8 +190,17 @@ func wireExtras(
 		slog.Info("agent hooks dispatcher wired", "handlers", "command,http,prompt")
 	}
 
+	// Memory vault backend root (deployment-global; "" disables vault → db fallback).
+	// Computed once and shared by the resolver (auto-inject), the interceptors, and
+	// the memory_search tool.
+	var memVaultDir string
+	if appCfg.Agents.Defaults.Memory != nil && appCfg.Agents.Defaults.Memory.VaultDir != "" {
+		memVaultDir = config.ExpandHome(appCfg.Agents.Defaults.Memory.VaultDir)
+	}
+
 	resolver := agent.NewManagedResolver(agent.ResolverDeps{
 		AgentStore:             stores.Agents,
+		MemoryVaultDir:         memVaultDir,
 		ProviderStore:          stores.Providers,
 		ProviderReg:            providerReg,
 		ModelRegistry:          modelReg,
@@ -290,9 +299,10 @@ func wireExtras(
 	// Share ONE ContextFileInterceptor instance between read_file and write_file
 	// so they share the same cache.
 	// Write-capable tools share a memory interceptor with optional KG extraction hook.
+	// memVaultDir computed above (shared with resolver auto-inject + memory_search).
 	var writeMemIntc *tools.MemoryInterceptor
 	if stores.Memory != nil {
-		writeMemIntc = tools.NewMemoryInterceptor(stores.Memory, workspace)
+		writeMemIntc = tools.NewMemoryInterceptor(stores.Memory, workspace, memVaultDir)
 		// Hook KG extraction on memory writes if KG store is available
 		if stores.KnowledgeGraph != nil && stores.BuiltinTools != nil {
 			writeMemIntc.SetKGExtractFunc(buildKGExtractFunc(stores.KnowledgeGraph, stores.BuiltinTools, providerReg))
@@ -304,7 +314,7 @@ func wireExtras(
 				ia.SetContextFileInterceptor(contextFileInterceptor)
 			}
 			if stores.Memory != nil {
-				ia.SetMemoryInterceptor(tools.NewMemoryInterceptor(stores.Memory, workspace))
+				ia.SetMemoryInterceptor(tools.NewMemoryInterceptor(stores.Memory, workspace, memVaultDir))
 			}
 		}
 	}
@@ -331,7 +341,7 @@ func wireExtras(
 	if listTool, ok := toolsReg.Get("list_files"); ok {
 		if ia, ok := listTool.(tools.InterceptorAware); ok {
 			if stores.Memory != nil {
-				ia.SetMemoryInterceptor(tools.NewMemoryInterceptor(stores.Memory, workspace))
+				ia.SetMemoryInterceptor(tools.NewMemoryInterceptor(stores.Memory, workspace, memVaultDir))
 			}
 		}
 	}
@@ -363,6 +373,17 @@ func wireExtras(
 			}
 		}
 		slog.Info("memory layering enabled")
+	}
+
+	// Vault backend: wire the vault dir on memory_search so vault-mode agents grep
+	// their markdown files instead of Postgres FTS (independent of PG memory store).
+	if memVaultDir != "" {
+		if searchTool, ok := toolsReg.Get("memory_search"); ok {
+			if mst, ok := searchTool.(*tools.MemorySearchTool); ok {
+				mst.SetVaultDir(memVaultDir)
+			}
+		}
+		slog.Info("memory vault backend enabled", "dir", memVaultDir)
 	}
 
 	// V3: Wire episodic store + evolution metrics on memory tools (search + expand)

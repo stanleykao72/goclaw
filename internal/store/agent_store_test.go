@@ -6,6 +6,33 @@ import (
 	"testing"
 )
 
+func TestParseMemoryBackend(t *testing.T) {
+	cases := []struct {
+		name        string
+		otherConfig string
+		want        string
+	}{
+		{"unset defaults to db", "", "db"},
+		{"empty object defaults to db", `{}`, "db"},
+		{"explicit vault", `{"memory_backend":"vault"}`, "vault"},
+		{"explicit db", `{"memory_backend":"db"}`, "db"},
+		{"unknown value falls back to db", `{"memory_backend":"sqlite"}`, "db"},
+		{"wrong type falls back to db", `{"memory_backend":123}`, "db"},
+		{"malformed json falls back to db", `{not json`, "db"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ag := &AgentData{}
+			if c.otherConfig != "" {
+				ag.OtherConfig = json.RawMessage(c.otherConfig)
+			}
+			if got := ag.ParseMemoryBackend(); got != c.want {
+				t.Fatalf("ParseMemoryBackend() = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
 func TestParseReasoningConfigDefaultsToOff(t *testing.T) {
 	agent := &AgentData{}
 

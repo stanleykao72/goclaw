@@ -282,6 +282,37 @@ func (a *AgentData) ParsePromptMode() string {
 	return mode
 }
 
+// validMemoryBackends is the set of allowed memory_backend values.
+var validMemoryBackends = map[string]bool{
+	"db": true, "vault": true,
+}
+
+// ParseMemoryBackend returns the configured memory backend from OtherConfig JSONB.
+// Returns "db" (the native Postgres backend) when not set, empty, malformed, or
+// not in the whitelist — so any agent without an explicit, valid opt-in keeps the
+// unchanged DB memory path.
+func (a *AgentData) ParseMemoryBackend() string {
+	if len(a.OtherConfig) == 0 {
+		return "db"
+	}
+	var bag map[string]json.RawMessage
+	if json.Unmarshal(a.OtherConfig, &bag) != nil {
+		return "db"
+	}
+	raw, ok := bag["memory_backend"]
+	if !ok {
+		return "db"
+	}
+	var backend string
+	if json.Unmarshal(raw, &backend) != nil {
+		return "db"
+	}
+	if !validMemoryBackends[backend] {
+		return "db" // invalid value → default to db
+	}
+	return backend
+}
+
 // ParsePinnedSkills returns per-agent pinned skill names from OtherConfig JSONB.
 // Max 10 enforced. Returns nil if not set.
 func (a *AgentData) ParsePinnedSkills() []string {

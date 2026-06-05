@@ -75,16 +75,21 @@ func isMemoryPath(path, workspace string) bool {
 type KGExtractFunc func(ctx context.Context, agentID, userID, content string)
 
 // MemoryInterceptor routes memory file reads/writes to the MemoryStore.
-// Keeps MEMORY.md and memory/* in Postgres.
+// Keeps MEMORY.md and memory/* in Postgres (db backend). When an agent's
+// MemoryBackendFromCtx(ctx) == "vault" and vaultDir is set, memory reads/writes
+// are routed to Obsidian-markdown files under vaultDir instead (see memory_vault.go).
 type MemoryInterceptor struct {
 	memStore    store.MemoryStore
 	workspace   string
+	vaultDir    string // root for the vault backend ("" = vault unavailable → db fallback)
 	kgExtractFn KGExtractFunc
 }
 
 // NewMemoryInterceptor creates an interceptor backed by the given memory store.
-func NewMemoryInterceptor(ms store.MemoryStore, workspace string) *MemoryInterceptor {
-	return &MemoryInterceptor{memStore: ms, workspace: workspace}
+// vaultDir is the deployment-global Obsidian-markdown vault root ("" disables the
+// vault backend, so vault-mode agents safely fall back to db).
+func NewMemoryInterceptor(ms store.MemoryStore, workspace, vaultDir string) *MemoryInterceptor {
+	return &MemoryInterceptor{memStore: ms, workspace: workspace, vaultDir: vaultDir}
 }
 
 // SetKGExtractFunc sets the callback for KG extraction after memory writes.
@@ -92,12 +97,36 @@ func (m *MemoryInterceptor) SetKGExtractFunc(fn KGExtractFunc) {
 	m.kgExtractFn = fn
 }
 
+// WouldRouteVault reports whether a write to path would ACTUALLY be routed to the
+// vault backend (vault mode + vault dir configured + a vault memory path). The
+// file-writer ACL exemption at the write tool sites is bound to this so a write
+// can be exempted ONLY if it will in fact be intercepted into the vault — never
+// when it would fall through to a raw host write that already skipped the ACL.
+func (m *MemoryInterceptor) WouldRouteVault(ctx context.Context, path string) bool {
+	if m == nil || m.vaultDir == "" {
+		return false
+	}
+	if store.MemoryBackendFromCtx(ctx) != "vault" {
+		return false
+	}
+	return isMemoryPathForBackend("vault", path, effectiveWorkspace(ctx, m.workspace))
+}
+
 // ReadFile attempts to read a memory file from the DB.
 // Returns (content, true, nil) if handled, or ("", false, nil) if not a memory path.
 func (m *MemoryInterceptor) ReadFile(ctx context.Context, path string) (string, bool, error) {
 	ws := effectiveWorkspace(ctx, m.workspace)
-	if !isMemoryPath(path, ws) {
+	backend := store.MemoryBackendFromCtx(ctx)
+	if !isMemoryPathForBackend(backend, path, ws) {
 		return "", false, nil
+	}
+
+	// Vault backend: read from Obsidian-markdown files (bypasses Postgres).
+	if backend == "vault" {
+		if m.vaultDir != "" {
+			return readMemoryVaultFile(ctx, m.vaultDir, ws, path)
+		}
+		warnVaultFallbackOnce(ctx) // vault dir unset → fall through to db backend
 	}
 
 	agentID := store.AgentIDFromContext(ctx)
@@ -147,8 +176,19 @@ type MemoryWriteResult struct {
 // PreviousContent is populated in the result to allow callers to warn the agent.
 func (m *MemoryInterceptor) WriteFile(ctx context.Context, path, content string, appendMode bool) (MemoryWriteResult, error) {
 	ws := effectiveWorkspace(ctx, m.workspace)
-	if !isMemoryPath(path, ws) {
+	backend := store.MemoryBackendFromCtx(ctx)
+	if !isMemoryPathForBackend(backend, path, ws) {
 		return MemoryWriteResult{}, nil
+	}
+
+	// Vault backend: persist to Obsidian-markdown files (bypasses PutDocument/
+	// IndexDocument/KG). Group-shared scopes are writable by any member — the
+	// file-writer ACL exemption is enforced at the tool call sites.
+	if backend == "vault" {
+		if m.vaultDir != "" {
+			return writeMemoryVaultFile(ctx, m.vaultDir, ws, path, content, appendMode)
+		}
+		warnVaultFallbackOnce(ctx) // vault dir unset → fall through to db backend
 	}
 
 	agentID := store.AgentIDFromContext(ctx)
@@ -215,6 +255,14 @@ func (m *MemoryInterceptor) ListFiles(ctx context.Context, path string) (string,
 	ws := effectiveWorkspace(ctx, m.workspace)
 	if !isMemoryDir(path, ws) {
 		return "", false, nil
+	}
+
+	// Vault backend: list the scope folder on disk (bypasses Postgres).
+	if backend := store.MemoryBackendFromCtx(ctx); backend == "vault" {
+		if m.vaultDir != "" {
+			return listMemoryVaultFiles(ctx, m.vaultDir)
+		}
+		warnVaultFallbackOnce(ctx) // vault dir unset → fall through to db backend
 	}
 
 	agentID := store.AgentIDFromContext(ctx)

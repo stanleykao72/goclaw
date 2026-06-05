@@ -30,6 +30,7 @@ import (
 // ResolverDeps holds shared dependencies for the agent resolver.
 type ResolverDeps struct {
 	AgentStore     store.AgentStore
+	MemoryVaultDir string // deployment-global vault backend root ("" = vault disabled)
 	ProviderStore  store.ProviderStore
 	ProviderReg    *providers.Registry
 	ModelRegistry  providers.ModelRegistry // per-model context window + capabilities lookup
@@ -512,6 +513,8 @@ func NewManagedResolver(deps ResolverDeps) ResolverFunc {
 			DisabledTools:          disabledTools,
 			ReasoningConfig:        store.ResolveEffectiveReasoningConfig(providerReasoningDefaults, ag.ParseReasoningConfig()),
 			PromptMode:             PromptMode(ag.ParsePromptMode()),
+			MemoryBackend:          ag.ParseMemoryBackend(),
+			MemoryVaultDir:         deps.MemoryVaultDir,
 			PinnedSkills:           ag.ParsePinnedSkills(),
 			SelfEvolve:             ag.ParseSelfEvolve(),
 			AllowImageGeneration:   ag.ParseAllowImageGeneration(),

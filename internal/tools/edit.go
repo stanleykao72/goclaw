@@ -107,8 +107,12 @@ func (t *EditTool) Execute(ctx context.Context, args map[string]any) *Result {
 		return ErrorResult("old_string and new_string are identical")
 	}
 
-	// Group write permission check
-	if t.permStore != nil {
+	// Group write permission check.
+	// Exempt vault-mode memory writes: group-shared memory is writable by any
+	// member (the whole point of the vault backend). The exemption is bound to
+	// WouldRouteVault so it only fires when the write will ACTUALLY be intercepted
+	// into the vault — never when it would fall through to a raw host write.
+	if t.permStore != nil && !t.memIntc.WouldRouteVault(ctx, path) {
 		if err := store.CheckFileWriterPermission(ctx, t.permStore); err != nil {
 			return ErrorResult(err.Error())
 		}
