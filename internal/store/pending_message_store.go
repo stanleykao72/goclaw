@@ -46,6 +46,13 @@ type PendingMessageStore interface {
 	// Compact atomically deletes old messages (by IDs) and inserts a summary row.
 	Compact(ctx context.Context, deleteIDs []uuid.UUID, summary *PendingMessage) error
 
+	// DeleteByIDs removes the given pending messages by ID without inserting any
+	// summary row. Used by group-memory curation to trim already-curated
+	// messages after their content has been persisted to the vault (the deletion
+	// itself is the watermark — no summary placeholder is left behind). A no-op
+	// when ids is empty.
+	DeleteByIDs(ctx context.Context, ids []uuid.UUID) error
+
 	// DeleteStale removes messages older than the given duration for inactive groups.
 	DeleteStale(ctx context.Context, olderThan time.Duration) (int64, error)
 

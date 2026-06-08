@@ -550,6 +550,11 @@ func runGateway() {
 	// Start cron + heartbeat ticker, wire wake functions and adaptive throttle.
 	heartbeatTicker := startCronAndHeartbeat(pgStores, server, sched, msgBus, providerRegistry, channelMgr, cfg, heartbeatTool, heartbeatMethods)
 
+	// Start the LINE WORKS group memory curation sweep (periodic, business-hours
+	// agent-driven curation of unmentioned group discussion into vault LONGTERM.md).
+	curationSweep := newCurationSweeper(cfg, pgStores.PendingMessages, sched, pgStores.Agents, pgStores.Sessions, providerRegistry)
+	curationSweep.Start()
+
 	// Subscribe to agent events for channel streaming/reaction forwarding.
 	deps.wireChannelStreamingSubscriber()
 
@@ -603,6 +608,7 @@ func runGateway() {
 	deps.runLifecycle(ctx, cancel, lifecycleDeps{
 		sched:             sched,
 		heartbeatTicker:   heartbeatTicker,
+		curationSweep:     curationSweep,
 		quotaChecker:      quotaChecker,
 		webFetchTool:      webFetchTool,
 		ttsTool:           ttsTool,
