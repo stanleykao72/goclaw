@@ -84,12 +84,12 @@ type curationProviderResolver interface {
 // on each poll. This keeps the feature additive and avoids polluting the user
 // cron job list.
 type curationSweeper struct {
-	cfg      *config.Config
-	pending  store.PendingMessageStore
-	sched    curationScheduler
-	agents   curationAgentResolver
-	sessions curationSessionResetter
-	provReg  curationProviderResolver
+	cfg        *config.Config
+	pending    store.PendingMessageStore
+	sched      curationScheduler
+	agents     curationAgentResolver
+	sessions   curationSessionResetter
+	provReg    curationProviderResolver
 	stopCh     chan struct{}
 	wg         sync.WaitGroup
 	lastFire   time.Time // last time the cadence fired (zero = never)
@@ -149,6 +149,17 @@ func (s *curationSweeper) Stop() {
 	slog.Info("group curation sweep stopped")
 }
 
+// gc returns the group-curation config, never nil. When no curation.* keys are
+// configured the config pointer is nil; the *GroupMemoryCurationConfig methods
+// are nil-safe, but RAW field reads (Provider, Model) are not — so normalize to a
+// zero-value struct here so every use site (including raw field access) is safe.
+func (s *curationSweeper) gc() *config.GroupMemoryCurationConfig {
+	if s.cfg != nil && s.cfg.Channels.GroupCuration != nil {
+		return s.cfg.Channels.GroupCuration
+	}
+	return &config.GroupMemoryCurationConfig{}
+}
+
 func (s *curationSweeper) loop() {
 	defer s.wg.Done()
 	ticker := time.NewTicker(curationPollInterval)
@@ -160,7 +171,16 @@ func (s *curationSweeper) loop() {
 			return
 		case now := <-ticker.C:
 			if s.cadenceElapsed(now) {
-				s.sweep(context.Background())
+				// Guard: a bug in a single sweep/curation must never crash the
+				// whole gateway. Recover, log, and keep the ticker alive.
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							slog.Error("group curation: sweep panic recovered", "panic", r)
+						}
+					}()
+					s.sweep(context.Background())
+				}()
 			}
 		}
 	}
@@ -171,7 +191,7 @@ func (s *curationSweeper) loop() {
 // (or process start) in the configured timezone and returns true once now has
 // reached it, advancing lastFire to now.
 func (s *curationSweeper) cadenceElapsed(now time.Time) bool {
-	gc := s.cfg.Channels.GroupCuration
+	gc := s.gc()
 	expr := gc.EffectiveCadence()
 	tz := gc.EffectiveTimezone(s.cfg.Cron.DefaultTimezone)
 
@@ -208,7 +228,7 @@ func (s *curationSweeper) cadenceElapsed(now time.Time) bool {
 // sweep enumerates qualifying LINE WORKS groups and curates each. This is the
 // OUTER loop only — per-group curation is delegated to curateGroup.
 func (s *curationSweeper) sweep(ctx context.Context) {
-	gc := s.cfg.Channels.GroupCuration
+	gc := s.gc()
 	if !gc.IsEnabled() {
 		return
 	}
@@ -283,7 +303,7 @@ const curationExtraSystemPrompt = "[Group Memory Curation]\n" +
 // is derived by the tool layer from ChannelType+PeerKind+ChatID, identical to the
 // scope this function reads from to feed merge-delta.
 func (s *curationSweeper) curateGroup(ctx context.Context, channelName, historyKey string) {
-	gc := s.cfg.Channels.GroupCuration
+	gc := s.gc()
 
 	// [1] Read the group's pending discussion.
 	msgs, err := s.pending.ListByKey(ctx, channelName, historyKey)

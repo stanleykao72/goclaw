@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/nextlevelbuilder/goclaw/internal/agent"
+	"github.com/nextlevelbuilder/goclaw/internal/config"
 	"github.com/nextlevelbuilder/goclaw/internal/scheduler"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
@@ -40,6 +41,36 @@ func TestSweep_InjectsTenantForStoreReads(t *testing.T) {
 	// tenant-scoped ctx — otherwise curateGroup would have errored before scheduling.
 	if len(pending.deleted) != 1 {
 		t.Fatalf("expected trim to run under tenant-scoped ctx (1 delete), got %d", len(pending.deleted))
+	}
+}
+
+// Regression lock for the production SIGSEGV: when no curation.* config is set,
+// cfg.Channels.GroupCuration is NIL. The *GroupMemoryCurationConfig methods are
+// nil-safe but RAW field reads (Provider, Model) are not — curateGroup crashed
+// the whole gateway on gc.Provider. The sweeper must normalize gc to non-nil so
+// the default-on path runs without panicking even with zero config.
+func TestSweep_NilCurationConfigDoesNotPanic(t *testing.T) {
+	cfg := &config.Config{} // GroupCuration left nil, exactly like prod with no curation.* keys
+	pending := &fakePendingStore{
+		groups: []store.PendingMessageGroup{
+			{ChannelName: "lineworks", HistoryKey: "g1", MessageCount: 5},
+		},
+		byKey: map[string][]store.PendingMessage{
+			keyOf("lineworks", "g1"): mkMsgs("g1", 5),
+		},
+	}
+	sched := &fakeScheduler{outcome: scheduler.RunOutcome{Result: &agent.RunResult{}}}
+	s := newTestSweeper(cfg, pending, sched)
+
+	// Must NOT panic on the raw field reads (gc.Provider/gc.Model) in curateGroup.
+	s.sweep(context.Background())
+
+	if len(sched.captured) != 1 {
+		t.Fatalf("expected default-on curation with nil config (1 run), got %d", len(sched.captured))
+	}
+	// ModelOverride resolves to "" (zero value) when no curation config — fine.
+	if sched.captured[0].ModelOverride != "" {
+		t.Fatalf("expected empty ModelOverride with nil config, got %q", sched.captured[0].ModelOverride)
 	}
 }
 
