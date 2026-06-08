@@ -552,7 +552,7 @@ func runGateway() {
 
 	// Start the LINE WORKS group memory curation sweep (periodic, business-hours
 	// agent-driven curation of unmentioned group discussion into vault LONGTERM.md).
-	curationSweep := newCurationSweeper(cfg, pgStores.PendingMessages, sched, pgStores.Agents, pgStores.Sessions, providerRegistry)
+	curationSweep := newCurationSweeper(cfg, pgStores.PendingMessages, sched, pgStores.Agents, pgStores.ChannelInstances, pgStores.Sessions, providerRegistry)
 	curationSweep.Start()
 
 	// Subscribe to agent events for channel streaming/reaction forwarding.

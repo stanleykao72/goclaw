@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -71,6 +72,44 @@ func TestSweep_NilCurationConfigDoesNotPanic(t *testing.T) {
 	// ModelOverride resolves to "" (zero value) when no curation config — fine.
 	if sched.captured[0].ModelOverride != "" {
 		t.Fatalf("expected empty ModelOverride with nil config, got %q", sched.captured[0].ModelOverride)
+	}
+}
+
+// Curation MUST run as the agent that SERVES the channel (so write_file routes to
+// that agent's memory backend / vault), NOT the global default agent. Regression
+// lock for the prod bug where curation ran as the default agent (field-recorder)
+// and the vault was never written.
+func TestCurateGroup_UsesChannelServingAgent(t *testing.T) {
+	cfg := newTestCfg()
+	chanAgentID := uuid.Must(uuid.NewV7())
+	pending := &fakePendingStore{
+		byKey: map[string][]store.PendingMessage{
+			keyOf("lineworks", "g1"): mkMsgs("g1", 5),
+		},
+	}
+	sched := &fakeScheduler{outcome: scheduler.RunOutcome{Result: &agent.RunResult{}}}
+	agents := &fakeAgentResolver{
+		agent: &store.AgentData{AgentKey: "field-recorder", TenantID: store.MasterTenantID}, // the (wrong) default
+		byID: map[uuid.UUID]*store.AgentData{
+			chanAgentID: {AgentKey: "e-smith-hub", TenantID: store.MasterTenantID}, // the channel's agent
+		},
+	}
+	channels := &fakeChannelResolver{instances: []store.ChannelInstanceData{
+		{ChannelType: "lineworks", AgentID: chanAgentID},
+	}}
+	s := newCurationSweeper(cfg, pending, sched, agents, channels, &fakeSessionResetter{}, nil)
+
+	s.curateGroup(context.Background(), "lineworks", "g1")
+
+	if len(sched.captured) != 1 {
+		t.Fatalf("expected 1 run, got %d", len(sched.captured))
+	}
+	// The session key embeds the agent key — it MUST be the channel's agent, not the default.
+	if !strings.Contains(sched.captured[0].SessionKey, "e-smith-hub") {
+		t.Fatalf("curation must run as the channel's agent (e-smith-hub), got SessionKey %q", sched.captured[0].SessionKey)
+	}
+	if strings.Contains(sched.captured[0].SessionKey, "field-recorder") {
+		t.Fatalf("curation wrongly ran as the default agent (field-recorder): %q", sched.captured[0].SessionKey)
 	}
 }
 
