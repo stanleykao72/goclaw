@@ -53,10 +53,23 @@ type curationScheduler interface {
 	Schedule(ctx context.Context, lane string, req agent.RunRequest) <-chan scheduler.RunOutcome
 }
 
-// curationAgentResolver resolves the default agent (agent key + tenant) used to
-// scope the curation session and resolve the curator provider.
+// curationAgentResolver resolves the agent (key + tenant) used to scope the
+// curation session and the curator provider. GetByID maps the channel
+// instance's agent_id to the agent that SERVES the channel (its memory backend
+// decides where write_file lands — e.g. e-smith-hub uses the vault); GetDefault
+// is the fallback when no channel→agent mapping is found.
 type curationAgentResolver interface {
 	GetDefault(ctx context.Context) (*store.AgentData, error)
+	GetByID(ctx context.Context, id uuid.UUID) (*store.AgentData, error)
+}
+
+// curationChannelResolver lists channel instances so curation can find the
+// agent that serves a given channel type (the pending rows carry the channel
+// TYPE, e.g. "lineworks"). Required so curation runs as the channel's own agent
+// rather than the global default — otherwise the curator's memory backend is
+// wrong and the vault is never written.
+type curationChannelResolver interface {
+	ListEnabled(ctx context.Context) ([]store.ChannelInstanceData, error)
 }
 
 // curationSessionResetter resets + persists the curation session before each run
@@ -88,6 +101,7 @@ type curationSweeper struct {
 	pending    store.PendingMessageStore
 	sched      curationScheduler
 	agents     curationAgentResolver
+	channels   curationChannelResolver
 	sessions   curationSessionResetter
 	provReg    curationProviderResolver
 	stopCh     chan struct{}
@@ -103,6 +117,7 @@ func newCurationSweeper(
 	pending store.PendingMessageStore,
 	sched curationScheduler,
 	agents curationAgentResolver,
+	channels curationChannelResolver,
 	sess curationSessionResetter,
 	provReg curationProviderResolver,
 ) *curationSweeper {
@@ -111,6 +126,7 @@ func newCurationSweeper(
 		pending:  pending,
 		sched:    sched,
 		agents:   agents,
+		channels: channels,
 		sessions: sess,
 		provReg:  provReg,
 		stopCh:   make(chan struct{}),
@@ -158,6 +174,35 @@ func (s *curationSweeper) gc() *config.GroupMemoryCurationConfig {
 		return s.cfg.Channels.GroupCuration
 	}
 	return &config.GroupMemoryCurationConfig{}
+}
+
+// resolveChannelAgent returns the agent that serves the given channel TYPE
+// (e.g. "lineworks"), by matching a channel instance's ChannelType and looking
+// up its agent_id. Returns nil when no mapping is found (caller falls back to the
+// default agent). This is what makes curation run as the channel's own agent so
+// write_file routes to that agent's memory backend (the vault).
+func (s *curationSweeper) resolveChannelAgent(ctx context.Context, channelName string) *store.AgentData {
+	if s.channels == nil || s.agents == nil {
+		return nil
+	}
+	instances, err := s.channels.ListEnabled(ctx)
+	if err != nil {
+		slog.Warn("group curation: list channel instances failed", "error", err)
+		return nil
+	}
+	for _, inst := range instances {
+		if inst.ChannelType != channelName {
+			continue
+		}
+		ag, aerr := s.agents.GetByID(ctx, inst.AgentID)
+		if aerr != nil || ag == nil {
+			slog.Warn("group curation: channel agent lookup failed",
+				"channel", channelName, "agent_id", inst.AgentID, "error", aerr)
+			return nil
+		}
+		return ag
+	}
+	return nil
 }
 
 func (s *curationSweeper) loop() {
@@ -316,17 +361,22 @@ func (s *curationSweeper) curateGroup(ctx context.Context, channelName, historyK
 		return
 	}
 
-	// [2] Resolve the default agent (for session scope + tenant + provider).
+	// [2] Resolve the agent that SERVES this channel (its memory backend decides
+	// where write_file lands — the lineworks channel's agent uses the vault). Fall
+	// back to the default agent only if no channel→agent mapping is found (and warn,
+	// since the default's backend may not be the vault → curation would not persist).
 	agentKey := s.cfg.ResolveDefaultAgentID()
 	var tenantID uuid.UUID
-	if s.agents != nil {
+	if ag := s.resolveChannelAgent(ctx, channelName); ag != nil {
+		agentKey = ag.AgentKey
+		tenantID = ag.TenantID
+	} else if s.agents != nil {
 		if ag, aerr := s.agents.GetDefault(ctx); aerr == nil && ag != nil {
 			agentKey = ag.AgentKey
 			tenantID = ag.TenantID
-		} else if aerr != nil {
-			slog.Debug("group curation: default agent lookup failed, using config default",
-				"error", aerr)
 		}
+		slog.Warn("group curation: no channel→agent mapping; using default agent — vault may not be written if its memory backend is not the vault",
+			"channel", channelName, "agent", agentKey)
 	}
 
 	// [3] Read existing LONGTERM.md for the scope so the prompt can merge-delta.

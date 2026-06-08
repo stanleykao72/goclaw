@@ -131,14 +131,35 @@ func (f *fakeScheduler) Schedule(ctx context.Context, lane string, req agent.Run
 	return ch
 }
 
-// fakeAgentResolver returns a fixed default agent.
+// fakeAgentResolver returns a fixed default agent, and (for GetByID) any agent
+// registered in byID, else the default agent.
 type fakeAgentResolver struct {
 	agent *store.AgentData
 	err   error
+	byID  map[uuid.UUID]*store.AgentData
 }
 
 func (f *fakeAgentResolver) GetDefault(ctx context.Context) (*store.AgentData, error) {
 	return f.agent, f.err
+}
+
+func (f *fakeAgentResolver) GetByID(ctx context.Context, id uuid.UUID) (*store.AgentData, error) {
+	if f.byID != nil {
+		if a, ok := f.byID[id]; ok {
+			return a, nil
+		}
+	}
+	return f.agent, f.err
+}
+
+// fakeChannelResolver returns a fixed channel-instance list for channel→agent mapping.
+type fakeChannelResolver struct {
+	instances []store.ChannelInstanceData
+	err       error
+}
+
+func (f *fakeChannelResolver) ListEnabled(ctx context.Context) ([]store.ChannelInstanceData, error) {
+	return f.instances, f.err
 }
 
 // fakeSessionResetter records reset/save calls.
@@ -170,6 +191,7 @@ func newTestCfg() *config.Config {
 func newTestSweeper(cfg *config.Config, pending store.PendingMessageStore, sched curationScheduler) *curationSweeper {
 	return newCurationSweeper(cfg, pending, sched,
 		&fakeAgentResolver{agent: &store.AgentData{AgentKey: "default", TenantID: store.MasterTenantID}},
+		&fakeChannelResolver{}, // empty → resolveChannelAgent nil → default agent (existing behavior)
 		&fakeSessionResetter{},
 		nil, // provReg unused unless Provider set
 	)
@@ -440,6 +462,7 @@ func TestCurateGroup_ProviderOverrideResolved(t *testing.T) {
 	provReg := &fakeProviderResolver{}
 	s := newCurationSweeper(cfg, pending, sched,
 		&fakeAgentResolver{agent: &store.AgentData{AgentKey: "default", TenantID: store.MasterTenantID}},
+		&fakeChannelResolver{},
 		&fakeSessionResetter{},
 		provReg,
 	)
