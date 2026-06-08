@@ -143,6 +143,28 @@ func (s *SQLitePendingMessageStore) Compact(ctx context.Context, deleteIDs []uui
 	return tx.Commit()
 }
 
+// DeleteByIDs deletes the given pending messages by ID, without inserting any
+// summary row. Used by group-memory curation to trim already-curated messages.
+func (s *SQLitePendingMessageStore) DeleteByIDs(ctx context.Context, ids []uuid.UUID) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	placeholders := make([]string, len(ids))
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	_, err := s.db.ExecContext(ctx,
+		fmt.Sprintf("DELETE FROM channel_pending_messages WHERE id IN (%s)", strings.Join(placeholders, ",")),
+		args...,
+	)
+	if err != nil {
+		return fmt.Errorf("delete pending by ids: %w", err)
+	}
+	return nil
+}
+
 func (s *SQLitePendingMessageStore) DeleteStale(ctx context.Context, olderThan time.Duration) (int64, error) {
 	cutoff := time.Now().Add(-olderThan)
 	tid := tenantIDForInsert(ctx)

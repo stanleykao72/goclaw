@@ -26,6 +26,7 @@ import (
 type lifecycleDeps struct {
 	sched             *scheduler.Scheduler
 	heartbeatTicker   *heartbeat.Ticker
+	curationSweep     *curationSweeper
 	quotaChecker      *channels.QuotaChecker
 	webFetchTool      *tools.WebFetchTool
 	ttsTool           *tools.TtsTool
@@ -192,6 +193,9 @@ func (d *gatewayDeps) runLifecycle(
 		d.channelMgr.StopAll(context.Background())
 		d.pgStores.Cron.Stop()
 		deps.heartbeatTicker.Stop()
+		if deps.curationSweep != nil {
+			deps.curationSweep.Stop()
+		}
 		if taskTicker != nil {
 			taskTicker.Stop()
 		}

@@ -85,6 +85,29 @@ func (c *Config) ApplySystemConfigs(configs map[string]string) {
 		str("compaction.model", &pc.Model)
 	}
 
+	// Group memory curation (LINE WORKS pending -> vault LONGTERM.md via agent turn).
+	// Any curation.* key present materializes the config; absent keys keep struct
+	// defaults (resolved via the Effective* / IsEnabled helpers at use sites).
+	if hasCurationKey(configs) {
+		if c.Channels.GroupCuration == nil {
+			c.Channels.GroupCuration = &GroupMemoryCurationConfig{}
+		}
+		gc := c.Channels.GroupCuration
+		boolean("curation.enabled", &gc.Enabled)
+		str("curation.cadence", &gc.Cadence)
+		str("curation.timezone", &gc.Timezone)
+		integer("curation.min_pending", &gc.MinPending)
+		integer("curation.keep_recent", &gc.KeepRecent)
+		str("curation.model", &gc.Model)
+		str("curation.provider", &gc.Provider)
+		if v, ok := configs["curation.disabled_groups"]; ok && v != "" {
+			var groups []string
+			if err := json.Unmarshal([]byte(v), &groups); err == nil {
+				gc.DisabledGroups = groups
+			}
+		}
+	}
+
 	// Allowed paths (JSON array)
 	if v, ok := configs["allowed_paths"]; ok && v != "" {
 		var paths []string
@@ -92,4 +115,24 @@ func (c *Config) ApplySystemConfigs(configs map[string]string) {
 			c.Agents.Defaults.AllowedPaths = paths
 		}
 	}
+}
+
+// hasCurationKey reports whether any group-curation config key is present, so the
+// loader only materializes the config struct when it is actually configured.
+func hasCurationKey(configs map[string]string) bool {
+	for _, k := range []string{
+		"curation.enabled",
+		"curation.cadence",
+		"curation.timezone",
+		"curation.min_pending",
+		"curation.keep_recent",
+		"curation.model",
+		"curation.provider",
+		"curation.disabled_groups",
+	} {
+		if _, ok := configs[k]; ok {
+			return true
+		}
+	}
+	return false
 }
