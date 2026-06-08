@@ -52,6 +52,10 @@ func (c *Channel) handleBotCommand(ctx context.Context, ev callbackEvent) bool {
 	chatID, peerKind := peerOf(ev.Source)
 	senderID := senderPrefix + ev.Source.UserID
 
+	// Resolve the requesting user's preferred language once for this command so
+	// every fixed reply below is localized to them. Falls back to "en".
+	lang := c.resolveUserLang(ctx, ev.Source.UserID)
+
 	switch cmd {
 	case "/reset", "/new":
 		// In groups, restrict reset of the shared conversation history once file
@@ -75,63 +79,63 @@ func (c *Channel) handleBotCommand(ctx context.Context, ev callbackEvent) bool {
 					if perr != nil {
 						slog.Warn("LINEWORKS: reset writer check failed (fail-open)", "err", perr, "sender", ev.Source.UserID)
 					} else if !isWriter {
-						c.replyCommand(ctx, ev, "Only file writers can reset conversation history in this group.")
+						c.replyCommand(ctx, ev, localize(lang, keyResetWriterGate))
 						return true
 					}
 				}
 			}
 		}
 		c.publishCommand(ev, chatID, peerKind, senderID, "reset", "/reset")
-		c.replyCommand(ctx, ev, "Conversation history has been reset.")
+		c.replyCommand(ctx, ev, localize(lang, keyResetDone))
 		return true
 
 	case "/stop":
 		c.publishCommand(ev, chatID, peerKind, senderID, "stop", "/stop")
 		// Feedback (success/failure) is published by the consumer once the
 		// cancel result is known; we add only a tiny ack here.
-		c.replyCommand(ctx, ev, "Stopping current task…")
+		c.replyCommand(ctx, ev, localize(lang, keyStopOne))
 		return true
 
 	case "/stopall":
 		c.publishCommand(ev, chatID, peerKind, senderID, "stopall", "/stopall")
-		c.replyCommand(ctx, ev, "Stopping all tasks…")
+		c.replyCommand(ctx, ev, localize(lang, keyStopAll))
 		return true
 
 	case "/help":
-		c.replyCommand(ctx, ev, lineWorksHelpText())
+		c.replyCommand(ctx, ev, localize(lang, keyHelp))
 		return true
 
 	case "/status":
-		c.replyCommand(ctx, ev, c.statusText())
+		c.replyCommand(ctx, ev, c.statusText(lang))
 		return true
 
 	// --- Tier 2 admin commands (text carries the full argument string) ---
 	case "/addwriter":
-		c.handleWriterCommand(ctx, ev, text, "add")
+		c.handleWriterCommand(ctx, ev, text, "add", lang)
 		return true
 
 	case "/removewriter":
-		c.handleWriterCommand(ctx, ev, text, "remove")
+		c.handleWriterCommand(ctx, ev, text, "remove", lang)
 		return true
 
 	case "/writers":
-		c.handleListWriters(ctx, ev)
+		c.handleListWriters(ctx, ev, lang)
 		return true
 
 	case "/tasks":
-		c.handleTasksList(ctx, ev)
+		c.handleTasksList(ctx, ev, lang)
 		return true
 
 	case "/task_detail":
-		c.handleTaskDetail(ctx, ev, text)
+		c.handleTaskDetail(ctx, ev, text, lang)
 		return true
 
 	case "/subagents":
-		c.handleSubagentsList(ctx, ev)
+		c.handleSubagentsList(ctx, ev, lang)
 		return true
 
 	case "/subagent":
-		c.handleSubagentDetail(ctx, ev, text)
+		c.handleSubagentDetail(ctx, ev, text, lang)
 		return true
 
 	default:
@@ -181,39 +185,27 @@ func (c *Channel) replyCommand(ctx context.Context, ev callbackEvent, text strin
 	}
 }
 
-// lineWorksHelpText lists the Tier 1 commands available on this channel.
+// lineWorksHelpText lists the Tier 1 commands available on this channel, in the
+// canonical (English) language. The localized variant is selected at call time
+// via localize(lang, keyHelp); this wrapper is retained for tests and any
+// language-agnostic caller.
 func lineWorksHelpText() string {
-	return "Available commands:\n" +
-		"/new — Reset conversation history\n" +
-		"/reset — Reset conversation history\n" +
-		"/stop — Stop the current running task\n" +
-		"/stopall — Stop all running tasks\n" +
-		"/help — Show this help message\n" +
-		"/status — Show bot status\n" +
-		"\nAdmin commands:\n" +
-		"/addwriter <userId> — Add a file writer (group)\n" +
-		"/removewriter <userId> — Remove a file writer (group)\n" +
-		"/writers — List file writers (group)\n" +
-		"/tasks — List team tasks\n" +
-		"/task_detail <id> — Show a team task\n" +
-		"/subagents — List subagent tasks\n" +
-		"/subagent <id> — Show a subagent task\n" +
-		"\nJust send a message to chat with the AI."
+	return localize(langEN, keyHelp)
 }
 
 // statusText reports the channel's runtime status without invoking the agent:
 // channel name, running state, and the resolved bot name(s) used for group
-// mention gating (or a note that gating is disabled when unresolved).
-func (c *Channel) statusText() string {
-	running := "stopped"
+// mention gating (or a note that gating is disabled when unresolved). lang
+// selects the language for the fixed labels (the channel name and bot names are
+// data, not translated).
+func (c *Channel) statusText(lang string) string {
+	running := localize(lang, keyStatusStopped)
 	if c.IsRunning() {
-		running = "running"
+		running = localize(lang, keyStatusRunning)
 	}
-	names := "(unresolved — group mention gating disabled)"
+	names := localize(lang, keyStatusNamesUnresolved)
 	if bn := c.botNamesSnapshot(); len(bn) > 0 {
 		names = strings.Join(bn, ", ")
 	}
-	return "Bot status: " + running + "\n" +
-		"Channel: " + c.Name() + "\n" +
-		"Bot name(s): " + names
+	return localize(lang, keyStatusLine, running, c.Name(), names)
 }

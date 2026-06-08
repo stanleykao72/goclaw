@@ -427,6 +427,16 @@ func registerLineWorksAutobindHook(ch *lineworkschannel.Channel, name string, cr
 		return
 	}
 
+	// Wire the same odoo MCP server row into the channel so command replies can
+	// be localized to the requesting user's res.users.lang (autobind stores it
+	// as Env["odoo_lang"] on the per-user credential row read via mcpStore). This
+	// is independent of the gate registration below: even if directory/token-
+	// source setup fails further down, the channel can still resolve a lang from
+	// a credential a prior bind populated.
+	ch.SetCredsStore(mcpStore)
+	ch.SetMCPServerID(srv.ID)
+	ch.SetMCPEndpoint(srv.URL, token)
+
 	var cr lineWorksFactoryCreds
 	if len(creds) > 0 {
 		if err := json.Unmarshal(creds, &cr); err != nil {
