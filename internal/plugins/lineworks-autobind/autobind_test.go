@@ -131,10 +131,18 @@ func (f *fakeAgentStore) SetUserContextFile(_ context.Context, agentID uuid.UUID
 // odooStub serves the MCP search and the openclaw bind/verify endpoints.
 func odooStub(t *testing.T, login, code, apiKey string) *httptest.Server {
 	t.Helper()
+	return odooStubLang(t, login, "", code, apiKey)
+}
+
+// odooStubLang is odooStub with an explicit res.users.lang returned from the
+// MCP search (so lookupLang sees a value). Each MCP search row carries both
+// login and lang; lookupLogin/lookupLang each read only their own field.
+func odooStubLang(t *testing.T, login, lang, code, apiKey string) *httptest.Server {
+	t.Helper()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/mcp/v1/message", func(w http.ResponseWriter, r *http.Request) {
-		// search_records res.users → [{login}]
-		rows := []map[string]any{{"login": login}}
+		// search_records res.users → [{login, lang}]
+		rows := []map[string]any{{"login": login, "lang": lang}}
 		structured, _ := json.Marshal(rows)
 		resp := map[string]any{
 			"jsonrpc": "2.0", "id": 1,
@@ -193,6 +201,97 @@ func TestProvision_PrivateEmailPrimary(t *testing.T) {
 		if !strings.Contains(doc, want) {
 			t.Errorf("identity doc missing %q; got:\n%s", want, doc)
 		}
+	}
+}
+
+func TestProvision_StoresOdooLang(t *testing.T) {
+	// verify returns user id=6; lookupLang searches res.users(id=6) → lang.
+	srv := odooStubLang(t, "stanleykao72@gmail.com", "zh_TW", "123456", "langkey")
+	defer srv.Close()
+
+	creds := newFakeCredStore()
+	serverID := uuid.New()
+	h := New(Config{
+		Directory: stubDir{privateEmail: "stanleykao72@gmail.com"},
+		Creds:     creds,
+		ServerID:  serverID,
+		MCPURL:    srv.URL + "/mcp/v1/message",
+		MCPToken:  "gateway-tok",
+	})
+
+	if allow, _ := gate(h, "lwUID-lang"); !allow {
+		t.Fatal("expected allow for staff with lang lookup")
+	}
+
+	got, _ := creds.GetUserCredentials(context.Background(), serverID, "lineworks:lwUID-lang")
+	if got == nil || got.APIKey != "langkey" {
+		t.Fatalf("expected stored api_key 'langkey', got %+v", got)
+	}
+	if got.Env == nil || got.Env["odoo_lang"] != "zh_TW" {
+		t.Fatalf("expected Env[odoo_lang]=zh_TW, got Env=%+v", got.Env)
+	}
+}
+
+func TestProvision_NoLangNoEnv(t *testing.T) {
+	// res.users.lang empty → credential stored without an Env map (unchanged
+	// behavior on lookup miss).
+	srv := odooStubLang(t, "stanleykao72@gmail.com", "", "123456", "nolangkey")
+	defer srv.Close()
+
+	creds := newFakeCredStore()
+	serverID := uuid.New()
+	h := New(Config{
+		Directory: stubDir{privateEmail: "stanleykao72@gmail.com"},
+		Creds:     creds,
+		ServerID:  serverID,
+		MCPURL:    srv.URL + "/mcp/v1/message",
+		MCPToken:  "gateway-tok",
+	})
+
+	if allow, _ := gate(h, "lwUID-nolang"); !allow {
+		t.Fatal("expected allow for staff without lang")
+	}
+
+	got, _ := creds.GetUserCredentials(context.Background(), serverID, "lineworks:lwUID-nolang")
+	if got == nil || got.APIKey != "nolangkey" {
+		t.Fatalf("expected stored api_key 'nolangkey', got %+v", got)
+	}
+	if got.Env != nil {
+		t.Fatalf("expected no Env on empty lang, got Env=%+v", got.Env)
+	}
+}
+
+// A user bound before lang capture existed (credential has APIKey but no Env)
+// gets odoo_lang backfilled on their next message via the already-bound path,
+// WITHOUT re-binding, preserving the existing api_key.
+func TestBackfill_AlreadyBoundUserGetsLang(t *testing.T) {
+	srv := odooStubLang(t, "stanleykao72@gmail.com", "zh_TW", "123456", "ignored")
+	defer srv.Close()
+
+	creds := newFakeCredStore()
+	serverID := uuid.New()
+	// Pre-existing binding: api_key present, no Env (no stored lang).
+	_ = creds.SetUserCredentials(context.Background(), serverID, "lineworks:lwUID-old",
+		store.MCPUserCredentials{APIKey: "preexisting"})
+
+	h := New(Config{
+		Directory: stubDir{privateEmail: "stanleykao72@gmail.com"},
+		Creds:     creds,
+		ServerID:  serverID,
+		MCPURL:    srv.URL + "/mcp/v1/message",
+		MCPToken:  "gateway-tok",
+	})
+
+	if allow, _ := gate(h, "lwUID-old"); !allow {
+		t.Fatal("expected already-bound user to be allowed")
+	}
+
+	got, _ := creds.GetUserCredentials(context.Background(), serverID, "lineworks:lwUID-old")
+	if got == nil || got.APIKey != "preexisting" {
+		t.Fatalf("backfill must preserve the existing api_key, got %+v", got)
+	}
+	if got.Env == nil || got.Env["odoo_lang"] != "zh_TW" {
+		t.Fatalf("expected backfilled Env[odoo_lang]=zh_TW, got Env=%+v", got.Env)
 	}
 }
 

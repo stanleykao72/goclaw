@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
+
 	lw "github.com/nextlevelbuilder/goclaw/internal/lineworks"
 
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
@@ -103,6 +105,24 @@ type Channel struct {
 	// exact triggering message, but conversations are typically sequential.
 	groupLastSender sync.Map
 
+	// --- Command-reply localization (i18n) ---
+	//
+	// credsStore reads the per-user MCP credential row autobind populates; its
+	// Env["odoo_lang"] selects the language for the sender's fixed command
+	// replies. All four fields are optional: a nil credsStore (or zero
+	// mcpServerID) makes resolveUserLang fall back to "en" — the channel never
+	// fails because lang resolution is unavailable. Wired by makeLineWorksFactory
+	// from the same odoo MCP server row the autobind hook uses.
+	credsStore  credentialLangStore
+	mcpServerID uuid.UUID
+	mcpURL      string
+	mcpToken    string
+
+	// langCache memoizes lwUserID → resolved lang to avoid a credential read on
+	// every command. Guarded by langCacheMu with a TTL (langCacheTTL).
+	langCache   map[string]langCacheEntry
+	langCacheMu sync.Mutex
+
 	// ackPending tracks chats awaiting an agent reply (chatID → generation int64).
 	// LINE WORKS has no streaming / typing indicator and bot messages cannot be
 	// edited, so for a slow turn we send a one-off "processing" ack only if the
@@ -169,6 +189,117 @@ func (c *Channel) SetTeamStore(s store.TeamStore) { c.teamStore = s }
 // SetSubagentTaskStore wires the subagent task store backing /subagents and
 // /subagent. Optional: nil → those commands reply "unavailable".
 func (c *Channel) SetSubagentTaskStore(s store.SubagentTaskStore) { c.subagentTaskStore = s }
+
+// credentialLangStore is the minimal credential-store surface the channel needs
+// to resolve (and lazily backfill) a sender's preferred command-reply language.
+// store.MCPServerStore satisfies it; a fake implements it in tests. Kept narrow
+// so command-reply localization does not couple the channel to the full MCP
+// store contract.
+type credentialLangStore interface {
+	GetUserCredentials(ctx context.Context, serverID uuid.UUID, userID string) (*store.MCPUserCredentials, error)
+	SetUserCredentials(ctx context.Context, serverID uuid.UUID, userID string, creds store.MCPUserCredentials) error
+}
+
+// langCacheEntry is a memoized lang resolution with its expiry.
+type langCacheEntry struct {
+	lang   string
+	expiry time.Time
+}
+
+// langCacheTTL bounds how long a resolved lang is reused before re-reading the
+// credential row (so a user who changes their Odoo language is picked up within
+// the window without a per-message store round-trip).
+const langCacheTTL = 6 * time.Hour
+
+// SetCredsStore wires the credential store backing command-reply localization
+// (autobind writes Env["odoo_lang"] into the same rows). Optional: nil →
+// resolveUserLang returns "en". Mirrors SetAgentStore.
+func (c *Channel) SetCredsStore(s credentialLangStore) { c.credsStore = s }
+
+// SetMCPServerID sets the odoo MCP server row id the per-user credential is
+// stored under (the same id the autobind hook uses). Zero → resolveUserLang
+// returns "en".
+func (c *Channel) SetMCPServerID(id uuid.UUID) { c.mcpServerID = id }
+
+// SetMCPEndpoint wires the Odoo MCP JSON-RPC URL + bearer token used for the
+// lazy res.users.lang backfill. Both optional: an empty pair disables backfill
+// (resolveUserLang then relies solely on the lang autobind already stored).
+func (c *Channel) SetMCPEndpoint(url, token string) {
+	c.mcpURL = url
+	c.mcpToken = token
+}
+
+// resolveUserLang returns the command-reply language for a LINE WORKS sender,
+// normalized to one of the supported codes. Resolution order:
+//
+//  1. in-memory cache (langCacheTTL) — avoids a credential read per message;
+//  2. the per-user MCP credential's Env["odoo_lang"] (written by autobind);
+//  3. "en" fallback.
+//
+// It never panics and never blocks the command: any missing wiring, a store
+// error, or an unrecognized value all collapse to "en". The result is cached
+// (including the "en" fallback) so a steady-state conversation does at most one
+// credential read per TTL.
+func (c *Channel) resolveUserLang(ctx context.Context, lwUserID string) string {
+	if lwUserID == "" {
+		return langEN
+	}
+
+	// 1. Cache.
+	now := time.Now()
+	c.langCacheMu.Lock()
+	if c.langCache != nil {
+		if e, ok := c.langCache[lwUserID]; ok && now.Before(e.expiry) {
+			c.langCacheMu.Unlock()
+			return e.lang
+		}
+	}
+	c.langCacheMu.Unlock()
+
+	lang := c.resolveUserLangUncached(ctx, lwUserID)
+
+	// Cache the result (fallback included) to bound store round-trips.
+	c.langCacheMu.Lock()
+	if c.langCache == nil {
+		c.langCache = make(map[string]langCacheEntry)
+	}
+	c.langCache[lwUserID] = langCacheEntry{lang: lang, expiry: now.Add(langCacheTTL)}
+	c.langCacheMu.Unlock()
+	return lang
+}
+
+// resolveUserLangUncached performs the actual credential lookup without touching
+// the cache. Returns a normalized lang ("en" on any miss/error).
+func (c *Channel) resolveUserLangUncached(_ context.Context, lwUserID string) string {
+	if c.credsStore == nil || c.mcpServerID == uuid.Nil {
+		return langEN
+	}
+	// userKey matches the namespace autobind binds under ("lineworks:<uid>").
+	userKey := senderPrefix + lwUserID
+	// Tenant alignment: autobind writes the per-user credential under
+	// MasterTenantID (its gate runs on a tenant-less context, so
+	// tenantIDForInsert falls back to Master). The command path may have
+	// overridden the context with the channel's own TenantID (for the admin ACL
+	// stores), which on a non-master deployment filters to a different partition
+	// and misses the row — making every reply fall back to "en". Read under a
+	// tenant-less context so it resolves to the SAME Master partition the write
+	// used, independent of the caller's tenant override.
+	readCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	uc, err := c.credsStore.GetUserCredentials(readCtx, c.mcpServerID, userKey)
+	if err != nil || uc == nil {
+		return langEN
+	}
+	if l := uc.Env["odoo_lang"]; l != "" {
+		return normalizeLang(l)
+	}
+	// No stored lang yet → English. The channel does not backfill here (it lacks
+	// the sender's Odoo uid at command time); instead the autobind hook backfills
+	// Env["odoo_lang"] on the user's next message via its already-bound path
+	// (it has the login to query res.users.lang). So an already-bound user
+	// converges to their real language within one message, without re-binding.
+	return langEN
+}
 
 // SetPendingCompaction configures LLM-based auto-compaction for the group
 // pending history, so discussion that exceeds the history limit is summarized

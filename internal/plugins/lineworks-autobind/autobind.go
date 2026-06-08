@@ -291,6 +291,28 @@ func (h *Hook) evaluate(ctx context.Context, lwUserID, userKey string, isDM bool
 
 	// 3. Staff. If already bound, allow everywhere (and backfill identity).
 	if uc, gerr := h.cfg.Creds.GetUserCredentials(ctx, h.cfg.ServerID, userKey); gerr == nil && uc != nil && uc.APIKey != "" {
+		// Backfill the Odoo language for users bound before lang capture existed
+		// (their credential row has no Env["odoo_lang"]). One MCP lookup by login,
+		// guarded so it runs at most once — once odoo_lang is stored this branch
+		// is skipped. Preserves APIKey + Headers (SetUserCredentials is a full
+		// replace). Best-effort: a failure does not block the message.
+		if uc.Env["odoo_lang"] == "" {
+			if lang, lerr := h.lookupLangByLogin(ctx, bindID); lerr != nil {
+				slog.Warn("lineworks-autobind: lang backfill lookup failed", "user", lwUserID, "err", lerr)
+			} else if lang != "" {
+				env := uc.Env
+				if env == nil {
+					env = map[string]string{}
+				}
+				env["odoo_lang"] = lang
+				if serr := h.cfg.Creds.SetUserCredentials(ctx, h.cfg.ServerID, userKey,
+					store.MCPUserCredentials{APIKey: uc.APIKey, Headers: uc.Headers, Env: env}); serr != nil {
+					slog.Warn("lineworks-autobind: lang backfill write failed", "user", lwUserID, "err", serr)
+				} else {
+					slog.Info("lineworks-autobind: backfilled odoo_lang for bound user", "user", lwUserID, "lang", lang)
+				}
+			}
+		}
 		h.writeIdentityContext(ctx, userKey, du, bindID, 0)
 		return true, "", h.cfg.SuccessTTL
 	}
@@ -315,8 +337,19 @@ func (h *Hook) evaluate(ctx context.Context, lwUserID, userKey string, isDM bool
 		slog.Warn("lineworks-autobind: openclaw verify failed (allow)", "user", lwUserID, "err", vErr)
 		return true, "", h.cfg.NegativeTTL
 	}
-	if serr := h.cfg.Creds.SetUserCredentials(ctx, h.cfg.ServerID, userKey,
-		store.MCPUserCredentials{APIKey: apiKey}); serr != nil {
+	// Fetch the bound user's Odoo res.users.lang so command replies can be
+	// localized to their preferred language. Fail-soft: a lookup error never
+	// blocks binding — we just store the credential without a lang.
+	lang, langErr := h.lookupLang(ctx, odoo.ID)
+	if langErr != nil {
+		slog.Warn("lineworks-autobind: res.users.lang lookup failed (provisioning without lang)", "user", lwUserID, "odoo_uid", odoo.ID, "err", langErr)
+		lang = ""
+	}
+	creds := store.MCPUserCredentials{APIKey: apiKey}
+	if lang != "" {
+		creds.Env = map[string]string{"odoo_lang": lang}
+	}
+	if serr := h.cfg.Creds.SetUserCredentials(ctx, h.cfg.ServerID, userKey, creds); serr != nil {
 		slog.Error("lineworks-autobind: SetUserCredentials failed (allow)", "user", lwUserID, "err", serr)
 		return true, "", h.cfg.NegativeTTL
 	}
@@ -403,6 +436,53 @@ func (h *Hook) lookupLogin(ctx context.Context, empID int) (string, error) {
 		return "", nil
 	}
 	return rows[0].Login, nil
+}
+
+// lookupLang runs an Odoo MCP search_records on res.users filtered by id,
+// returning the user's lang ("" if none). Mirrors lookupLogin.
+func (h *Hook) lookupLang(ctx context.Context, odooUID int) (string, error) {
+	var rows []struct {
+		Lang string `json:"lang"`
+	}
+	err := mcpToolCall(ctx, h.cfg.MCPURL, h.cfg.MCPToken, "search_records", map[string]any{
+		"model":  "res.users",
+		"domain": [][]any{{"id", "=", odooUID}},
+		"fields": []string{"lang"},
+		"limit":  1,
+	}, &rows)
+	if err != nil {
+		return "", err
+	}
+	if len(rows) == 0 {
+		return "", nil
+	}
+	return rows[0].Lang, nil
+}
+
+// lookupLangByLogin returns the Odoo res.users.lang for a given login/email,
+// used to backfill the language of users bound before lang capture existed (the
+// already-bound path has the login but not the uid). Mirrors lookupLang but
+// filters by login. Returns "" when no user matches.
+func (h *Hook) lookupLangByLogin(ctx context.Context, login string) (string, error) {
+	if login == "" {
+		return "", nil
+	}
+	var rows []struct {
+		Lang string `json:"lang"`
+	}
+	err := mcpToolCall(ctx, h.cfg.MCPURL, h.cfg.MCPToken, "search_records", map[string]any{
+		"model":  "res.users",
+		"domain": [][]any{{"login", "=", login}},
+		"fields": []string{"lang"},
+		"limit":  1,
+	}, &rows)
+	if err != nil {
+		return "", err
+	}
+	if len(rows) == 0 {
+		return "", nil
+	}
+	return rows[0].Lang, nil
 }
 
 // deriveBaseURL strips the MCP path suffix from a full MCP endpoint, yielding

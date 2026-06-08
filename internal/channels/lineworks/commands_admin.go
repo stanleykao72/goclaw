@@ -62,21 +62,21 @@ func (c *Channel) resolveAgentUUID(ctx context.Context) (uuid.UUID, error) {
 
 // handleWriterCommand implements /addwriter and /removewriter. action is "add"
 // or "remove". The target user id is taken from the command argument.
-func (c *Channel) handleWriterCommand(ctx context.Context, ev callbackEvent, text, action string) {
+func (c *Channel) handleWriterCommand(ctx context.Context, ev callbackEvent, text, action, lang string) {
 	_, peerKind := peerOf(ev.Source)
 	if peerKind != peerGroup {
-		c.replyCommand(ctx, ev, "This command only works in group chats.")
+		c.replyCommand(ctx, ev, localize(lang, keyWriterGroupOnly))
 		return
 	}
 	if c.configPermStore == nil {
-		c.replyCommand(ctx, ev, "File writer management is not available.")
+		c.replyCommand(ctx, ev, localize(lang, keyWriterUnavailable))
 		return
 	}
 
 	agentID, err := c.resolveAgentUUID(ctx)
 	if err != nil {
 		slog.Debug("lineworks.writer_cmd.agent_resolve_failed", "error", err)
-		c.replyCommand(ctx, ev, "File writer management is not available (no agent).")
+		c.replyCommand(ctx, ev, localize(lang, keyWriterUnavailableAgent))
 		return
 	}
 
@@ -97,11 +97,11 @@ func (c *Channel) handleWriterCommand(ctx context.Context, ev callbackEvent, tex
 			}
 		}
 		if !isWriter {
-			c.replyCommand(ctx, ev, "Only existing file writers can manage the writer list.")
+			c.replyCommand(ctx, ev, localize(lang, keyWriterOnlyWriters))
 			return
 		}
 	} else if action == "remove" {
-		c.replyCommand(ctx, ev, "No file writers configured yet. Use /addwriter to add the first one.")
+		c.replyCommand(ctx, ev, localize(lang, keyWriterNoneYet))
 		return
 	}
 
@@ -111,7 +111,7 @@ func (c *Channel) handleWriterCommand(ctx context.Context, ev callbackEvent, tex
 		if action == "remove" {
 			verb = "remove"
 		}
-		c.replyCommand(ctx, ev, fmt.Sprintf("Usage: /%swriter <userId>", verb))
+		c.replyCommand(ctx, ev, localize(lang, keyWriterUsage, verb))
 		return
 	}
 
@@ -127,41 +127,41 @@ func (c *Channel) handleWriterCommand(ctx context.Context, ev callbackEvent, tex
 			Metadata:   meta,
 		}); err != nil {
 			slog.Warn("lineworks.writer_cmd.add_failed", "error", err, "target", targetID)
-			c.replyCommand(ctx, ev, "Failed to add writer. Please try again.")
+			c.replyCommand(ctx, ev, localize(lang, keyWriterAddFailed))
 			return
 		}
-		c.replyCommand(ctx, ev, fmt.Sprintf("Added %s as a file writer.", targetID))
+		c.replyCommand(ctx, ev, localize(lang, keyWriterAdded, targetID))
 
 	case "remove":
 		if len(existingWriters) <= 1 {
-			c.replyCommand(ctx, ev, "Cannot remove the last file writer.")
+			c.replyCommand(ctx, ev, localize(lang, keyWriterRemoveLast))
 			return
 		}
 		if err := c.configPermStore.Revoke(ctx, agentID, groupID, store.ConfigTypeFileWriter, targetID); err != nil {
 			slog.Warn("lineworks.writer_cmd.remove_failed", "error", err, "target", targetID)
-			c.replyCommand(ctx, ev, "Failed to remove writer. Please try again.")
+			c.replyCommand(ctx, ev, localize(lang, keyWriterRemoveFailed))
 			return
 		}
-		c.replyCommand(ctx, ev, fmt.Sprintf("Removed %s from file writers.", targetID))
+		c.replyCommand(ctx, ev, localize(lang, keyWriterRemoved, targetID))
 	}
 }
 
 // handleListWriters implements /writers.
-func (c *Channel) handleListWriters(ctx context.Context, ev callbackEvent) {
+func (c *Channel) handleListWriters(ctx context.Context, ev callbackEvent, lang string) {
 	_, peerKind := peerOf(ev.Source)
 	if peerKind != peerGroup {
-		c.replyCommand(ctx, ev, "This command only works in group chats.")
+		c.replyCommand(ctx, ev, localize(lang, keyWriterGroupOnly))
 		return
 	}
 	if c.configPermStore == nil {
-		c.replyCommand(ctx, ev, "File writer management is not available.")
+		c.replyCommand(ctx, ev, localize(lang, keyWriterUnavailable))
 		return
 	}
 
 	agentID, err := c.resolveAgentUUID(ctx)
 	if err != nil {
 		slog.Debug("lineworks.writer_cmd.agent_resolve_failed", "error", err)
-		c.replyCommand(ctx, ev, "File writer management is not available (no agent).")
+		c.replyCommand(ctx, ev, localize(lang, keyWriterUnavailableAgent))
 		return
 	}
 
@@ -169,18 +169,18 @@ func (c *Channel) handleListWriters(ctx context.Context, ev callbackEvent) {
 	writers, err := c.configPermStore.List(ctx, agentID, store.ConfigTypeFileWriter, groupID)
 	if err != nil {
 		slog.Warn("lineworks.writer_cmd.list_failed", "error", err)
-		c.replyCommand(ctx, ev, "Failed to list writers. Please try again.")
+		c.replyCommand(ctx, ev, localize(lang, keyWriterListFailed))
 		return
 	}
 	if len(writers) == 0 {
-		c.replyCommand(ctx, ev, "No file writers configured for this group. Use /addwriter to add one.")
+		c.replyCommand(ctx, ev, localize(lang, keyWriterListEmpty))
 		return
 	}
 
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "File writers for this group (%d):\n", len(writers))
+	sb.WriteString(localize(lang, keyWriterListHeader, len(writers)))
 	for i, w := range writers {
-		fmt.Fprintf(&sb, "%d. %s (ID: %s)\n", i+1, channels.WriterLabel(w.Metadata, w.UserID), w.UserID)
+		sb.WriteString(localize(lang, keyWriterListRow, i+1, channels.WriterLabel(w.Metadata, w.UserID), w.UserID))
 	}
 	c.replyCommand(ctx, ev, sb.String())
 }
@@ -199,27 +199,27 @@ func writerCommandArg(text string) string {
 // --- /tasks, /task_detail ---
 
 // handleTasksList implements /tasks — lists team tasks.
-func (c *Channel) handleTasksList(ctx context.Context, ev callbackEvent) {
+func (c *Channel) handleTasksList(ctx context.Context, ev callbackEvent, lang string) {
 	if c.teamStore == nil {
-		c.replyCommand(ctx, ev, "Team features are not available.")
+		c.replyCommand(ctx, ev, localize(lang, keyTeamUnavailable))
 		return
 	}
 
 	agentID, err := c.resolveAgentUUID(ctx)
 	if err != nil {
 		slog.Debug("lineworks.tasks_cmd.agent_resolve_failed", "error", err)
-		c.replyCommand(ctx, ev, "Team features are not available (no agent).")
+		c.replyCommand(ctx, ev, localize(lang, keyTeamUnavailableAgent))
 		return
 	}
 
 	team, err := c.teamStore.GetTeamForAgent(ctx, agentID)
 	if err != nil {
 		slog.Warn("lineworks.tasks_cmd.get_team_failed", "error", err)
-		c.replyCommand(ctx, ev, "Failed to look up team. Please try again.")
+		c.replyCommand(ctx, ev, localize(lang, keyTeamLookupFailed))
 		return
 	}
 	if team == nil {
-		c.replyCommand(ctx, ev, "This agent is not part of any team.")
+		c.replyCommand(ctx, ev, localize(lang, keyTeamNotInTeam))
 		return
 	}
 
@@ -227,11 +227,11 @@ func (c *Channel) handleTasksList(ctx context.Context, ev callbackEvent) {
 	tasks, err := c.teamStore.ListTasks(ctx, team.ID, "newest", store.TeamTaskFilterAll, taskUserID(c.Name(), chatID, peerKind), "", "", 0, 0)
 	if err != nil {
 		slog.Warn("lineworks.tasks_cmd.list_failed", "error", err)
-		c.replyCommand(ctx, ev, "Failed to list tasks. Please try again.")
+		c.replyCommand(ctx, ev, localize(lang, keyTaskListFailed))
 		return
 	}
 	if len(tasks) == 0 {
-		c.replyCommand(ctx, ev, fmt.Sprintf("No tasks for team %q.", team.Name))
+		c.replyCommand(ctx, ev, localize(lang, keyTaskNoneForTeam, team.Name))
 		return
 	}
 
@@ -242,9 +242,9 @@ func (c *Channel) handleTasksList(ctx context.Context, ev callbackEvent) {
 
 	var sb strings.Builder
 	if total > lineWorksMaxTasksInList {
-		fmt.Fprintf(&sb, "Tasks for team %q (showing %d of %d):\n\n", team.Name, lineWorksMaxTasksInList, total)
+		sb.WriteString(localize(lang, keyTaskListHeaderTrunc, team.Name, lineWorksMaxTasksInList, total))
 	} else {
-		fmt.Fprintf(&sb, "Tasks for team %q (%d):\n\n", team.Name, total)
+		sb.WriteString(localize(lang, keyTaskListHeader, team.Name, total))
 	}
 	for i, t := range tasks {
 		owner := ""
@@ -253,38 +253,38 @@ func (c *Channel) handleTasksList(ctx context.Context, ev callbackEvent) {
 		}
 		fmt.Fprintf(&sb, "%d. %s %s%s\n   id: %s\n", i+1, taskStatusIcon(t.Status), t.Subject, owner, t.ID.String())
 	}
-	sb.WriteString("\nUse /task_detail <id> to view a task.")
+	sb.WriteString(localize(lang, keyTaskListFooter))
 	c.replyCommand(ctx, ev, sb.String())
 }
 
 // handleTaskDetail implements /task_detail <id> — shows detail for a task.
-func (c *Channel) handleTaskDetail(ctx context.Context, ev callbackEvent, text string) {
+func (c *Channel) handleTaskDetail(ctx context.Context, ev callbackEvent, text, lang string) {
 	idArg := writerCommandArg(text)
 	if idArg == "" {
-		c.replyCommand(ctx, ev, "Usage: /task_detail <task_id>")
+		c.replyCommand(ctx, ev, localize(lang, keyTaskDetailUsage))
 		return
 	}
 
 	if c.teamStore == nil {
-		c.replyCommand(ctx, ev, "Team features are not available.")
+		c.replyCommand(ctx, ev, localize(lang, keyTeamUnavailable))
 		return
 	}
 
 	agentID, err := c.resolveAgentUUID(ctx)
 	if err != nil {
 		slog.Debug("lineworks.task_detail_cmd.agent_resolve_failed", "error", err)
-		c.replyCommand(ctx, ev, "Team features are not available (no agent).")
+		c.replyCommand(ctx, ev, localize(lang, keyTeamUnavailableAgent))
 		return
 	}
 
 	team, err := c.teamStore.GetTeamForAgent(ctx, agentID)
 	if err != nil {
 		slog.Warn("lineworks.task_detail_cmd.get_team_failed", "error", err)
-		c.replyCommand(ctx, ev, "Failed to look up team. Please try again.")
+		c.replyCommand(ctx, ev, localize(lang, keyTeamLookupFailed))
 		return
 	}
 	if team == nil {
-		c.replyCommand(ctx, ev, "This agent is not part of any team.")
+		c.replyCommand(ctx, ev, localize(lang, keyTeamNotInTeam))
 		return
 	}
 
@@ -292,7 +292,7 @@ func (c *Channel) handleTaskDetail(ctx context.Context, ev callbackEvent, text s
 	tasks, err := c.teamStore.ListTasks(ctx, team.ID, "newest", store.TeamTaskFilterAll, taskUserID(c.Name(), chatID, peerKind), "", "", 0, 0)
 	if err != nil {
 		slog.Warn("lineworks.task_detail_cmd.list_failed", "error", err)
-		c.replyCommand(ctx, ev, "Failed to list tasks. Please try again.")
+		c.replyCommand(ctx, ev, localize(lang, keyTaskListFailed))
 		return
 	}
 
@@ -305,7 +305,7 @@ func (c *Channel) handleTaskDetail(ctx context.Context, ev callbackEvent, text s
 			return
 		}
 	}
-	c.replyCommand(ctx, ev, fmt.Sprintf("Task %q not found. Use /tasks to see available tasks.", idArg))
+	c.replyCommand(ctx, ev, localize(lang, keyTaskNotFound, idArg))
 }
 
 // taskUserID composes the scoped user id for task filtering. Groups use
@@ -364,26 +364,26 @@ func formatTaskDetail(t *store.TeamTaskData) string {
 // --- /subagents, /subagent ---
 
 // handleSubagentsList implements /subagents — lists subagent tasks from DB.
-func (c *Channel) handleSubagentsList(ctx context.Context, ev callbackEvent) {
+func (c *Channel) handleSubagentsList(ctx context.Context, ev callbackEvent, lang string) {
 	if c.subagentTaskStore == nil {
-		c.replyCommand(ctx, ev, "Subagent task tracking is not available.")
+		c.replyCommand(ctx, ev, localize(lang, keySubUnavailable))
 		return
 	}
 
 	agentKey := c.AgentID()
 	if agentKey == "" {
-		c.replyCommand(ctx, ev, "Subagent tasks are not available (no agent configured).")
+		c.replyCommand(ctx, ev, localize(lang, keySubUnavailableAgent))
 		return
 	}
 
 	tasks, err := c.subagentTaskStore.ListByParent(ctx, agentKey, "")
 	if err != nil {
 		slog.Warn("lineworks.subagents_cmd.list_failed", "error", err)
-		c.replyCommand(ctx, ev, "Failed to list subagent tasks. Please try again.")
+		c.replyCommand(ctx, ev, localize(lang, keySubListFailed))
 		return
 	}
 	if len(tasks) == 0 {
-		c.replyCommand(ctx, ev, "No subagent tasks found.")
+		c.replyCommand(ctx, ev, localize(lang, keySubNone))
 		return
 	}
 
@@ -394,9 +394,9 @@ func (c *Channel) handleSubagentsList(ctx context.Context, ev callbackEvent) {
 
 	var sb strings.Builder
 	if total > lineWorksMaxSubagentsInList {
-		fmt.Fprintf(&sb, "Subagent tasks (showing %d of %d):\n\n", lineWorksMaxSubagentsInList, total)
+		sb.WriteString(localize(lang, keySubListHeaderTrunc, lineWorksMaxSubagentsInList, total))
 	} else {
-		fmt.Fprintf(&sb, "Subagent tasks (%d):\n\n", total)
+		sb.WriteString(localize(lang, keySubListHeader, total))
 	}
 	for i, t := range tasks {
 		tokens := fmt.Sprintf("%s/%s tokens", formatTokenCount(t.InputTokens), formatTokenCount(t.OutputTokens))
@@ -410,38 +410,38 @@ func (c *Channel) handleSubagentsList(ctx context.Context, ev callbackEvent) {
 			fmt.Fprintf(&sb, "%d. %s %s (%s)\n   id: %s\n", i+1, subagentStatusIcon(t.Status), t.Subject, tokens, t.ID.String())
 		}
 	}
-	sb.WriteString("\nUse /subagent <id> to view a task.")
+	sb.WriteString(localize(lang, keySubListFooter))
 	c.replyCommand(ctx, ev, sb.String())
 }
 
 // handleSubagentDetail implements /subagent <id> — shows detail for a subagent
 // task.
-func (c *Channel) handleSubagentDetail(ctx context.Context, ev callbackEvent, text string) {
+func (c *Channel) handleSubagentDetail(ctx context.Context, ev callbackEvent, text, lang string) {
 	idArg := writerCommandArg(text)
 	if idArg == "" {
-		c.replyCommand(ctx, ev, "Usage: /subagent <task_id>")
+		c.replyCommand(ctx, ev, localize(lang, keySubDetailUsage))
 		return
 	}
 
 	if c.subagentTaskStore == nil {
-		c.replyCommand(ctx, ev, "Subagent task tracking is not available.")
+		c.replyCommand(ctx, ev, localize(lang, keySubUnavailable))
 		return
 	}
 
 	taskID, err := uuid.Parse(idArg)
 	if err != nil {
-		c.replyCommand(ctx, ev, fmt.Sprintf("Invalid task ID %q. Use /subagents to list tasks.", idArg))
+		c.replyCommand(ctx, ev, localize(lang, keySubInvalidID, idArg))
 		return
 	}
 
 	task, err := c.subagentTaskStore.Get(ctx, taskID)
 	if err != nil {
 		slog.Warn("lineworks.subagent_cmd.get_failed", "id", idArg, "error", err)
-		c.replyCommand(ctx, ev, "Failed to load subagent task. Please try again.")
+		c.replyCommand(ctx, ev, localize(lang, keySubLoadFailed))
 		return
 	}
 	if task == nil {
-		c.replyCommand(ctx, ev, fmt.Sprintf("Task %q not found. Use /subagents to see available tasks.", idArg))
+		c.replyCommand(ctx, ev, localize(lang, keySubNotFound, idArg))
 		return
 	}
 
