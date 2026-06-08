@@ -73,9 +73,30 @@ func TestGate_BareGroupCommand_DispatchesWithGatingEnabled(t *testing.T) {
 	}
 }
 
-// FIX 1: group /reset is writer-gated — only file writers may wipe the shared
-// group session. A non-writer is denied (no publish); a writer succeeds. 1:1
-// reset is never gated.
+// Open-until-configured: with NO file writer set for the group, anyone may
+// reset (no ACL = no restriction), so /new works out of the box.
+func TestGate_GroupReset_OpenWhenNoWriters(t *testing.T) {
+	c, mb := newGatingChannel(t, nil, true)
+	c.SetName("lineworks")
+	c.SetAgentID("agent-key-1")
+	c.SetTenantID(uuid.New())
+	c.SetAgentStore(fakeAgentStore{id: uuid.New()})
+	c.SetConfigPermStore(&recordingPermStore{}) // no writers configured
+
+	c.handleMessageEvent(groupEvent("grp1", "anyUser", "/reset"))
+
+	msg, ok := consume(t, mb)
+	if !ok {
+		t.Fatal("expected /reset to be open (publish) when no file writers are configured")
+	}
+	if msg.Metadata[tools.MetaCommand] != "reset" {
+		t.Fatalf("expected command=reset, got %q", msg.Metadata[tools.MetaCommand])
+	}
+}
+
+// FIX 1: once file writers are designated, group /reset is restricted — only
+// writers may wipe the shared group session. A non-writer is denied (no
+// publish); a writer succeeds. 1:1 reset is never gated.
 func TestGate_GroupReset_WriterGated(t *testing.T) {
 	c, mb := newGatingChannel(t, nil, true) // names nil → mention gate off; isolate the writer gate
 	c.SetName("lineworks")

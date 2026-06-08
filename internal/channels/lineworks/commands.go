@@ -54,19 +54,30 @@ func (c *Channel) handleBotCommand(ctx context.Context, ev callbackEvent) bool {
 
 	switch cmd {
 	case "/reset", "/new":
-		// In groups, only file writers may reset the shared conversation history
-		// (mirrors telegram). The gateway consumer performs no authorization of
-		// its own, so the gate must live here. Fail-open on a store error so a DB
-		// hiccup does not block resets.
+		// In groups, restrict reset of the shared conversation history once file
+		// writers are designated. The gateway consumer performs no authorization
+		// of its own, so the gate must live here.
+		//
+		// Open-until-configured: when NO file writer is set for the group, anyone
+		// may reset (no ACL = no restriction), so the feature is usable out of the
+		// box; once /addwriter designates writers, only they may reset. This
+		// matches the /addwriter bootstrap semantics. Fail-open on a store error
+		// so a DB hiccup never blocks resets.
 		if peerKind == peerGroup && c.configPermStore != nil {
 			if agentID, err := c.resolveAgentUUID(ctx); err == nil {
 				groupID := fmt.Sprintf("group:%s:%s", c.Name(), ev.Source.ChannelID)
-				isWriter, perr := c.configPermStore.CheckPermission(ctx, agentID, groupID, store.ConfigTypeFileWriter, ev.Source.UserID)
-				if perr != nil {
-					slog.Warn("LINEWORKS: reset writer check failed (fail-open)", "err", perr, "sender", ev.Source.UserID)
-				} else if !isWriter {
-					c.replyCommand(ctx, ev, "Only file writers can reset conversation history in this group.")
-					return true
+				existing, lerr := c.configPermStore.ListFileWriters(ctx, agentID, groupID)
+				if lerr != nil {
+					slog.Warn("LINEWORKS: reset writer list failed (fail-open)", "err", lerr, "sender", ev.Source.UserID)
+				} else if len(existing) > 0 {
+					// Writers configured → enforce.
+					isWriter, perr := c.configPermStore.CheckPermission(ctx, agentID, groupID, store.ConfigTypeFileWriter, ev.Source.UserID)
+					if perr != nil {
+						slog.Warn("LINEWORKS: reset writer check failed (fail-open)", "err", perr, "sender", ev.Source.UserID)
+					} else if !isWriter {
+						c.replyCommand(ctx, ev, "Only file writers can reset conversation history in this group.")
+						return true
+					}
 				}
 			}
 		}
