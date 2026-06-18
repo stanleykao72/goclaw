@@ -16,7 +16,7 @@ import (
 
 // Chat runs the CLI synchronously and returns the final response.
 func (p *ClaudeCLIProvider) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
-	systemPrompt, userMsg, images := extractFromMessages(req.Messages)
+	systemPrompt, userMsg, images, _ := extractFromMessages(req.Messages)
 	sessionKey := extractStringOpt(req.Options, OptSessionKey)
 	model := req.Model
 	if model == "" {
@@ -80,7 +80,7 @@ func (p *ClaudeCLIProvider) Chat(ctx context.Context, req ChatRequest) (*ChatRes
 
 // ChatStream runs the CLI with stream-json output, calling onChunk for each text delta.
 func (p *ClaudeCLIProvider) ChatStream(ctx context.Context, req ChatRequest, onChunk func(StreamChunk)) (*ChatResponse, error) {
-	systemPrompt, userMsg, images := extractFromMessages(req.Messages)
+	systemPrompt, userMsg, images, _ := extractFromMessages(req.Messages)
 	sessionKey := extractStringOpt(req.Options, OptSessionKey)
 	model := req.Model
 	if model == "" {

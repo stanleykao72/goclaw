@@ -341,7 +341,7 @@ func (p *ACPProvider) Close() error {
 
 // extractACPContent extracts user message + images from ChatRequest into ACP ContentBlocks.
 func extractACPContent(req ChatRequest) []acp.ContentBlock {
-	systemPrompt, userMsg, images := extractFromMessages(req.Messages)
+	systemPrompt, userMsg, images, _ := extractFromMessages(req.Messages)
 	if userMsg == "" {
 		return nil
 	}

@@ -134,20 +134,34 @@ func (p *ClaudeCLIProvider) writeClaudeMD(workDir, systemPrompt string) {
 	}
 }
 
-// extractFromMessages extracts system prompt, last user message, and images from the messages array.
-func extractFromMessages(msgs []Message) (systemPrompt, userMsg string, images []ImageContent) {
-	for _, m := range msgs {
-		if m.Role == "system" {
-			systemPrompt = m.Content
-		}
-	}
-	// Find last user message
+// extractFromMessages splits the message array into the system prompt, the
+// latest user message (+ its images), and priorTurns — the ordered non-system
+// turns BEFORE that latest user message. priorTurns is empty for a fresh
+// single-turn request. It is consumed by cold-subprocess seeding (k-2) to
+// replay history the CLI .jsonl no longer has after a respawn; current callers
+// discard it (`_`), keeping behavior byte-identical until that wiring lands.
+func extractFromMessages(msgs []Message) (systemPrompt, userMsg string, images []ImageContent, priorTurns []Message) {
+	// Find the last user message (its index bounds priorTurns).
+	lastUserIdx := -1
 	for i := len(msgs) - 1; i >= 0; i-- {
 		if msgs[i].Role == "user" {
+			lastUserIdx = i
 			userMsg = msgs[i].Content
 			images = msgs[i].Images
 			break
 		}
+	}
+	// System prompt = last system message; priorTurns = ordered non-system
+	// turns excluding the latest user message.
+	for i, m := range msgs {
+		if m.Role == "system" {
+			systemPrompt = m.Content
+			continue
+		}
+		if i == lastUserIdx {
+			continue
+		}
+		priorTurns = append(priorTurns, m)
 	}
 	return
 }
