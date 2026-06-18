@@ -602,6 +602,11 @@ The fs/exec tools (`Bash,Edit,Read,Write,Glob,Grep`) stay disabled in BOTH cases
 | **k-3** | K tests | hermetic table-driven extract + transcript + cold-gate (`t.Setenv HOME`, NEVER exec real claude binary) | claude_cli_session_test.go | medium |
 | **i-3a** | I bridge dynamic-proxy substrate (Option A) | teach goclaw-bridge to discover/connect/proxy non-builtin per-agent external MCP tools — **§11 authoritative spec**; XL, [ESC:arch] registry-mutation concurrency | bridge_server.go, manager.go | xhigh |
 
+**Wave 2 execution status:**
+- **k-3** ✅ — hermetic tests for `extractFromMessages` (system split, last-user-msg, priorTurns ordering) + `buildColdSeedPreamble` (empty→"", order + role labels). K slice (k-1/k-2/k-3) complete.
+- **fu-j-4** ⤳ **SUBSUMED by §11 §2.7** — the per-sender actor for external-MCP grant-recheck (`bridge_tool.go:188-202`) is fixed by i-3a injecting the RESOLVED actor as the ctx `UserID` (so `UserIDFromContext` already returns the actor), NOT by editing `bridge_tool.go`. Any distinct builtin file-writer/exec per-sender gate is a separate, currently-undefined concern.
+- **i-3a** 🔴 **REMAINING (I-slice)** — the bridge dynamic-proxy substrate. HIGHEST-RISK, xhigh; §11 mandates security review before force-route code. Lands with i-3b atomically (wave 3).
+
 ### Wave 3 — Option A force-route wiring + I verification (deps: 0,1,2)
 
 | Unit | Name | Scope | Files | Effort |

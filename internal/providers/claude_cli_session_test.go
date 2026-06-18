@@ -3,6 +3,7 @@ package providers
 import (
 	"encoding/json"
 	"io"
+	"strings"
 	"testing"
 )
 
@@ -121,5 +122,67 @@ func TestBuildStreamJSONInput_NoText(t *testing.T) {
 	}
 	if len(msg.Message.Content) != 1 {
 		t.Errorf("content blocks = %d, want 1 (image only)", len(msg.Message.Content))
+	}
+}
+
+// --- extractFromMessages + cold-seed (k-1/k-2) tests ---
+
+func TestExtractFromMessages(t *testing.T) {
+	msgs := []Message{
+		{Role: "system", Content: "sys-prompt"},
+		{Role: "user", Content: "hello"},
+		{Role: "assistant", Content: "hi there"},
+		{Role: "user", Content: "latest question"},
+	}
+	sys, userMsg, _, prior := extractFromMessages(msgs)
+	if sys != "sys-prompt" {
+		t.Errorf("system = %q, want sys-prompt", sys)
+	}
+	if userMsg != "latest question" {
+		t.Errorf("userMsg = %q, want 'latest question'", userMsg)
+	}
+	// priorTurns = non-system turns BEFORE the latest user message.
+	if len(prior) != 2 {
+		t.Fatalf("priorTurns len = %d, want 2 (%+v)", len(prior), prior)
+	}
+	if prior[0].Role != "user" || prior[0].Content != "hello" {
+		t.Errorf("priorTurns[0] = %+v, want user/hello", prior[0])
+	}
+	if prior[1].Role != "assistant" || prior[1].Content != "hi there" {
+		t.Errorf("priorTurns[1] = %+v, want assistant/'hi there'", prior[1])
+	}
+}
+
+func TestExtractFromMessages_SingleTurn(t *testing.T) {
+	sys, userMsg, _, prior := extractFromMessages([]Message{
+		{Role: "system", Content: "s"},
+		{Role: "user", Content: "only message"},
+	})
+	if sys != "s" || userMsg != "only message" {
+		t.Errorf("got sys=%q user=%q", sys, userMsg)
+	}
+	if len(prior) != 0 {
+		t.Errorf("priorTurns = %+v, want empty for single-turn", prior)
+	}
+}
+
+func TestBuildColdSeedPreamble(t *testing.T) {
+	if got := buildColdSeedPreamble(nil); got != "" {
+		t.Errorf("empty priorTurns: got %q, want empty", got)
+	}
+	preamble := buildColdSeedPreamble([]Message{
+		{Role: "user", Content: "first"},
+		{Role: "assistant", Content: "second"},
+	})
+	if preamble == "" {
+		t.Fatal("non-empty priorTurns produced empty preamble")
+	}
+	for _, want := range []string{"User: first", "Assistant: second", "respond to the new message"} {
+		if !strings.Contains(preamble, want) {
+			t.Errorf("preamble missing %q; got:\n%s", want, preamble)
+		}
+	}
+	if strings.Index(preamble, "first") > strings.Index(preamble, "second") {
+		t.Error("preamble must keep turn order (first before second)")
 	}
 }
