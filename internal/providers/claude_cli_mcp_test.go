@@ -41,7 +41,7 @@ func TestVerifyBridgeContext_Level1_AllFields(t *testing.T) {
 	key := "gateway-token"
 	sig := SignBridgeContext(key, "agent1", "user1", "telegram", "chat1", "direct", "/ws", "tenant-123")
 
-	ok, tenantVerified := VerifyBridgeContext(key, "agent1", "user1", "telegram", "chat1", "direct", "/ws", "tenant-123", sig)
+	ok, tenantVerified, _ := VerifyBridgeContext(key, "agent1", "user1", "telegram", "chat1", "direct", "/ws", "tenant-123", sig)
 	if !ok {
 		t.Error("expected ok=true for valid level 1 signature")
 	}
@@ -57,7 +57,7 @@ func TestVerifyBridgeContext_Level2_OldSessionWithWorkspace(t *testing.T) {
 	// Level 1 fails (tenantID mismatch), level 2 matches (ignores tenantID).
 	sig := SignBridgeContext(key, "agent1", "user1", "telegram", "chat1", "direct", "/ws", "")
 
-	ok, tenantVerified := VerifyBridgeContext(key, "agent1", "user1", "telegram", "chat1", "direct", "/ws", "new-tenant-id", sig)
+	ok, tenantVerified, _ := VerifyBridgeContext(key, "agent1", "user1", "telegram", "chat1", "direct", "/ws", "new-tenant-id", sig)
 	if !ok {
 		t.Error("expected ok=true for level 2 fallback")
 	}
@@ -71,7 +71,7 @@ func TestVerifyBridgeContext_Level3_NoWorkspaceNoTenant(t *testing.T) {
 	// Signature from the oldest format (no workspace, no tenantID)
 	sig := SignBridgeContext(key, "agent1", "user1", "telegram", "chat1", "direct", "", "")
 
-	ok, tenantVerified := VerifyBridgeContext(key, "agent1", "user1", "telegram", "chat1", "direct", "/ws", "tenant-123", sig)
+	ok, tenantVerified, _ := VerifyBridgeContext(key, "agent1", "user1", "telegram", "chat1", "direct", "/ws", "tenant-123", sig)
 	if !ok {
 		t.Error("expected ok=true for level 3 fallback")
 	}
@@ -81,7 +81,7 @@ func TestVerifyBridgeContext_Level3_NoWorkspaceNoTenant(t *testing.T) {
 }
 
 func TestVerifyBridgeContext_InvalidSig(t *testing.T) {
-	ok, tenantVerified := VerifyBridgeContext("key", "agent1", "user1", "", "", "", "", "", "invalid-sig")
+	ok, tenantVerified, _ := VerifyBridgeContext("key", "agent1", "user1", "", "", "", "", "", "invalid-sig")
 	if ok {
 		t.Error("expected ok=false for invalid signature")
 	}
@@ -96,7 +96,7 @@ func TestVerifyBridgeContext_TenantNotTrustedOnFallback(t *testing.T) {
 	oldSig := SignBridgeContext(key, "agent1", "user1", "telegram", "chat1", "direct", "/ws", "")
 
 	// Attacker replays old sig but adds a fake tenantID header
-	ok, tenantVerified := VerifyBridgeContext(key, "agent1", "user1", "telegram", "chat1", "direct", "/ws", "fake-tenant-id", oldSig)
+	ok, tenantVerified, _ := VerifyBridgeContext(key, "agent1", "user1", "telegram", "chat1", "direct", "/ws", "fake-tenant-id", oldSig)
 	if !ok {
 		t.Error("expected ok=true (sig valid via fallback)")
 	}
@@ -109,7 +109,7 @@ func TestVerifyBridgeContext_EmptyFields(t *testing.T) {
 	key := "test-key"
 	sig := SignBridgeContext(key, "", "", "", "", "", "", "")
 
-	ok, tenantVerified := VerifyBridgeContext(key, "", "", "", "", "", "", "", sig)
+	ok, tenantVerified, _ := VerifyBridgeContext(key, "", "", "", "", "", "", "", sig)
 	if !ok {
 		t.Error("expected ok=true for empty fields with valid signature")
 	}
@@ -139,7 +139,7 @@ func TestVerifyBridgeContext_WithExtraParams(t *testing.T) {
 	sessionKey := "session-abc"
 	sig := SignBridgeContext(key, "agent1", "user1", "telegram", "chat1", "direct", "/ws", "tenant1", localKey, sessionKey)
 
-	ok, tenantVerified := VerifyBridgeContext(key, "agent1", "user1", "telegram", "chat1", "direct", "/ws", "tenant1", sig, localKey, sessionKey)
+	ok, tenantVerified, _ := VerifyBridgeContext(key, "agent1", "user1", "telegram", "chat1", "direct", "/ws", "tenant1", sig, localKey, sessionKey)
 	if !ok {
 		t.Error("expected ok=true for valid signature with extra params")
 	}
@@ -154,7 +154,7 @@ func TestVerifyBridgeContext_FallbackWithoutExtraParams(t *testing.T) {
 	sig := SignBridgeContext(key, "agent1", "user1", "telegram", "chat1", "direct", "/ws", "tenant1")
 
 	// New code passes localKey/sessionKey but signature was created without them
-	ok, tenantVerified := VerifyBridgeContext(key, "agent1", "user1", "telegram", "chat1", "direct", "/ws", "tenant1", sig, "-100123:topic:42", "session-abc")
+	ok, tenantVerified, _ := VerifyBridgeContext(key, "agent1", "user1", "telegram", "chat1", "direct", "/ws", "tenant1", sig, "-100123:topic:42", "session-abc")
 	if !ok {
 		t.Error("expected ok=true for fallback (pre-localKey session)")
 	}
@@ -168,14 +168,55 @@ func TestVerifyBridgeContext_ExtraParamOrderMatters(t *testing.T) {
 	sig := SignBridgeContext(key, "agent1", "user1", "", "", "", "", "", "localKey", "sessionKey")
 
 	// Verify with same order
-	ok, _ := VerifyBridgeContext(key, "agent1", "user1", "", "", "", "", "", sig, "localKey", "sessionKey")
+	ok, _, _ := VerifyBridgeContext(key, "agent1", "user1", "", "", "", "", "", sig, "localKey", "sessionKey")
 	if !ok {
 		t.Error("expected ok=true for same order")
 	}
 
 	// Verify with swapped order
-	ok2, _ := VerifyBridgeContext(key, "agent1", "user1", "", "", "", "", "", sig, "sessionKey", "localKey")
+	ok2, _, _ := VerifyBridgeContext(key, "agent1", "user1", "", "", "", "", "", sig, "sessionKey", "localKey")
 	if ok2 {
 		t.Error("expected ok=false for swapped extra param order")
+	}
+}
+
+// --- senderVerified (channelType+senderID) tier tests (fu-j J-substrate) ---
+
+func TestVerifyBridgeContext_SenderVerified(t *testing.T) {
+	key := "gateway-token"
+	localKey, sessionKey, channelType, senderID := "lk", "sk", "lineworks", "lineworks:42"
+
+	// (a) Sign WITH channelType+senderID differs from WITHOUT.
+	full := SignBridgeContext(key, "a", "u", "ch", "cid", "direct", "/ws", "ten", localKey, sessionKey, channelType, senderID)
+	base := SignBridgeContext(key, "a", "u", "ch", "cid", "direct", "/ws", "ten", localKey, sessionKey)
+	if full == base {
+		t.Error("signature with channelType+senderID must differ from without")
+	}
+
+	// (b) Full tier (4 extras) → senderVerified=true.
+	ok, tenantV, senderV := VerifyBridgeContext(key, "a", "u", "ch", "cid", "direct", "/ws", "ten", full, localKey, sessionKey, channelType, senderID)
+	if !ok || !tenantV || !senderV {
+		t.Errorf("full tier: ok=%v tenantVerified=%v senderVerified=%v, want all true", ok, tenantV, senderV)
+	}
+
+	// (c) Pre-channelType session (signed [localKey,sessionKey]) verified by new
+	// code passing 4 extras → matches L2 fallback → senderVerified=false.
+	ok, tenantV, senderV = VerifyBridgeContext(key, "a", "u", "ch", "cid", "direct", "/ws", "ten", base, localKey, sessionKey, channelType, senderID)
+	if !ok || !tenantV {
+		t.Errorf("L2 fallback: ok=%v tenantVerified=%v, want true,true", ok, tenantV)
+	}
+	if senderV {
+		t.Error("L2 fallback must return senderVerified=false (sender extras not in original sig)")
+	}
+
+	// (d) Forge resistance: attacker holds a valid OLD-format (base) sig and
+	// injects a DIFFERENT senderID. Must verify ok via fallback but
+	// senderVerified=false, so the bridge resolves zero creds under the forged sender.
+	ok, _, senderV = VerifyBridgeContext(key, "a", "u", "ch", "cid", "direct", "/ws", "ten", base, localKey, sessionKey, "lineworks", "attacker:99")
+	if !ok {
+		t.Error("forge case: base sig should still verify via fallback")
+	}
+	if senderV {
+		t.Error("forge case: injected senderID must NOT be senderVerified")
 	}
 }

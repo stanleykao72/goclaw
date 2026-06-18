@@ -45,6 +45,12 @@ const OptLocalKey = "local_key"
 // so it cannot be forged; absent for non-channel contexts.
 const OptSenderID = "sender_id"
 
+// OptChannelType passes the platform discriminator (e.g. "lineworks",
+// "telegram") — distinct from OptChannel which is the instance NAME. Threaded
+// into the HMAC as a trailing extra alongside OptSenderID; consumed by the
+// bridge to resolve the per-user MCP actor (see ResolveActorUserID).
+const OptChannelType = "channel_type"
+
 // ClaudeCLIProvider implements Provider by shelling out to the `claude` CLI binary.
 // It acts as a thin proxy: CLI manages session history, tool execution, and context.
 // GoClaw only forwards the latest user message and streams back the response.

@@ -264,6 +264,8 @@ func bridgeContextMiddleware(gatewayToken string, agentStore store.AgentStore, n
 		workspace := r.Header.Get("X-Workspace")
 		localKey := r.Header.Get("X-Local-Key")
 		sessionKey := r.Header.Get("X-Session-Key")
+		channelType := r.Header.Get("X-Channel-Type")
+		senderID := r.Header.Get("X-Sender-ID")
 
 		if agentIDStr != "" || userID != "" {
 			// Reject context headers when no gateway token — prevents unauthenticated impersonation.
@@ -277,7 +279,7 @@ func bridgeContextMiddleware(gatewayToken string, agentStore store.AgentStore, n
 			// Verify HMAC signature over all context fields.
 			tenantIDStr := r.Header.Get("X-Tenant-ID")
 			sig := r.Header.Get("X-Bridge-Sig")
-			ok, tenantVerified := providers.VerifyBridgeContext(gatewayToken, agentIDStr, userID, channel, chatID, peerKind, workspace, tenantIDStr, sig, localKey, sessionKey)
+			ok, tenantVerified, senderVerified := providers.VerifyBridgeContext(gatewayToken, agentIDStr, userID, channel, chatID, peerKind, workspace, tenantIDStr, sig, localKey, sessionKey, channelType, senderID)
 			if !ok {
 				slog.Warn("security.mcp_bridge: invalid bridge context signature",
 					"agent_id", agentIDStr, "user_id", userID)
@@ -315,6 +317,17 @@ func bridgeContextMiddleware(gatewayToken string, agentStore store.AgentStore, n
 			if tenantVerified && tenantIDStr != "" {
 				if tid, err := uuid.Parse(tenantIDStr); err == nil {
 					ctx = store.WithTenantID(ctx, tid)
+				}
+			}
+			// Inject sender identity + channel type only when the HMAC covers them
+			// (full tier). Fallback tiers must not trust unsigned X-Sender-ID /
+			// X-Channel-Type headers — forge resistance, mirroring tenantVerified.
+			if senderVerified {
+				if senderID != "" {
+					ctx = store.WithSenderID(ctx, senderID)
+				}
+				if channelType != "" {
+					ctx = tools.WithToolChannelType(ctx, channelType)
 				}
 			}
 		}

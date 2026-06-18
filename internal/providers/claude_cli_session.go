@@ -195,15 +195,16 @@ func extractBoolOpt(opts map[string]any, key string) bool {
 // bridgeContextFromOpts builds a BridgeContext from the Options map.
 func bridgeContextFromOpts(opts map[string]any) BridgeContext {
 	return BridgeContext{
-		AgentID:   extractStringOpt(opts, OptAgentID),
-		UserID:    extractStringOpt(opts, OptUserID),
-		Channel:   extractStringOpt(opts, OptChannel),
-		ChatID:    extractStringOpt(opts, OptChatID),
-		PeerKind:  extractStringOpt(opts, OptPeerKind),
-		Workspace: extractStringOpt(opts, OptWorkspace),
-		TenantID:  extractStringOpt(opts, OptTenantID),
-		LocalKey:  extractStringOpt(opts, OptLocalKey),
-		SenderID:  extractStringOpt(opts, OptSenderID),
+		AgentID:     extractStringOpt(opts, OptAgentID),
+		UserID:      extractStringOpt(opts, OptUserID),
+		Channel:     extractStringOpt(opts, OptChannel),
+		ChatID:      extractStringOpt(opts, OptChatID),
+		PeerKind:    extractStringOpt(opts, OptPeerKind),
+		Workspace:   extractStringOpt(opts, OptWorkspace),
+		TenantID:    extractStringOpt(opts, OptTenantID),
+		LocalKey:    extractStringOpt(opts, OptLocalKey),
+		SenderID:    extractStringOpt(opts, OptSenderID),
+		ChannelType: extractStringOpt(opts, OptChannelType),
 	}
 }
 
