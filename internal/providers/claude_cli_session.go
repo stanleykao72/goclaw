@@ -8,11 +8,22 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/google/uuid"
 	"github.com/nextlevelbuilder/goclaw/internal/config"
 )
+
+// claudeProjectPathEncoder matches how the Claude CLI encodes a working-directory
+// path into its ~/.claude/projects/<encoded> session-store directory name: every
+// character that is NOT [a-zA-Z0-9] (path separators, ".", "_", ":", AND non-ASCII
+// such as CJK channel names like "lineworks-主管群") is replaced with "-", one dash
+// per character. A previous strings.NewReplacer that only handled "/ _ . :" matched
+// for ASCII paths but diverged for non-ASCII session keys, so sessionFileExists
+// returned false and buildArgs chose --session-id for an already-existing session,
+// yielding "Session ID ... is already in use".
+var claudeProjectPathEncoder = regexp.MustCompile(`[^a-zA-Z0-9]`)
 
 // validCLIModels lists accepted model aliases for the Claude CLI.
 var validCLIModels = map[string]bool{
@@ -211,7 +222,7 @@ func sessionFileExists(workDir string, sessionID uuid.UUID) bool {
 	// CLI replaces path separators, "_", ".", and ":" with "-" in the path encoding.
 	// On Windows: C:\Users\foo → C--Users-foo (backslash + colon both become "-")
 	// On macOS/Linux: /home/foo → -home-foo (forward slash becomes "-")
-	encoded := strings.NewReplacer(string(filepath.Separator), "-", "_", "-", ".", "-", ":", "-").Replace(resolved)
+	encoded := claudeProjectPathEncoder.ReplaceAllString(resolved, "-")
 	sessionFile := filepath.Join(home, ".claude", "projects", encoded, sessionID.String()+".jsonl")
 	_, err = os.Stat(sessionFile)
 	return err == nil
@@ -280,7 +291,7 @@ func ResetCLISession(baseWorkDir, sessionKey string) {
 		if err != nil {
 			resolved = workDir
 		}
-		encoded := strings.NewReplacer(string(filepath.Separator), "-", "_", "-", ".", "-", ":", "-").Replace(resolved)
+		encoded := claudeProjectPathEncoder.ReplaceAllString(resolved, "-")
 		sessionFile := filepath.Join(home, ".claude", "projects", encoded, sessionID.String()+".jsonl")
 		if err := os.Remove(sessionFile); err == nil {
 			slog.Info("claude-cli: deleted session file on /reset", "path", sessionFile)
