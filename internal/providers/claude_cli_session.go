@@ -288,6 +288,41 @@ func buildStreamJSONInput(text string, images []ImageContent) *bytes.Reader {
 	return bytes.NewReader(data)
 }
 
+// buildColdSeedPreamble renders the compacted prior conversation turns as a
+// plain-text transcript to prepend to the current user message when seeding a
+// COLD (respawned) CLI subprocess whose .jsonl history is absent. The loop
+// already built+compacted the full history (extractFromMessages returns it as
+// priorTurns); on a cold subprocess the CLI cannot --resume it, so without this
+// the model loses all context (cat K respawn-amnesia).
+//
+// A text preamble (rather than a stream-json assistant-role transcript) is used
+// deliberately: it is deterministic and cannot break the cold path, whereas the
+// CLI's replay semantics for assistant-role stdin messages under
+// `--print --input-format stream-json` are not verifiable without the binary.
+// Callers gate this on sessionFileExists==false so it fires exactly once per
+// (re)spawn; warm turns keep last-msg-only + --resume (no double-replay).
+func buildColdSeedPreamble(priorTurns []Message) string {
+	if len(priorTurns) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("[Conversation so far in this session, replayed because the session was restarted. Use it as context; do not respond to it directly.]\n\n")
+	for _, m := range priorTurns {
+		switch m.Role {
+		case "user":
+			sb.WriteString("User: ")
+		case "assistant":
+			sb.WriteString("Assistant: ")
+		default:
+			sb.WriteString(m.Role + ": ")
+		}
+		sb.WriteString(strings.TrimSpace(m.Content))
+		sb.WriteString("\n\n")
+	}
+	sb.WriteString("[End of replayed history. Now respond to the new message below.]\n\n")
+	return sb.String()
+}
+
 // ResetCLISession deletes the Claude CLI session file and CLAUDE.md for a given session key.
 // Called on /reset to ensure the CLI starts fresh instead of --resume-ing poisoned history.
 // Safe to call even if CLI provider is not in use (no-op if files don't exist).

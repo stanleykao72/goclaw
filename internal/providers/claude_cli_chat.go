@@ -16,7 +16,7 @@ import (
 
 // Chat runs the CLI synchronously and returns the final response.
 func (p *ClaudeCLIProvider) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
-	systemPrompt, userMsg, images, _ := extractFromMessages(req.Messages)
+	systemPrompt, userMsg, images, priorTurns := extractFromMessages(req.Messages)
 	sessionKey := extractStringOpt(req.Options, OptSessionKey)
 	model := req.Model
 	if model == "" {
@@ -35,6 +35,14 @@ func (p *ClaudeCLIProvider) Chat(ctx context.Context, req ChatRequest) (*ChatRes
 	}
 
 	cliSessionID := deriveSessionUUID(sessionKey)
+	// K respawn-amnesia: seed a cold subprocess (.jsonl absent) with the loop's
+	// compacted prior turns as a text preamble; warm sessions keep last-msg-only
+	// + --resume (no double-replay). Fires exactly once per (re)spawn.
+	if !sessionFileExists(workDir, cliSessionID) {
+		if preamble := buildColdSeedPreamble(priorTurns); preamble != "" {
+			userMsg = preamble + userMsg
+		}
+	}
 	disableTools := extractBoolOpt(req.Options, OptDisableTools)
 	bc := bridgeContextFromOpts(req.Options)
 	mcpPath := p.resolveMCPConfigPath(ctx, sessionKey, bc)
@@ -80,7 +88,7 @@ func (p *ClaudeCLIProvider) Chat(ctx context.Context, req ChatRequest) (*ChatRes
 
 // ChatStream runs the CLI with stream-json output, calling onChunk for each text delta.
 func (p *ClaudeCLIProvider) ChatStream(ctx context.Context, req ChatRequest, onChunk func(StreamChunk)) (*ChatResponse, error) {
-	systemPrompt, userMsg, images, _ := extractFromMessages(req.Messages)
+	systemPrompt, userMsg, images, priorTurns := extractFromMessages(req.Messages)
 	sessionKey := extractStringOpt(req.Options, OptSessionKey)
 	model := req.Model
 	if model == "" {
@@ -104,6 +112,14 @@ func (p *ClaudeCLIProvider) ChatStream(ctx context.Context, req ChatRequest, onC
 	}
 
 	cliSessionID := deriveSessionUUID(sessionKey)
+	// K respawn-amnesia: seed a cold subprocess (.jsonl absent) with the loop's
+	// compacted prior turns as a text preamble; warm sessions keep last-msg-only
+	// + --resume (no double-replay). Fires exactly once per (re)spawn.
+	if !sessionFileExists(workDir, cliSessionID) {
+		if preamble := buildColdSeedPreamble(priorTurns); preamble != "" {
+			userMsg = preamble + userMsg
+		}
+	}
 	disableTools := extractBoolOpt(req.Options, OptDisableTools)
 	bc := bridgeContextFromOpts(req.Options)
 	mcpPath := p.resolveMCPConfigPath(ctx, sessionKey, bc)
