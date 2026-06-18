@@ -202,12 +202,36 @@ flowchart LR
   `X-Agent-ID/X-User-ID/X-Channel/X-Chat-ID/X-Peer-Kind/X-Session-Key` +
   `X-Bridge-Sig` (compute with the same signer behind `VerifyBridgeContext`).
 
-## 8. Risk-C verification (do first)
-Minimal probe on the VPS adapter: start `claude-agent-acp`, `initialize`,
-`session/new` with one HTTP MCP entry pointing at a throwaway local HTTP server
-that logs inbound headers; `session/prompt` something that lists/uses its tools;
-inspect whether the declared auth/custom headers arrived. Outcome selects HTTP vs
-stdio-shim and unblocks Phase 3.
+## 8. Risk-C verification — RESOLVED ✅ (2026-06-18)
+
+**Outcome: POSITIVE — the adapter forwards custom session/new HTTP MCP headers.**
+Transport decision: **HTTP+Headers** (the stdio-shim fallback is NOT needed).
+
+Two lines of evidence:
+
+1. **Code** — `claude-agent-acp@0.47.0` `dist/acp-agent.js:2143-2152` maps a
+   session/new MCP entry of shape `{type:"http"|"sse", name, url, headers:[{name,
+   value}]}` into the SDK config `{type, url, headers: Object.fromEntries(...)}`,
+   i.e. it passes the headers through to `claude-agent-sdk`.
+2. **Wire (empirical, VPS)** — a header-logging HTTP server received the adapter's
+   `POST /mcp` carrying both declared headers verbatim:
+   `Authorization: Bearer probe-abc` and `x-probe-token: sekret123`
+   (`User-Agent: claude-code/2.1.179 (sdk-ts, agent-sdk/0.3.179)`), confirming the
+   bundled SDK actually sends them over the wire.
+
+**Consequences (lock these into the foundation):**
+- `NewSessionMCPCfg` (found-1) MUST carry `Type string` (`"http"`) and
+  `Headers []HeaderEntry{ Name, Value string }` (a JSON **array** of `{name,value}`
+  objects — NOT a map), matching the adapter schema above.
+- The GoClaw bridge entry (toolcat-3) and external-MCP entries (extmcp-6) both ship
+  as `type:"http"` with `Authorization: Bearer <gateway token>` + the signed
+  `X-Bridge-Sig` + `X-Agent-ID/...` scope headers in `Headers[]`.
+- All bridge-routed units stay on HTTP+Headers; no transport flip. The G2 all-bridge
+  memory decision is viable as designed.
+
+Note: ACP-spawned subprocess env still has `CLAUDE_*/ANTHROPIC_*` stripped by
+`filterACPEnv` (auth stays file-based) — this does not affect MCP header forwarding,
+which travels in the session/new params, not the process env.
 
 ## 9. Affected files (index)
 
