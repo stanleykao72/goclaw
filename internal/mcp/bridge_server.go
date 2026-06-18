@@ -31,6 +31,7 @@ var BridgeToolNames = map[string]bool{
 	"memory_search": true,
 	"memory_get":    true,
 	"skill_search":  true,
+	"use_skill":     true,
 	// Media
 	"read_image":   true,
 	"create_image": true,
