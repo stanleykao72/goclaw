@@ -74,9 +74,11 @@ func parseJSONArray(data []byte) *ChatResponse {
 			}
 			if ev.Usage != nil {
 				usage = &Usage{
-					PromptTokens:     ev.Usage.InputTokens,
-					CompletionTokens: ev.Usage.OutputTokens,
-					TotalTokens:      ev.Usage.InputTokens + ev.Usage.OutputTokens,
+					PromptTokens:        ev.Usage.InputTokens,
+					CompletionTokens:    ev.Usage.OutputTokens,
+					TotalTokens:         ev.Usage.InputTokens + ev.Usage.OutputTokens,
+					CacheCreationTokens: ev.Usage.CacheCreationInputTokens,
+					CacheReadTokens:     ev.Usage.CacheReadInputTokens,
 				}
 			}
 
@@ -129,9 +131,11 @@ func parseSingleJSONResult(line []byte) *ChatResponse {
 	}
 	if resp.Usage != nil {
 		cr.Usage = &Usage{
-			PromptTokens:     resp.Usage.InputTokens,
-			CompletionTokens: resp.Usage.OutputTokens,
-			TotalTokens:      resp.Usage.InputTokens + resp.Usage.OutputTokens,
+			PromptTokens:        resp.Usage.InputTokens,
+			CompletionTokens:    resp.Usage.OutputTokens,
+			TotalTokens:         resp.Usage.InputTokens + resp.Usage.OutputTokens,
+			CacheCreationTokens: resp.Usage.CacheCreationInputTokens,
+			CacheReadTokens:     resp.Usage.CacheReadInputTokens,
 		}
 	}
 	return cr

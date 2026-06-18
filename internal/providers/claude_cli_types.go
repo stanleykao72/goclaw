@@ -14,10 +14,15 @@ type cliJSONResponse struct {
 	Usage     *cliUsage `json:"usage"`
 }
 
-// cliUsage maps Claude CLI usage counters.
+// cliUsage maps Claude CLI usage counters. InputTokens/OutputTokens are the
+// non-cached billable counts; the two cache fields are tracked separately so
+// downstream pricing (pricing/decimal.go, tracing/cost.go) can bill cache
+// creation/read at their distinct rates.
 type cliUsage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
+	InputTokens              int `json:"input_tokens"`
+	OutputTokens             int `json:"output_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
 }
 
 // cliStreamEvent is a single line from `--output-format stream-json`.

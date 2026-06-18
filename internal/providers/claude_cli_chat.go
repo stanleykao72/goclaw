@@ -213,9 +213,11 @@ func (p *ClaudeCLIProvider) ChatStream(ctx context.Context, req ChatRequest, onC
 			}
 			if ev.Usage != nil {
 				finalResp.Usage = &Usage{
-					PromptTokens:     ev.Usage.InputTokens,
-					CompletionTokens: ev.Usage.OutputTokens,
-					TotalTokens:      ev.Usage.InputTokens + ev.Usage.OutputTokens,
+					PromptTokens:        ev.Usage.InputTokens,
+					CompletionTokens:    ev.Usage.OutputTokens,
+					TotalTokens:         ev.Usage.InputTokens + ev.Usage.OutputTokens,
+					CacheCreationTokens: ev.Usage.CacheCreationInputTokens,
+					CacheReadTokens:     ev.Usage.CacheReadInputTokens,
 				}
 			}
 		}
