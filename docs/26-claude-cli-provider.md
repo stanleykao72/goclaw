@@ -522,3 +522,42 @@ Per-session config at `~/.goclaw/mcp-configs/<safe-session-key>/mcp-config.json`
 - RUNTIME V1/S12 — stage38: two LINE WORKS users same group -> two distinct UserPoolKey + two distinct Authorization bearer tokens via psql/SSH; user B never reuses user A poolEntry (contingent on B1)
 - RUNTIME V3/S2 — real claude --print --mcp-config: tools/list+tools/call carry Mcp-Session-Id from initialize; missing-ID safe (404, no clobber); two-concurrent-fake-CLI distinct external sets
 - RUNTIME V4/S7 — lifted helper slog.Warn never embeds Authorization in streamable-http 401 error string
+
+
+## 12. Follow-up F2 — sub-agent (Agent/Task) escape + WebSearch latency
+
+> Source: production incident 2026-06-18. A LINE WORKS DM "請問近三天的天氣" took **104s** to answer. Prepared for implementation; behavior NOT changed yet (deferred per user).
+
+### 12.1 Root cause (latency AND control-escape)
+
+`buildArgs` (`internal/providers/claude_cli_session.go:82` summoner + `:86` chat-with-bridge) sets `--disallowedTools Bash,Edit,Read,Write,Glob,Grep,WebFetch,WebSearch,TodoRead,TodoWrite,NotebookRead,NotebookEdit`. This disables WebSearch for the **main** agent, but the **`Agent` / `Task` sub-agent tool is NOT in the list**. So when the user asked for weather, Claude (Opus 4.8) spawned an internal sub-agent to do the lookup, and the sub-agent **does NOT inherit `--disallowedTools`** — it ran WebSearch freely.
+
+Evidence (session `.jsonl` trace, dba6b849):
+- `ToolSearch {"query":"+web"}` (~7s — bundled CLI tools are deferred)
+- `Agent {"description":"查三峽區三天天氣","prompt":"...請使用 WebSearch..."}` → spawns sub-agent
+- sub-agent runs ~55s (WebSearch + reasoning) → main agent composes answer
+- `v3.run.completed duration_ms=104704`
+
+Two problems:
+1. **Latency**: the sub-agent indirection turns a few-second WebSearch into ~55-100s.
+2. **Control-escape** (concrete instance of docs/25 §12-D / docs/26 D gap): the sub-agent bypasses `--disallowedTools`, the goclaw MCP bridge, AND the PreToolUse security hooks. It can run WebSearch today — and, by the same escape, potentially Bash/Read/Write that the main agent has blocked. **This is a security gap, not just a perf nit.**
+
+NOT the bottleneck (ruled out): MCP pool warmup (e-smith-hub odoo-prod connected in <1s); "odoo-prod connected twice" was two DIFFERENT agents (e-smith-hub allow_size=6 + another agent allow_size=4), not a double-connect.
+
+### 12.2 Fix (ready to implement)
+
+Add `Agent` and `Task` to BOTH `--disallowedTools` strings (`claude_cli_session.go:82` and `:86`). Closes the sub-agent escape (latency + security in one change). The bundled CLI version (2.1.x) names the tool `Agent`; include `Task` for forward/back compat.
+
+### 12.3 Open decision (DEFERRED 2026-06-18 — "先不動")
+
+Once the sub-agent escape is closed, the main agent still cannot WebSearch (it is in the disallowed list), so web queries (weather etc.) would be declined or knowledge-guessed. Decide:
+
+- **(A, recommended)** Remove `WebFetch,WebSearch` from the chat-bridge disallowed list (`:86` only, keep `:82` summoner locked) → the main agent web-searches **directly** (fast, one round-trip) and keeps the capability. Web is read-only / low-risk.
+- **(B)** Keep WebSearch disabled → bot has no web access (fastest, most controlled, loses capability).
+
+The fs/exec tools (`Bash,Edit,Read,Write,Glob,Grep`) stay disabled in BOTH cases — they MUST route through the bridge.
+
+### 12.4 Test
+
+- Assert the written CLI args contain `Agent` and `Task` in `--disallowedTools` (both sites).
+- A real DM weather query (Option A) completes with NO `Agent`/`Task` tool_use in the session `.jsonl` and in materially less wall-clock time; (Option B) the agent answers without web and does not spawn a sub-agent.
