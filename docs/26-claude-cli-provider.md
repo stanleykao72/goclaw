@@ -571,11 +571,11 @@ The fs/exec tools (`Bash,Edit,Read,Write,Glob,Grep`) stay disabled in BOTH cases
 
 | Unit | Name | Scope | Files | Iso | Effort | Status |
 |------|------|-------|-------|-----|--------|--------|
-| **fu-j-1** | J SenderID substrate | `OptSenderID` const (claude_cli.go) + `BridgeContext.SenderID` (claude_cli_mcp.go:86-95) + `X-Sender-ID` header (~:158) + SenderID as **TRAILING-EXTRA** in `SignBridgeContext` (:267) & `VerifyBridgeContext` (:284, new backward-compat level) | claude_cli.go, claude_cli_mcp.go, claude_cli_session.go | worktree | high | TODO |
-| **k-1** | K extract (full history) | `extractFromMessages` returns full ordered `[]Message` (sig change + callers assign `priorTurns`, discard `_` → byte-identical behavior) | claude_cli_session.go:127, claude_cli_chat.go:19,:83 | worktree | medium | TODO |
+| **fu-j-1** | J SenderID substrate | `OptSenderID` const (claude_cli.go) + `BridgeContext.SenderID` (claude_cli_mcp.go:86-95) + `X-Sender-ID` header (~:158) + SenderID as **TRAILING-EXTRA** in `SignBridgeContext` (:267) & `VerifyBridgeContext` (:284, new backward-compat level) | claude_cli.go, claude_cli_mcp.go, claude_cli_session.go | worktree | high | ✅ `58e2d66a` |
+| **k-1** | K extract (full history) | `extractFromMessages` returns full ordered `[]Message` (sig change + callers assign `priorTurns`, discard `_` → byte-identical behavior) | claude_cli_session.go:127, claude_cli_chat.go:19,:83 | worktree | medium | ✅ `1c1a637a` |
 | **i-2** | I decision gate | Option A vs B written decision (blast radius) | docs/26 | shared | high | ✅ DONE (Option A) |
-| **fu-1** | F cache/cost tokens | `cache_creation_input_tokens`/`cache_read_input_tokens` → `cliUsage` → `Usage` in `parseJSONArray`/`parseSingleJSONResult` + stream result event (claude_cli_chat.go:214-220) + NEW `claude_cli_parse_test.go` | claude_cli_types.go, claude_cli_parse.go, claude_cli_chat.go, claude_cli_parse_test.go | shared | medium | TODO |
-| **fu-3** | C use_skill bridge | add `"use_skill": true` to `BridgeToolNames` (bridge_server.go:33) | bridge_server.go | shared | low | TODO |
+| **fu-1** | F cache/cost tokens | `cache_creation_input_tokens`/`cache_read_input_tokens` → `cliUsage` → `Usage` in `parseJSONArray`/`parseSingleJSONResult` + stream result event (claude_cli_chat.go:214-220) + NEW `claude_cli_parse_test.go` | claude_cli_types.go, claude_cli_parse.go, claude_cli_chat.go, claude_cli_parse_test.go | shared | medium | ✅ `51efd0ce` |
+| **fu-3** | C use_skill bridge | add `"use_skill": true` to `BridgeToolNames` (bridge_server.go:33) | bridge_server.go | shared | low | ✅ `ab414ea9` |
 
 **Wave-0 merge order**: `fu-j-1` first (HMAC field-order contract — SenderID MUST append as trailing extra after sessionKey; reorder = fail-closed) → `k-1` (shares claude_cli_session.go disjoint region :127 vs :171, and claude_cli_chat.go disjoint from fu-1's :214-220) → `fu-1`/`fu-3` independent. `i-2` already resolved.
 
