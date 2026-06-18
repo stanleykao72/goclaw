@@ -39,6 +39,12 @@ const OptTenantID = "tenant_id"
 // OptLocalKey passes the composite local key (e.g. "-100123:topic:42") for forum topic routing.
 const OptLocalKey = "local_key"
 
+// OptSenderID passes the individual sender's identity (distinct from the
+// group-scoped UserID) so the bridge can authorize file-writer/exec tools
+// per-sender. Threaded into the HMAC as a trailing extra (see SignBridgeContext)
+// so it cannot be forged; absent for non-channel contexts.
+const OptSenderID = "sender_id"
+
 // ClaudeCLIProvider implements Provider by shelling out to the `claude` CLI binary.
 // It acts as a thin proxy: CLI manages session history, tool execution, and context.
 // GoClaw only forwards the latest user message and streams back the response.
