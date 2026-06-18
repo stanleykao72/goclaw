@@ -233,3 +233,15 @@ i-3b removes `AgentMCPLookup` (the direct-inject of external servers). Per-user 
 - Input safety: registeredName routing strips prefix to OriginalName and sends req.Params.Name upstream (bridge_tool.go) with no injection; schema marshaling failures fall back safely.
 - i-3b completeness: after removing AgentMCPLookup, assert (test) the written CLI mcp-config contains ONLY goclaw-bridge + static d.Servers, NEVER per-agent DB servers — enforcement-bypass provably closed.
 - odoo-security-reviewer sign-off: per-user Odoo (odoo-prod) credential isolation end-to-end — two LINE WORKS users in the same group get their OWN odoo session, verified on stage38 with psql/SSH before merge.
+
+
+### 10.8 R1 RESOLVED — per-request session identity (spike on mcp-go v0.44.0)
+
+The §10.3/STEP-5 P0 (sessionID="" clobber) is trivially avoidable; the design's ctx-scoped-ToolFilter fallback is NOT needed.
+
+- **Cause.** `WithStateLess(true)` forces `StatelessSessionIdManager` whose `Generate()` returns `""` (streamable_http.go:46-52, 1325-1329) — every concurrent request collapses onto the `""` key in the shared `sessionTools` store.
+- **Fix.** Construct the bridge with `WithSessionIdManager(&StatelessGeneratingSessionIdManager{})` INSTEAD OF `WithStateLess(true)`. Its `Generate()` returns `idPrefix + uuid.New()` (streamable_http.go:1344) — unique per session, still stateless (format-only validation, no local tracking; works cross-instance). This is in fact mcp-go's default when `WithStateLess` is not set. `WithSessionIdManager(manager)` does honor the passed manager (streamable_http.go:58-66).
+- **Injection is clean and reaches BOTH dispatch paths.** `handlePost` creates the ephemeral session (streamable_http.go:379) and binds it to ctx (:383) **before** running `contextFunc` (:385). So `seedExternalTools` (the `WithHTTPContextFunc`) retrieves the session via `ClientSessionFromContext` and calls `session.(SessionWithTools).SetSessionTools(externalTools)` (streamable_http.go:1076). `handleListTools` (server.go:1367-1368) AND `handleToolCall` (server.go:1441-1442) both consult `GetSessionTools()` → external tools are available for tools/list and tools/call. `WithToolFilter` is unnecessary (it scopes tools/list only, server.go:1398-1404).
+- **R2 (store growth) still applies, minor.** `s.sessionTools` (shared, keyed by sessionID) accumulates one entry per one-shot `claude --print` session. Add explicit cleanup via `sessionToolsStore.delete` (streamable_http.go:973) on request-end, or a short TTL sweep. Not a blocker.
+
+**Net:** i-3a STEP 5 is now concrete — drop `WithStateLess(true)`, add `WithSessionIdManager(&StatelessGeneratingSessionIdManager{})`, `SetSessionTools` inside `seedExternalTools`, add request-end cleanup. The design's last mechanism uncertainty is closed; **i-3a is ready to implement pending the §10.7 security sign-off.**
