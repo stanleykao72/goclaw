@@ -161,6 +161,9 @@ Provider switch is a DB-row change with no schema migration — revert by settin
 
 ## 10. Fix I — Option A bridge dynamic-proxy substrate design (i-3a / i-3b)
 
+> **Authoritative spec: §11.** §10.0–§10.10 below is the design-evolution record (BLOCKED → revised → consolidated). Implementers follow **§11**.
+
+
 > Decision (2026-06-18): Fix I = **Option A** — force-route per-agent external MCP servers THROUGH the goclaw-bridge so grant recheck + per-user creds apply on every call. Design verified against mcp-go v0.44.0 internals. Implementation gated by the §10.7 security checklist ([ESC:arch] + [ESC:sec], opus + odoo-security-reviewer).
 
 ### 10.1 Recommended design
@@ -304,3 +307,218 @@ The section-10.9 blockers were revised and re-reviewed against v3.14.0 code:
 6. S2/S8: sessionToolsStore and Release-before-build are NEW bridge-side constructs (sessionToolsStore does not exist in v3.14.0 — grep empty; native uses Release-AFTER-build at loop_mcp_user.go:151→build→:181 by design). The design correctly flags these as new but must specify the eviction/staleness contract and the documented acceptance of pool.evictIdle never setting connected.Store(false) (pool.go) as an explicit, reviewed risk, not an incidental note.
 
 **Net:** B2 + B3 cleared; B1 is clearable with the small, well-scoped resolveActorUserID lineworks-branch extension (replacing the rejected resolveCredentialUserID replication). Once that correction lands, i-3a + i-3b + fix-J are ready to implement as ONE atomic change. Note S2 sessionToolsStore + S8 Release-before-build are NEW bridge-side constructs (do not exist in v3.14.0; native uses Release-after-build) - design them fresh, do not claim parity.
+
+## 11. Fix I — Consolidated Implementation Spec (AUTHORITATIVE — supersedes §10.0–§10.10)
+
+> Supersedes the docs/26 §10.0–§10.10 design evolution (BLOCKED → revised → approved-with-conditions). One coherent spec for the **single atomic change** `i-3a + i-3b + fix-J`. Grounded in v3.14.0 (`esmith/main` HEAD `40429cd7`). All file:line citations re-pinned against actual code. No code is written here.
+>
+> **LOCKED corrections from the §10.10 re-review OVERRIDE any stale text in earlier sections.** In particular: the per-user MCP actor resolves via **`resolveActorUserID`** (NOT `resolveCredentialUserID`); B1 is a **behavioral lineworks-branch extension**; the 401-purge citation is **`loop_mcp_user.go:171`** (NOT `bridge_tool.go:257`).
+
+---
+
+#### 1. Overview & Atomic-Change Scope
+
+##### 1.1 Goal
+Force-route every per-agent external MCP server through the `goclaw-bridge` HTTP server so that **every external tool call** traverses `BridgeTool.Execute → grantChecker.IsAllowed` + `IsToolAllowed` + per-user credential resolution. Today external servers are direct-injected into the CLI `--mcp-config` (`claude_cli_mcp.go:115-126`), so the `claude` subprocess connects to them **directly** (`claude_cli_session.go:51-52`), bypassing all enforcement and carrying only static server-level `Authorization` shared across all users.
+
+##### 1.2 Three coupled sub-changes — must ship ATOMICALLY
+| Sub-change | What it does | Why it cannot ship alone |
+|---|---|---|
+| **i-3a** | Build bridge dynamic-proxy substrate: `ResolveExternalBridgeTools` lifted into `internal/mcp`, per-request `seedExternalTools` via `WithSessionIdManager(&StatelessGeneratingSessionIdManager{})` + `SetSessionTools`, per-request cleanup | Without i-3b deletion, DB servers still route around the bridge → isolation is **vacuous** (invariant is a property of the FINAL `mcpServers` key set) |
+| **i-3b** | Delete the 10-symbol direct-inject surface so external tools can ONLY arrive via the bridge | Deleting alone removes DB tools with no bridge replacement → external tools vanish |
+| **fix-J** | Thread **ChannelType + SenderID** as signed BridgeContext extras + `senderVerified`; extend `resolveActorUserID` to include `lineworks` | Without it, per-user odoo-prod silently **mis-resolves** (returns rewritten UUID, misses `lineworks:<uid>`) for LINE WORKS DM-merged users once i-3b deletes the direct-inject |
+
+The isolation invariant is a property of the **final** `mcpServers` key set written by `writeMCPConfigInternal` (`claude_cli_mcp.go:105-184`). Shipping any subset leaves a hole. **One PR, one atomic commit set.**
+
+##### 1.3 Out-of-scope (explicitly deferred, documented as parity gaps)
+- Context-scoped creds (`ChannelContextScope`) tier — never injected on the bridge; documented gap (C1).
+- search-mode / >threshold tool-deferral parity — `getUserMCPTools` does not enter search mode.
+- K respawn-amnesia (§4.1) and F cache-token follow-ups — independent.
+
+---
+
+#### 2. B1 — Actor Resolution on the Bridge
+
+##### 2.1 Root cause (precisely located, v3.14.0)
+- `BridgeContext` has 8 fields, **NO `ChannelType` / `SenderID`** (`claude_cli_mcp.go:86-95`). The `Channel` field is the **instance name** (`OptChannel`, e.g. `my-telegram-bot`), NOT the platform discriminator.
+- `resolveActorUserID` (`loop_mcp_user.go:71-85`) special-cases **ONLY** `channelType=='bitrix24' && senderID!=''` (line 75 — CONFIRMED still bitrix24-only). For a LINE WORKS DM-after-contact-merge user (`peerKind=='direct'`, `userID` rewritten to a tenant_user UUID at `gateway_consumer_normal.go:157`), it falls through to `peerKind != "group" || senderID == "" → return userID` (branch 2, lines 81-82) and returns the **rewritten UUID**, never `lineworks:<uid>`. The per-user Odoo cred row is keyed `lineworks:<uid>` (autobind `autobind.go:198` `userKey=senderPrefix+lwUserID`), so it is **missed**.
+- The per-user MCP cred path keys EXCLUSIVELY on `resolveActorUserID`'s output: `loop_pipeline_callbacks.go → getUserMCPTools → GetUserCredentials` (`loop_mcp_user.go:122`).
+
+##### 2.2 LOCKED CORRECTION — the fix is `resolveActorUserID`, NOT `resolveCredentialUserID`
+`resolveCredentialUserID` (`user_identity_resolver.go:43-88`) does **FORWARD** resolution (external → tenant_user UUID) feeding `RunContext.CredentialUserID`, consumed only by SecureCLI / browser_cookie_store — the **WRONG direction** for the MCP actor key. **Drop all design text claiming `resolveCredentialUserID` resolves the MCP actor or that the bridge must replicate it.** Replicating it is harmless but irrelevant.
+
+**The actual fix (BEHAVIORAL, not a verbatim port):** extend `resolveActorUserID`'s channel special-case to include `lineworks` (and any other DM-merge provisioning channel that keys per-user MCP creds by SenderID):
+
+```
+if (channelType == "bitrix24" || channelType == "lineworks") && senderID != "" {
+    return senderID
+}
+```
+
+This is a behavioral change that fixes **BOTH** the bridge AND **a latent native-loop bug** — LINE WORKS DM-merged per-user MCP creds are broken in v3.14.0 today (native mode too), because a verbatim `resolveActorUserID` returns the rewritten UUID for a lineworks DM (`peerKind!='group'` → branch 2). The autobind cred key (`autobind.go:198`) and message SenderID (`channels/lineworks/handlers.go:128/:210`) are both `lineworks:<uid>`, so the actor IS resolvable via SenderID once the branch is extended.
+
+##### 2.3 Thread ChannelType + SenderID as TRAILING signed extras
+`SignBridgeContext` (`claude_cli_mcp.go:267-276`) is strictly positional: fixed `agentID|userID|channel|chatID|peerKind|workspace|tenantID`, then `|`-joined `extra ...string`. Today extras are `localKey, sessionKey` (positions 0,1). Append ChannelType + SenderID **AFTER** them (positions 2,3) so existing signatures still match a fallback tier. **Prepending would invalidate every in-flight signature.** Edit chain (each grounded):
+
+1. **New Opt consts** — `OptChannelType="channel_type"`, `OptSenderID="sender_id"` in `internal/providers/claude_cli.go` (alongside `OptUserID`).
+2. **Producer enrichment** — `internal/agent/loop_pipeline_callbacks.go:303-313`: add `chatReq.Options[providers.OptChannelType]=req.ChannelType` and `[providers.OptSenderID]=req.SenderID`. Both available: `loop_types.go:627` (ChannelType), `:634` (SenderID).
+3. **Struct + builder** — add `ChannelType string`, `SenderID string` to `BridgeContext` (`claude_cli_mcp.go:86-95`) and to `bridgeContextFromOpts` (`claude_cli_session.go:171-182`) via `extractStringOpt(opts, OptChannelType/OptSenderID)`. `WriteMCPConfig` (`:101-103`) + `writeMCPConfigInternal` (`:105`) signatures gain the two params.
+4. **Header emission** — `writeMCPConfigInternal` (`claude_cli_mcp.go:128-173`): emit `X-Channel-Type` and `X-Sender-ID` under the SAME CRLF guard (`!strings.ContainsAny(v,"\r\n\x00")`) as the existing 9 headers, then pass `channelType, senderID` as the 3rd/4th extras to `SignBridgeContext(... localKey, sessionKey, channelType, senderID)` at `:163`.
+
+##### 2.4 `senderVerified` third return (S6b forge resistance)
+`VerifyBridgeContext` (`claude_cli_mcp.go:284-306`) today returns `(ok, tenantVerified)` with 4 short-circuit tiers (all-extras :286-289, no-extra :291-294, no-tenant :295-299, oldest :300-304). Change to return **`(ok, tenantVerified, senderVerified)`**:
+- The full tier covering `localKey|sessionKey|channelType|senderID` (the new L1) is the **ONLY** tier returning `senderVerified=true`.
+- A new intermediate tier matching `localKey`+`sessionKey` but NOT the channelType/senderID extras (the J-rollout transition window + pre-channelType sessions) returns `senderVerified=false`.
+- ALL existing fallback tiers (no-extra, no-tenant, oldest) return `senderVerified=false` — mirroring how L3/L4 already return `tenantVerified=false`.
+
+**Forge attack blocked:** an attacker holding a valid OLD-format signature who injects/strips `X-Sender-ID` lands on a fallback tier → `senderVerified=false` → bridge resolves ZERO per-user creds under the injected sender. Mirrors the `tenantVerified` precedent (`server.go:315-318`).
+
+##### 2.5 Middleware: verify-then-inject from ctx (S4 + S5 + S6b)
+In `bridgeContextMiddleware` (`internal/gateway/server.go:256-348`):
+- Read `X-Channel-Type` + `X-Sender-ID` alongside existing header reads (`:259-266`).
+- Pass them as matching extras to `VerifyBridgeContext(... localKey, sessionKey, channelType, senderID)` at `:280`; capture `senderVerified`.
+- Inject `tools.WithToolChannelType(ctx, channelType)` (`internal/tools/context_keys.go:59`) and `store.WithSenderID(ctx, senderID)` (`internal/store/context.go:211`) **ONLY when `senderVerified==true`** — gated identically to the `tenantVerified` tenant injection (`server.go:315-318`).
+- **S4 (tenant fail-closed):** when `tenantVerified==false || tenantID==''`, `ResolveExternalBridgeTools` surfaces ZERO per-user external tools (tenant required for `ListAccessible`/pool keys). On `ListAccessible` error (tenant-less legacy-HMAC ctx, `scope.go` fail-closed) return ZERO + log — NEVER fall back to `ListServers` or any non-scoped enumeration.
+- **S5 (FromContext-not-headers):** `seedExternalTools`/`ResolveExternalBridgeTools` derive agentID/userID/tenantID/senderID/channelType **EXCLUSIVELY** via `store.*FromContext` / `tools.*FromCtx` — NEVER `r.Header.Get`. The middleware is the sole trust boundary.
+
+##### 2.6 Lift `resolveActorUserID` into a shared importable package
+`ResolveExternalBridgeTools` lives in `internal/mcp` and CANNOT import `internal/agent` (`getUserMCPTools` is a `*Loop` method, `loop_mcp_user.go:91`). Move `resolveActorUserID` (with the lineworks-branch extension from §2.2) into a shared, importable package (`internal/mcp` itself or a small `internal/identityresolve`) as a free function `ResolveActorUserID(userID, senderID, peerKind, channelType string) string`. The native `*Loop` callers become thin wrappers so the two paths cannot drift (single source of truth). `ResolveExternalBridgeTools` receives `agentID, tenantID` PLUS the 4 actor-resolution inputs `userID, senderID, peerKind, channelType` from verified ctx, computes the actor id, then runs the lifted per-server loop.
+
+##### 2.7 V2 grant-check + creds must key on the RESOLVED actor (condition 3)
+`BridgeTool.Execute` rechecks via `grantChecker.IsAllowed(ctx, agentID, userID, serverID, toolName)` where `userID = store.UserIDFromContext(ctx)` (`bridge_tool.go:188-190`); `mcp_user_grants` are keyed by actor via `ListAccessible` LEFT JOIN on `mug.user_id` (`grant_checker.go`). On the bridge the ctx UserID is the rewritten/group-scoped `X-User-ID` — the WRONG id at execute time.
+
+**Fix + collision resolution (condition 3):** `ResolveExternalBridgeTools` injects the RESOLVED actor id as the ctx `UserID` for the resolved sub-context that the per-actor BridgeTools capture, via `store.WithUserID(ctx, actorID)`. The middleware unconditionally sets `store.WithUserID(ctx, userID)` at `server.go:311` (the `if userID != ""` block, CONFIRMED). The per-actor `store.WithUserID(ctx, actorID)` is applied **AFTER** (downstream of) the middleware in the `seedExternalTools`/`ResolveExternalBridgeTools` call path, so **last-write-wins yields `actorID`** at `GetUserCredentials`, `AcquireUser`, AND `IsAllowed`. The implementer MUST confirm the per-actor `WithUserID` is layered on the request ctx **after** the middleware has run (which it is: middleware wraps `next.ServeHTTP`, and `seedExternalTools` runs inside the handler via `WithHTTPContextFunc`). Ordering is correct; assert it in the per-actor isolation test.
+
+---
+
+#### 3. B2 — Atomic Merge: i-3a + Delete i-3b + fix-J
+
+##### 3.1 i-3b deletion surface — ALL 10 symbols removed in one change
+| # | Symbol | Location |
+|---|---|---|
+| 1 | `AgentMCPLookup` direct-inject loop (`servers[srv.Name]=entry`) | `claude_cli_mcp.go:115-126` |
+| 2 | `MCPServerLookup` func type | `claude_cli_mcp.go:30-32` |
+| 3 | `AgentMCPLookup MCPServerLookup` field on `MCPConfigData` | `claude_cli_mcp.go:40` |
+| 4 | `&& d.AgentMCPLookup == nil` clause in nil-guard | `claude_cli_mcp.go:106` |
+| 5 | `buildMCPServerLookup` factory | `cmd/gateway_providers.go:207-242` |
+| 6 | startup wiring `mcpData.AgentMCPLookup = buildMCPServerLookup(mcpStore)` | `cmd/gateway_providers.go:471` |
+| 7 | runtime wiring `mcpData.AgentMCPLookup = h.mcpLookup` | `internal/http/providers.go:242` |
+| 8 | `mcpLookup` field on `ProvidersHandler` | `internal/http/providers.go:39` |
+| 9 | `SetMCPServerLookup` setter | `internal/http/providers.go:67-71` |
+| 10 | `providersH.SetMCPServerLookup(buildMCPServerLookup(stores.MCP))` wiring | `cmd/gateway_http_handlers.go:95` |
+
+Keep `mcpServerEntryToConfig` ONLY if still referenced by static `d.Servers`. The collision guard at `:118` only protects name collisions, NOT authorization — deletion removes the whole branch.
+
+##### 3.2 Why atomic (grounded in write order)
+`writeMCPConfigInternal` builds `servers` as: (1) `maps.Copy` static `d.Servers` (`:112-113`), (2) **[i-3b]** inject `AgentMCPLookup` DB servers (`:115-126`), (3) add `goclaw-bridge` entry (`:128-173`), then marshal `{"mcpServers": servers}` (`:180`). Isolation is a property of the FINAL key set: i-3a alone leaves step (2) routing DB servers around the bridge; deleting i-3b alone removes DB tools with no bridge replacement. Both must land with fix-J.
+
+##### 3.3 B2 key-set regression test (genuinely NEW)
+The existing test file `internal/providers/claude_cli_mcp_test.go:9-166` covers ONLY HMAC sign/verify (ZERO assertion on the written key set). New tests:
+- **Positive:** construct `MCPConfigData{Servers: {"static-a":…, "static-b":…}, GatewayAddr:"x", GatewayToken:"t"}`, call `WriteMCPConfig`, read+unmarshal the file, assert `mcpServers` keys == **EXACTLY** `{"goclaw-bridge","static-a","static-b"}` — after step (2) removal the only keys are shallow-copied `d.Servers` + the unconditional `servers["goclaw-bridge"]` (`:173`).
+- **Negative:** a config that would previously inject a DB server name must now NOT contain it (proves the bypass is closed).
+- **Nil-guard (condition 4):** assert removing `&& d.AgentMCPLookup == nil` from the `:106` early-return does NOT change behavior for empty-`Servers`+empty-`GatewayAddr` configs — still returns `""` early.
+
+---
+
+#### 4. B3 — 401-Purge Lift (Self-Heal)
+
+##### 4.1 Citation correction (LOCKED)
+The original §10.7 claim that `bridge_tool.go:257` calls `DeleteUserCredentials` is **FALSE**. `bridge_tool.go:257-258` is `t.connected.Store(false)` + a retry-hint warn; the string `DeleteUserCredentials` appears only in a COMMENT at `:254`. **The ONLY actual `DeleteUserCredentials` call in the per-user MCP path is `loop_mcp_user.go:171`** (CONFIRMED — inside the `AcquireUser` error → `isUnauthorized401(err)` branch, keyed on the `userID` param).
+
+##### 4.2 Lift the purge, re-keyed on resolved actor
+The purge (`loop_mcp_user.go:154-173`): inside the `AcquireUser` error handler, `if isUnauthorized401(err)` → bitrix diagnostics slog (`:162-170`) → `_ = l.mcpStore.DeleteUserCredentials(ctx, srv.ID, userID)` (`:171`) → purged-warn (`:172`).
+
+**Lift into `ResolveExternalBridgeTools`:** duplicate the `isUnauthorized401 → DeleteUserCredentials` branch into the bridge's per-server `AcquireUser` error handler, keyed on the **resolved actor id** (`lineworks:<uid>` / SenderID), NOT the raw header userID. Because B1 makes `GetUserCredentials`, `AcquireUser`, AND `IsAllowed` all key on the resolved actor, the purge target is consistent end-to-end. The native loop retains its own purge; both call `mcpStore.DeleteUserCredentials(ctx, srv.ID, actorID)`.
+
+##### 4.3 Ordering dependency (condition 5)
+B3's actor-keyed purge is correct **only after B1's resolution fix lands**; until then the lifted purge keys on the rewritten UUID and purges the wrong/no row for exactly the lineworks DM-merged cohort B3 targets. Since this is one atomic change, B1 and B3 land together — implementer must order the edits so the lineworks-branch extension (§2.2) is in place before the lifted purge is keyed on `ResolveActorUserID`'s output.
+
+---
+
+#### 5. The 6 Residual Conditions as Concrete Requirements
+
+| # | Condition | Concrete design/test requirement |
+|---|---|---|
+| **1** | B1 lineworks-branch is BEHAVIORAL, not verbatim port | `ResolveActorUserID` MUST read `if (channelType=="bitrix24" \|\| channelType=="lineworks") && senderID!="" { return senderID }`. A verbatim port returns the rewritten UUID for a lineworks DM (branch 2). **Test:** `ResolveActorUserID("uuid-x","lineworks:42","direct","lineworks")` returns `"lineworks:42"` (not `"uuid-x"`); same inputs with `channelType="telegram"` returns `"uuid-x"` (unchanged). Document the latent native-loop bug this also fixes. |
+| **2** | Drop `resolveCredentialUserID`-as-MCP-actor text | No design artifact, comment, or helper may claim `resolveCredentialUserID` resolves the MCP actor or that the bridge replicates it. The MCP per-user path keys exclusively on `ResolveActorUserID`. (Doc/text requirement — verify by grep that no new code/comment references `resolveCredentialUserID` in the bridge resolution path.) |
+| **3** | Per-actor `store.WithUserID(actorID)` vs middleware `store.WithUserID(userID)` collision | The per-actor sub-ctx `store.WithUserID(ctx, actorID)` (§2.7) is applied DOWNSTREAM of the middleware's `store.WithUserID(ctx, userID)` (`server.go:311`), so **last-write-wins = actorID**. Confirm the per-actor injection runs inside `seedExternalTools` (after middleware). **Test:** assert `GetUserCredentials`/`AcquireUser`/`IsAllowed` all see `actorID` (`lineworks:<uid>`), not the header `X-User-ID`. |
+| **4** | Nil-guard clause removal preserves empty-Servers early return | Removing `&& d.AgentMCPLookup == nil` from `claude_cli_mcp.go:106` must NOT change the early `return ""` for `len(d.Servers)==0 && d.GatewayAddr==""`. **Test:** `MCPConfigData{}` (no Servers, no GatewayAddr) → `WriteMCPConfig` returns `""`. |
+| **5** | B3 purge correct only after B1 lands | Order edits so the lineworks extension is in place before the lifted purge keys on `ResolveActorUserID` output. (Implementation-order requirement, §4.3.) |
+| **6** | S2 `sessionToolsStore` is NEW (no v3.14.0 parity); S8 Release-before-build MIRRORS native ordering | `sessionToolsStore`/`SessionTools` does NOT exist in v3.14.0 (grep empty) — design fresh, NO parity claim. **S2 eviction/staleness contract:** per-request cleanup keyed on THIS request's unique sessionID (from `WithSessionIdManager(&StatelessGeneratingSessionIdManager{})`, `Generate()=idPrefix+uuid`); the one-shot `claude --print` path never sends DELETE (`streamable_http.go:694-695` fires only on terminate) → add explicit request-end `sessionToolsStore.delete` or short TTL sweep. **S8 Release-BEFORE-build:** bridge uses Release-immediately-after-`AcquireUser`-success, before `convertBridgeToMCPTool`/`NewToolWithRawSchema`, because BridgeTools hold the live `*atomic.Pointer[Client]` (not a snapshot). Native ALSO releases BEFORE build (`loop_mcp_user.go:181` release → `:204` build), so the bridge's Release-before-build MIRRORS native; only `sessionToolsStore` is the genuinely new (no-parity) construct. **Documented accepted risk:** `pool.evictIdle` calls `cancel()`+`Close()` but NEVER `connected.Store(false)`, so a tool captured during the refCount==0 window can read `Connected()==true` against a CLOSED client; staleness detected only on next failed `CallTool` (`bridge_tool.go:257`). Accept the same eventual-consistency staleness the native loop tolerates; re-acquire self-heals. This is an explicit reviewed risk, not an incidental note. |
+
+##### 5.1 Additional folded conditions (from §10.9 C1–C11 / S-items)
+- **C1 (cred source-of-truth):** the lifted `ResolveExternalBridgeTools` replicates the inline merge ORDER (server APIKey → `headers["Authorization"]` `loop_mcp_user.go:139-141` → user APIKey override `:144-146` → `maps.Copy` user Headers/Env `:147-148`) and the `hasUserCreds → AcquireUser` decision EXACTLY. It does NOT claim full equivalence to `manager.resolveServerCredentials` (which adds a contextCreds tier unreachable on the bridge). **Test:** resolved headers map for `(odoo-prod, user)` is byte-identical between bridge helper and native loop; document the contextCreds gap.
+- **C2/S6b:** see §2.4 senderVerified + §6 adversarial test.
+- **C4 (trust boundary):** `seedExternalTools` derives identity EXCLUSIVELY via `store.*FromContext`, never `r.Header`. **Test:** valid token + forged `X-Agent-ID`/`X-Tenant-ID` headers + invalid/absent `X-Bridge-Sig` → zero external tools.
+- **C7/S2 (cred confidentiality, P0):** adversarial concurrency test asserts not just distinct tool NAMES but that each resolved BridgeTool carries the correct per-user api_key/connection (two fake users, different creds, each `tools/call` hits its own captured `clientPtr`). Unique-session-ID isolation is the SOLE barrier.
+- **C8/S3 (global fallthrough):** external per-agent tools are NEVER in process-global `s.tools` (only the per-request session map), so `handleToolCall`'s global fallthrough can never name-guess another agent's external tool.
+- **C9/S8 (refCount):** Release matched on EVERY post-success exit (skip/continue/grant-deny/timeout/panic); no fallible step between Acquire-success and Release. Test: refCount returns to 0, no MaxUserConns exhaustion under repeated seed.
+- **C10/S9 (bridge-disabled):** wire `NewBridgeServer(…, mcpStore, pool, grantChecker)` into the SAME token-gated site (`server.go:217-231`, inside `if Gateway.Token != ""`). Test: empty token → `/mcp/bridge` 403, no tools/list, written config contains NO DB servers (only static `d.Servers`; `goclaw-bridge` absent).
+- **C11/S10 (schema-marshal):** `convertBridgeToMCPTool` replicates `bridge_server.go:83-91`'s `{"type":"object"}` fallback on marshal failure; set ONLY `RawInputSchema`; handler closure calls `bt.Execute`, never passes inbound `req.Params.Name` upstream.
+
+##### 5.2 Runtime verifications (cannot be satisfied by static review — stage38 + real `claude` binary)
+- **V1/S12:** two LINE WORKS users in the SAME group each trigger an odoo-prod tool call; psql/SSH confirm TWO distinct `UserPoolKey` entries + TWO distinct Authorization bearer tokens; user B's call NEVER reuses user A's poolEntry. Contingent on B1 fix.
+- **V3/S2:** capture bridge HTTP traffic from a real `claude --print --mcp-config` run; assert tools/list + tools/call carry the `Mcp-Session-Id` from initialize. Safe failure mode (missing ID → `StatelessGeneratingSessionIdManager.Validate("")` → 404, no clobber).
+- **V4/S7:** confirm the lifted helper's `slog.Warn(...'error', err.Error())` never embeds Authorization in the streamable-http 401 error string.
+
+---
+
+#### 6. HMAC / Forge Test Extensions (B1 / S6b)
+Extend `internal/providers/claude_cli_mcp_test.go` (`:9-166`) and `internal/gateway/bridge_context_test.go`:
+- (a) Sign WITH `channelType`/`senderID` extras differs from WITHOUT.
+- (b) `VerifyBridgeContext` returns `senderVerified=true` ONLY at the full tier.
+- (c) ALL fallback tiers return `senderVerified=false`.
+- (d) Adversarial: valid OLD-format sig + injected `X-Sender-ID` → `ok=true, senderVerified=false`, creds NOT resolved under the injected sender.
+- (e) Middleware injects `WithToolChannelType`/`WithSenderID` ONLY when `senderVerified`.
+- (f) Backward-compat: pre-channelType session (localKey+sessionKey only) still verifies `ok=true` (graceful degradation; per-user tools withheld until config rewrite — flag-day-free, same as pre-tenantID/pre-localKey).
+
+#### 7. In-Flight Session Safety
+Per-session config at `~/.goclaw/mcp-configs/<safe-session-key>/mcp-config.json` (`claude_cli_mcp.go:81-83`, atomic write). A session whose config predates the new fields carries an OLD `X-Bridge-Sig` → matches a fallback tier (`ok=true`) → keeps working with `senderVerified=false` (per-user Odoo tools withheld until config rewrite). Same mechanism that already protects pre-localKey/pre-tenantID sessions. This is what lets the change ship without a flag day.
+
+#### 11.S Implementation step order
+
+1. Step 0 (pre-flight): Move resolveActorUserID into a shared importable package (internal/mcp or internal/identityresolve) as free func ResolveActorUserID; make native *Loop callers thin wrappers. This is prerequisite for both B1 and the lifted helper (loop_mcp_user.go:71-85).
+2. Step 1 (B1 behavioral fix): In the shared ResolveActorUserID, extend the channel special-case from `channelType=="bitrix24"` to `channelType=="bitrix24" || channelType=="lineworks"` (loop_mcp_user.go:75). This must precede the B3 purge keying.
+3. Step 2 (fix-J consts): Add OptChannelType="channel_type" and OptSenderID="sender_id" in internal/providers/claude_cli.go.
+4. Step 3 (fix-J producer): In internal/agent/loop_pipeline_callbacks.go:303-313 add chatReq.Options[OptChannelType]=req.ChannelType and [OptSenderID]=req.SenderID (loop_types.go:627/:634).
+5. Step 4 (fix-J struct+builder): Add ChannelType/SenderID to BridgeContext (claude_cli_mcp.go:86-95) and bridgeContextFromOpts (claude_cli_session.go:171-182); extend WriteMCPConfig (:101-103) + writeMCPConfigInternal (:105) signatures.
+6. Step 5 (fix-J header+sign): In writeMCPConfigInternal emit X-Channel-Type/X-Sender-ID under the CRLF guard; pass channelType,senderID as 3rd/4th extras to SignBridgeContext at claude_cli_mcp.go:163.
+7. Step 6 (fix-J verify): Change VerifyBridgeContext (claude_cli_mcp.go:284-306) to return (ok, tenantVerified, senderVerified); add the new full L1 tier (only senderVerified=true) + intermediate localKey/sessionKey-only tier (senderVerified=false); all other tiers senderVerified=false.
+8. Step 7 (fix-J middleware): In bridgeContextMiddleware (server.go:256-348) read X-Channel-Type/X-Sender-ID, pass to VerifyBridgeContext, capture senderVerified; inject tools.WithToolChannelType + store.WithSenderID ONLY when senderVerified==true (gate like tenantVerified at :315-318).
+9. Step 8 (i-3a lift): Lift getUserMCPTools per-server body (loop_mcp_user.go:115-220) into internal/mcp free func ResolveExternalBridgeTools(ctx, store, pool, gc, tenantID, agentID, userID, senderID, peerKind, channelType); compute actorID via ResolveActorUserID; replicate inline cred merge order (:139-148); refactor Loop.getUserMCPTools to call it.
+10. Step 9 (i-3a actor-keyed ctx): Inside ResolveExternalBridgeTools inject store.WithUserID(ctx, actorID) for the per-actor sub-ctx that BridgeTools capture (downstream of middleware's WithUserID at server.go:312 -> last-write-wins=actorID), so GetUserCredentials/AcquireUser/IsAllowed all key on actorID.
+11. Step 10 (B3 purge lift): Add the isUnauthorized401 -> mcpStore.DeleteUserCredentials(ctx, srv.ID, actorID) branch (port of loop_mcp_user.go:154-173) into ResolveExternalBridgeTools' AcquireUser error handler, keyed on resolved actorID.
+12. Step 11 (i-3a S8 Release-before-build): Release immediately after AcquireUser-success, before convertBridgeToMCPTool; Release on every post-success exit path (skip/continue/grant-deny/timeout/panic).
+13. Step 12 (i-3a bridge server): Change NewBridgeServer signature (bridge_server.go) to add (mcpStore, pool, grantChecker); keep builtin BridgeToolNames AddTool loop unchanged.
+14. Step 13 (i-3a seeding): Construct bridge with WithSessionIdManager(&StatelessGeneratingSessionIdManager{}) (NOT WithStateLess(true)) + WithHTTPContextFunc(seedExternalTools); seedExternalTools derives identity via store.*FromContext (never r.Header), calls ResolveExternalBridgeTools, SetSessionTools on the ephemeral session; add request-end sessionToolsStore.delete cleanup (S2).
+15. Step 14 (i-3a convert+schema): convertBridgeToMCPTool with bridge_server.go:83-91 marshal-error fallback {"type":"object"}; set ONLY RawInputSchema; handler closure calls bt.Execute, never forwards inbound req.Params.Name.
+16. Step 15 (i-3a wiring): Wire NewBridgeServer(...,mcpStore,pool,grantChecker) into the token-gated construction site (server.go:217-231, inside if Gateway.Token != "").
+17. Step 16 (i-3b deletion): Delete all 10 symbols ATOMICALLY: claude_cli_mcp.go:115-126 inject loop, :30-32 MCPServerLookup type, :40 field, :106 nil-guard clause; gateway_providers.go:207-242 buildMCPServerLookup + :471; http/providers.go:39 field, :67-71 setter, :242; gateway_http_handlers.go:95. Keep mcpServerEntryToConfig only if static d.Servers still uses it.
+18. Step 17 (tests): Add B2 key-set regression test + nil-guard test (claude_cli_mcp_test.go); HMAC/senderVerified + adversarial forge tests (claude_cli_mcp_test.go / bridge_context_test.go); ResolveExternalBridgeTools unit tests (allow/deny, hasUserCreds->AcquireUser, 401 purge keyed on actorID, skip-on-cold-server); concurrency cred-confidentiality test; bridge-disabled invariant test; cred byte-identical test.
+19. Step 18 (single atomic commit set + PR): one PR carrying i-3a+i-3b+fix-J; document S2/S8 new-construct + evictIdle staleness as explicit reviewed risks; defer V1/V3/V4 to stage38 runtime verification.
+
+#### 11.T Test matrix
+
+- B1 / condition-1 — ResolveActorUserID("uuid-x","lineworks:42","direct","lineworks") == "lineworks:42" (NOT rewritten UUID); same with channelType="telegram" == "uuid-x" (unchanged); bitrix24 branch still works (loop_mcp_user.go:71-85)
+- B1 / S6b condition — VerifyBridgeContext returns senderVerified=true ONLY at the new full L1 tier; intermediate localKey/sessionKey-only tier and all legacy fallbacks return senderVerified=false (claude_cli_mcp.go:284-306)
+- B1 / S6b adversarial (C2) — valid OLD-format sig + injected X-Sender-ID -> ok=true, senderVerified=false, creds NOT resolved under injected sender
+- B1 / sign roundtrip — SignBridgeContext WITH channelType/senderID extras differs from WITHOUT; backward-compat pre-channelType session still ok=true (flag-day-free)
+- B1 / middleware (e) — WithToolChannelType + WithSenderID injected ONLY when senderVerified==true; not injected on fallback tiers
+- B1 / condition-3 collision — per-actor store.WithUserID(actorID) wins over middleware store.WithUserID(userID) (server.go:312); GetUserCredentials/AcquireUser/IsAllowed all key on actorID=lineworks:<uid>
+- B1 / S4 fail-closed — tenantVerified==false || tenantID=='' || ListAccessible error -> ZERO per-user external tools, no ListServers fallback
+- B1 / C4 trust-boundary — valid token + forged X-Agent-ID/X-Tenant-ID headers + absent/invalid X-Bridge-Sig -> zero external tools; seedExternalTools never reads r.Header
+- B2 / key-set positive — WriteMCPConfig with Servers={static-a,static-b}+GatewayAddr -> mcpServers keys EXACTLY {goclaw-bridge,static-a,static-b}
+- B2 / key-set negative — config that previously injected a DB server name now contains NO per-agent DB server (bypass closed)
+- B2 / condition-4 nil-guard — MCPConfigData{} (no Servers, no GatewayAddr) -> WriteMCPConfig returns "" after removing && d.AgentMCPLookup==nil clause (claude_cli_mcp.go:106)
+- B3 / 401-purge — ResolveExternalBridgeTools AcquireUser 401 -> DeleteUserCredentials(ctx, srv.ID, actorID) keyed on resolved actor (NOT header userID); native loop purge unchanged (loop_mcp_user.go:171)
+- B3 / condition-5 ordering — purge keys on lineworks:<uid> only because B1 lineworks branch landed; pre-B1 would purge wrong/no row
+- C1 / cred merge — resolved headers map for (odoo-prod, user) byte-identical between ResolveExternalBridgeTools and native getUserMCPTools (server APIKey -> user APIKey override -> maps.Copy Headers/Env, loop_mcp_user.go:139-148)
+- C7/S2 / cred-confidentiality (P0) — two concurrent fake users with DIFFERENT creds resolving for distinct actors (lineworks:A vs lineworks:B) -> each BridgeTool carries its own api_key/clientPtr; never observe each other's Authorization; stale (IsConnected()==false) entries evicted not served
+- C6/S2 / sessionToolsStore cleanup — one-shot claude --print path leaves NO permanent sessionTools entry (explicit request-end delete or TTL); unbounded-growth assertion
+- C8/S3 / global-fallthrough — external per-agent tools NEVER in process-global s.tools (only per-request session map); each ServerTool handler closure binds THIS request's bt (captured serverID)
+- C9/S8 / refCount discipline — Release-before-build; refCount returns to 0 on every exit (success/skip/grant-deny/timeout/panic); no MaxUserConns exhaustion under repeated seed
+- C10/S9 / bridge-disabled — GatewayToken=='' -> /mcp/bridge 403, no tools/list, written config has NO DB servers (only static d.Servers, goclaw-bridge absent)
+- C11/S10 / schema-marshal — malformed external-tool schema -> convertBridgeToMCPTool falls back to {"type":"object"} (RawInputSchema only); whole resolve does not fail
+- RUNTIME V1/S12 — stage38: two LINE WORKS users same group -> two distinct UserPoolKey + two distinct Authorization bearer tokens via psql/SSH; user B never reuses user A poolEntry (contingent on B1)
+- RUNTIME V3/S2 — real claude --print --mcp-config: tools/list+tools/call carry Mcp-Session-Id from initialize; missing-ID safe (404, no clobber); two-concurrent-fake-CLI distinct external sets
+- RUNTIME V4/S7 — lifted helper slog.Warn never embeds Authorization in streamable-http 401 error string
