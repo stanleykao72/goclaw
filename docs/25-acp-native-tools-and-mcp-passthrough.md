@@ -244,6 +244,29 @@ external-MCP work.
 4. Per-server `ToolAllow/ToolDeny` enforcement when handing servers to the ACP
    agent — enforce in GoClaw, rely on adapter, or accept all?
 
+### Resolved (2026-06-18, human decisions on the impl plan)
+
+- **G2 / decision 1 — Memory: Route B (all via bridge).** ACP memory recall AND
+  writes go through the GoClaw MCP bridge, reusing the native memory tools so writes
+  land in `memory_documents`/`memory_chunks`/KG with scope enforcement and
+  untrusted-wrapping. **Consequence: the whole memory path is Risk-C-gated** — a
+  Risk-C negative routes it to the stdio-shim/Env transport.
+- **G4 / decision 3 — Tool exposure: GoClaw-unique subset.** Expose only tools the
+  Claude subprocess lacks natively — memory store, cron/datetime/heartbeat,
+  messaging/send, sessions, group_members. Do NOT expose fs/web/exec (Claude has its
+  own Read/Write/Bash/WebFetch) to avoid duplication + attack surface. Remove the
+  dead `browser` entry from `BridgeToolNames`.
+- **G6 — Skills: inline SKILL.md.** Pre-inline relevant skill content into the
+  flattened ACP prompt at turn-build (disposition b); no bridge/Risk-C dependency.
+  `skill_load` over the bridge is deferred.
+- **Still spike-gated (not human-decidable):** G1 Risk-C (does the adapter forward
+  custom session/new MCP headers? — now the master gate), G3 Risk-F (does it emit
+  token usage?), G5 Gap-G (does it honour injected `settings.json` for shell
+  deny-patterns/hooks?). Resolved by the Wave-0/1 spikes; outcomes recorded in §6/§8.
+- **Decision 2 (external MCP transport):** deferred to the Risk-C outcome (same gate
+  as G2). **Decision 4 (ToolAllow/ToolDeny):** enforce in GoClaw by force-routing
+  filtered servers through the bridge (plan unit extmcp-2).
+
 ## 12. ACP delegation gap inventory
 
 §1–§11 address only **two slices** — interactive memory tools and external MCP
