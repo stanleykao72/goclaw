@@ -588,6 +588,12 @@ The fs/exec tools (`Bash,Edit,Read,Write,Glob,Grep`) stay disabled in BOTH cases
 | **k-2** | K seed | cold-spawn stream-json transcript seeding (`sessionFileExists==false` gate), extend `buildStreamJSONInput` (claude_cli_session.go:228) + Chat/ChatStream gates | claude_cli_session.go, claude_cli_chat.go | high |
 | **fu-2** | M observability | PostToolUse hook-matcher approach (claude_cli_hooks.go:52, §5) — **NOT** the event-emitter (avoids NewBridgeServer sig change) | claude_cli_hooks.go | medium |
 
+**Wave 1 execution status (Option-A reconciliation):**
+- **k-2** ✅ `7756427b` — implemented as a deterministic TEXT preamble (Option B, §4.1 step 2) rather than a stream-json assistant transcript: the CLI's stdin replay semantics are unverifiable without the binary and a wrong shape would break the cold path.
+- **fu-j-2+3** ✅ `f4d13cd5` — EXPANDED per §11 §2.3-2.6: also threads `ChannelType` (not just `SenderID`), fixes the HMAC extra order to `[localKey,sessionKey,channelType,senderID]`, and changes `VerifyBridgeContext`→3-tuple with `senderVerified`. Supersedes fu-j-1's conditional senderID-only append.
+- **i-1** ⛔ **PRUNED** — Option A's i-3b deletes the entire direct-inject path (`MCPServerLookup`/`buildMCPServerLookup`, §11 §3.1), so widening it is throwaway work. i-1 was Option-B prep (§13 gating_decisions[1] DAG pruning).
+- **fu-2** ⏸ **DEFERRED** — M is a non-blocking follow-up (§3 cat M = "no" for BOTH ACP and claude_cli; not a regression). Scope unconfirmed (the §13 risk note flags "confirm scope before coding" — where observable events are consumed is undesigned). Pick up as a focused change rather than shipping a half-wired hook.
+
 ### Wave 2 — J gate + K tests + (Option A) i-3a substrate (deps: 0,1)
 
 | Unit | Name | Scope | Files | Effort |
