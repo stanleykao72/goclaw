@@ -27,12 +27,14 @@ func NewPGSecureCLIStore(db *sql.DB, encryptionKey string) *PGSecureCLIStore {
 }
 
 const secureCLISelectCols = `id, binary_name, binary_path, description, encrypted_env,
- deny_args, deny_verbose, timeout_seconds, tips, is_global, enabled, created_by, created_at, updated_at`
+ deny_args, deny_verbose, timeout_seconds, tips, is_global, enabled, created_by,
+ adapter_name, created_at, updated_at`
 
 // secureCLISelectColsAliased is prefixed with table alias "b."
 // Required for LookupByBinary which uses LEFT JOIN (ambiguous column names without prefix).
 const secureCLISelectColsAliased = `b.id, b.binary_name, b.binary_path, b.description, b.encrypted_env,
- b.deny_args, b.deny_verbose, b.timeout_seconds, b.tips, b.is_global, b.enabled, b.created_by, b.created_at, b.updated_at`
+ b.deny_args, b.deny_verbose, b.timeout_seconds, b.tips, b.is_global, b.enabled, b.created_by,
+ b.adapter_name, b.created_at, b.updated_at`
 
 func (s *PGSecureCLIStore) Create(ctx context.Context, b *store.SecureCLIBinary) error {
 	if err := store.ValidateUserID(b.CreatedBy); err != nil {
@@ -69,14 +71,15 @@ func (s *PGSecureCLIStore) Create(ctx context.Context, b *store.SecureCLIBinary)
 
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO secure_cli_binaries (id, binary_name, binary_path, description, encrypted_env,
-		 deny_args, deny_verbose, timeout_seconds, tips, is_global, enabled, created_by, created_at, updated_at, tenant_id)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+		 deny_args, deny_verbose, timeout_seconds, tips, is_global, enabled, created_by,
+		 adapter_name, created_at, updated_at, tenant_id)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
 		b.ID, b.BinaryName, nilStr(derefStr(b.BinaryPath)), b.Description,
 		envBytes,
 		jsonOrEmptyArray(b.DenyArgs), jsonOrEmptyArray(b.DenyVerbose),
 		b.TimeoutSeconds, b.Tips,
 		b.IsGlobal, b.Enabled,
-		b.CreatedBy, now, now, tenantID,
+		b.CreatedBy, b.AdapterName, now, now, tenantID,
 	)
 	return err
 }
@@ -106,7 +109,7 @@ func (s *PGSecureCLIStore) scanRow(row *sql.Row) (*store.SecureCLIBinary, error)
 		&b.ID, &b.BinaryName, &binaryPath, &b.Description, &env,
 		&denyArgs, &denyVerbose,
 		&b.TimeoutSeconds, &b.Tips, &b.IsGlobal,
-		&b.Enabled, &b.CreatedBy, &b.CreatedAt, &b.UpdatedAt,
+		&b.Enabled, &b.CreatedBy, &b.AdapterName, &b.CreatedAt, &b.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -148,7 +151,7 @@ func (s *PGSecureCLIStore) scanRows(rows *sql.Rows) ([]store.SecureCLIBinary, er
 			&b.ID, &b.BinaryName, &binaryPath, &b.Description, &env,
 			&denyArgs, &denyVerbose,
 			&b.TimeoutSeconds, &b.Tips, &b.IsGlobal,
-			&b.Enabled, &b.CreatedBy, &b.CreatedAt, &b.UpdatedAt,
+			&b.Enabled, &b.CreatedBy, &b.AdapterName, &b.CreatedAt, &b.UpdatedAt,
 		); err != nil {
 			continue
 		}
@@ -178,7 +181,7 @@ var secureCLIAllowedFields = map[string]bool{
 	"binary_name": true, "binary_path": true, "description": true,
 	"encrypted_env": true, "deny_args": true, "deny_verbose": true,
 	"timeout_seconds": true, "tips": true, "is_global": true, "enabled": true,
-	"updated_at": true,
+	"adapter_name": true, "updated_at": true,
 }
 
 func (s *PGSecureCLIStore) Update(ctx context.Context, id uuid.UUID, updates map[string]any) error {
@@ -299,7 +302,7 @@ func (s *PGSecureCLIStore) scanRowsWithGrants(rows *sql.Rows) ([]store.SecureCLI
 			&b.ID, &b.BinaryName, &binaryPath, &b.Description, &env,
 			&denyArgs, &denyVerbose,
 			&b.TimeoutSeconds, &b.Tips, &b.IsGlobal,
-			&b.Enabled, &b.CreatedBy, &b.CreatedAt, &b.UpdatedAt,
+			&b.Enabled, &b.CreatedBy, &b.AdapterName, &b.CreatedAt, &b.UpdatedAt,
 			&grantsJSON,
 		); err != nil {
 			continue
@@ -348,9 +351,14 @@ func (s *PGSecureCLIStore) LookupByBinary(ctx context.Context, binaryName string
 
 	var joinClause string
 	if userID != "" {
-		selectCols += ", uc.encrypted_env AS user_env"
+		selectCols += ", uc.encrypted_env AS user_env, uc.credential_type AS user_cred_type, uc.host_scope AS user_host_scope"
 	} else {
-		selectCols += ", NULL AS user_env"
+		selectCols += ", NULL AS user_env, NULL AS user_cred_type, NULL AS user_host_scope"
+	}
+	if agentID != nil {
+		selectCols += ", ac.encrypted_env AS agent_env, ac.credential_type AS agent_cred_type, ac.host_scope AS agent_host_scope"
+	} else {
+		selectCols += ", NULL AS agent_env, NULL AS agent_cred_type, NULL AS agent_host_scope"
 	}
 
 	var args []any
@@ -366,6 +374,16 @@ func (s *PGSecureCLIStore) LookupByBinary(ctx context.Context, binaryName string
 		argIdx++
 	} else {
 		query += ` LEFT JOIN secure_cli_agent_grants g ON FALSE` // never match
+	}
+	if agentID != nil {
+		query += fmt.Sprintf(` LEFT JOIN secure_cli_agent_credentials ac ON ac.binary_id = b.id AND ac.agent_id = $%d`, argIdx)
+		args = append(args, *agentID)
+		argIdx++
+		if !isCross {
+			query += fmt.Sprintf(` AND ac.tenant_id = $%d`, argIdx)
+			args = append(args, tid)
+			argIdx++
+		}
 	}
 
 	// LEFT JOIN user credentials
@@ -407,7 +425,11 @@ func (s *PGSecureCLIStore) LookupByBinary(ctx context.Context, binaryName string
 	query += ` LIMIT 1`
 
 	row := s.db.QueryRowContext(ctx, query, args...)
-	return s.scanRowWithGrantAndUserEnv(row)
+	b, err := s.scanRowWithGrantAndUserEnv(row)
+	if err != nil || b == nil {
+		return b, err
+	}
+	return s.applyContextSecureCLI(ctx, b)
 }
 
 // scanRowWithGrantAndUserEnv scans a row that includes grant override columns and user_env.
@@ -424,16 +446,21 @@ func (s *PGSecureCLIStore) scanRowWithGrantAndUserEnv(row *sql.Row) (*store.Secu
 	var grantID *uuid.UUID
 	var grantEncEnv []byte
 	var userEnv []byte
+	var userCredType, userHostScope *string
+	var agentEnv []byte
+	var agentCredType, agentHostScope *string
 
 	err := row.Scan(
 		&b.ID, &b.BinaryName, &binaryPath, &b.Description, &env,
 		&denyArgs, &denyVerbose,
 		&b.TimeoutSeconds, &b.Tips, &b.IsGlobal,
-		&b.Enabled, &b.CreatedBy, &b.CreatedAt, &b.UpdatedAt,
+		&b.Enabled, &b.CreatedBy, &b.AdapterName, &b.CreatedAt, &b.UpdatedAt,
 		// Grant columns
 		&grantDenyArgs, &grantDenyVerbose, &grantTimeout, &grantTips, &grantEnabled, &grantID, &grantEncEnv,
-		// User env
-		&userEnv,
+		// User credential columns
+		&userEnv, &userCredType, &userHostScope,
+		// Agent credential columns
+		&agentEnv, &agentCredType, &agentHostScope,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -473,22 +500,99 @@ func (s *PGSecureCLIStore) scanRowWithGrantAndUserEnv(row *sql.Row) (*store.Secu
 		grant.TimeoutSeconds = grantTimeout
 		grant.Tips = grantTips
 		// Decrypt grant env override (fail-closed: skip if decrypt fails).
-		if len(grantEncEnv) > 0 && s.encKey != "" {
-			if decrypted, err := crypto.Decrypt(string(grantEncEnv), s.encKey); err == nil {
-				grant.EncryptedEnv = []byte(decrypted)
+		if len(grantEncEnv) > 0 {
+			if s.encKey != "" {
+				if decrypted, err := crypto.Decrypt(string(grantEncEnv), s.encKey); err == nil {
+					grant.EncryptedEnv = []byte(decrypted)
+				}
+			} else {
+				grant.EncryptedEnv = grantEncEnv
 			}
 		}
 		b.MergeGrantOverrides(grant)
 	}
 
 	// Decrypt per-user env
-	if len(userEnv) > 0 && s.encKey != "" {
-		if decrypted, err := crypto.Decrypt(string(userEnv), s.encKey); err == nil {
-			b.UserEnv = []byte(decrypted)
+	if len(userEnv) > 0 {
+		if s.encKey != "" {
+			if decrypted, err := crypto.Decrypt(string(userEnv), s.encKey); err == nil {
+				b.UserEnv = []byte(decrypted)
+			}
+		} else {
+			b.UserEnv = userEnv
+		}
+	}
+	// Project per-user credential metadata so adapters can branch on it.
+	b.UserCredentialType = userCredType
+	b.UserHostScope = userHostScope
+	if len(b.UserEnv) > 0 || userCredType != nil || userHostScope != nil {
+		b.SetEffectiveCredential(b.UserEnv, userCredType, userHostScope, "user", "")
+	}
+	if len(agentEnv) > 0 || agentCredType != nil || agentHostScope != nil {
+		decrypted := agentEnv
+		if len(agentEnv) > 0 && s.encKey != "" {
+			if d, err := crypto.Decrypt(string(agentEnv), s.encKey); err == nil {
+				decrypted = []byte(d)
+			}
+		}
+		if b.CredentialSource == "" {
+			b.SetEffectiveCredential(decrypted, agentCredType, agentHostScope, "agent", "")
 		}
 	}
 
 	return &b, nil
+}
+
+func (s *PGSecureCLIStore) applyContextSecureCLI(ctx context.Context, b *store.SecureCLIBinary) (*store.SecureCLIBinary, error) {
+	scopes := store.ChannelContextScopeChainFromContext(ctx)
+	if len(scopes) == 0 || b == nil {
+		return b, nil
+	}
+	hasUserCredential := b.CredentialSource == "user" || len(b.UserEnv) > 0 || b.UserCredentialType != nil || b.UserHostScope != nil
+	disabledByContext := false
+	for _, scope := range scopes {
+		grants, err := s.ListContextGrantsForScope(ctx, scope)
+		if err != nil {
+			return nil, err
+		}
+		for _, contextGrant := range grants {
+			if contextGrant.BinaryID != b.ID {
+				continue
+			}
+			if !contextGrant.Enabled {
+				disabledByContext = true
+				break
+			}
+			grant := &store.SecureCLIAgentGrant{
+				DenyArgs:       contextGrant.DenyArgs,
+				DenyVerbose:    contextGrant.DenyVerbose,
+				TimeoutSeconds: contextGrant.TimeoutSeconds,
+				Tips:           contextGrant.Tips,
+				EncryptedEnv:   contextGrant.EncryptedEnv,
+			}
+			b.MergeGrantOverrides(grant)
+			disabledByContext = false
+			break
+		}
+	}
+	if disabledByContext {
+		return nil, nil
+	}
+	for _, scope := range scopes {
+		creds, err := s.GetContextCredentialsForScope(ctx, scope, b.ID)
+		if err != nil {
+			return nil, err
+		}
+		if creds == nil || len(creds.EncryptedEnv) == 0 {
+			continue
+		}
+		if !hasUserCredential {
+			b.SetEffectiveCredential(creds.EncryptedEnv, creds.CredentialType, creds.HostScope, "context", scope.ScopeType+":"+scope.ScopeKey)
+		} else {
+			b.EncryptedEnv = creds.EncryptedEnv
+		}
+	}
+	return b, nil
 }
 
 func (s *PGSecureCLIStore) ListEnabled(ctx context.Context) ([]store.SecureCLIBinary, error) {
@@ -591,7 +695,7 @@ func (s *PGSecureCLIStore) ListForAgent(ctx context.Context, agentID uuid.UUID) 
 			&b.ID, &b.BinaryName, &binaryPath, &b.Description, &env,
 			&denyArgs, &denyVerbose,
 			&b.TimeoutSeconds, &b.Tips, &b.IsGlobal,
-			&b.Enabled, &b.CreatedBy, &b.CreatedAt, &b.UpdatedAt,
+			&b.Enabled, &b.CreatedBy, &b.AdapterName, &b.CreatedAt, &b.UpdatedAt,
 			&grantDenyArgs, &grantDenyVerbose, &grantTimeout, &grantTips, &grantID, &grantEncEnv,
 		); err != nil {
 			continue

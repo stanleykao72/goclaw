@@ -2,6 +2,7 @@ package pg
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -148,7 +149,37 @@ func (s *PGMCPServerStore) RevokeFromUser(ctx context.Context, serverID uuid.UUI
 // --- Resolution ---
 
 func (s *PGMCPServerStore) ListAccessible(ctx context.Context, agentID uuid.UUID, userID string) ([]store.MCPAccessInfo, error) {
-	tClause, tArgs, _, err := scopeClauseAlias(ctx, 3, "ms")
+	tClause, tArgs, _, err := scopeClauseAlias(ctx, 2, "ms")
+	if err != nil {
+		return nil, err
+	}
+	// Synthetic owner identities ("" at startup registration, "system" for
+	// WS direct/owner chat) are not real external actors — they cannot have
+	// a per-user grant that anyone deliberately provisioned. Skipping the
+	// mcp_user_grants join for those keeps registration (userID="") and
+	// execute (userID="system") symmetric. Without this, a stale row in
+	// mcp_user_grants with user_id='system' AND enabled=false would silently
+	// hide tools at execute time that registration saw fine, producing
+	// "grant revoked (reason: server_not_accessible)" with no DB change.
+	if userID == "" || userID == "system" {
+		rows, err := s.db.QueryContext(ctx,
+			`SELECT ms.id, ms.name, ms.display_name, ms.transport, ms.command, ms.args, ms.url, ms.headers, ms.env,
+			 ms.api_key, ms.tool_prefix, ms.timeout_sec, ms.settings, ms.enabled, ms.created_by, ms.created_at, ms.updated_at,
+			 mag.tool_allow, mag.tool_deny
+			 FROM mcp_servers ms
+			 INNER JOIN mcp_agent_grants mag ON ms.id = mag.server_id AND mag.agent_id = $1 AND mag.enabled = true
+			 WHERE ms.enabled = true`+tClause,
+			append([]any{agentID}, tArgs...)...)
+		if err != nil {
+			return nil, err
+		}
+		result, err := s.scanAccessibleRows(rows)
+		if err != nil {
+			return nil, err
+		}
+		return s.applyContextMCPAccess(ctx, result)
+	}
+	tClause, tArgs, _, err = scopeClauseAlias(ctx, 3, "ms")
 	if err != nil {
 		return nil, err
 	}
@@ -165,6 +196,74 @@ func (s *PGMCPServerStore) ListAccessible(ctx context.Context, agentID uuid.UUID
 	if err != nil {
 		return nil, err
 	}
+	result, err := s.scanAccessibleRows(rows)
+	if err != nil {
+		return nil, err
+	}
+	return s.applyContextMCPAccess(ctx, result)
+}
+
+func (s *PGMCPServerStore) applyContextMCPAccess(ctx context.Context, result []store.MCPAccessInfo) ([]store.MCPAccessInfo, error) {
+	scopes := store.ChannelContextScopeChainFromContext(ctx)
+	if len(scopes) == 0 {
+		return result, nil
+	}
+	for _, scope := range scopes {
+		grants, err := s.ListContextGrantsForScope(ctx, scope)
+		if err != nil {
+			return nil, err
+		}
+		if len(grants) == 0 {
+			continue
+		}
+		byServer := make(map[uuid.UUID]int, len(result))
+		for i := range result {
+			byServer[result[i].Server.ID] = i
+		}
+		for _, grant := range grants {
+			if idx, exists := byServer[grant.ServerID]; exists {
+				if !grant.Enabled {
+					result = append(result[:idx], result[idx+1:]...)
+					byServer = make(map[uuid.UUID]int, len(result))
+					for i := range result {
+						byServer[result[i].Server.ID] = i
+					}
+					continue
+				}
+				result[idx].ToolAllow = decodeGrantStringList(grant.ToolAllow)
+				result[idx].ToolDeny = decodeGrantStringList(grant.ToolDeny)
+				continue
+			}
+			if !grant.Enabled {
+				continue
+			}
+			server, err := s.GetServer(ctx, grant.ServerID)
+			if err != nil || server == nil || !server.Enabled {
+				continue
+			}
+			result = append(result, store.MCPAccessInfo{
+				Server:    *server,
+				ToolAllow: decodeGrantStringList(grant.ToolAllow),
+				ToolDeny:  decodeGrantStringList(grant.ToolDeny),
+			})
+		}
+	}
+	return result, nil
+}
+
+func decodeGrantStringList(raw json.RawMessage) []string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var list []string
+	_ = json.Unmarshal(raw, &list)
+	return list
+}
+
+// scanAccessibleRows decodes the shared SELECT projection used by both the
+// system-user (no per-user-grant filter) and external-user paths of
+// ListAccessible. Kept private so callers go through ListAccessible.
+func (s *PGMCPServerStore) scanAccessibleRows(rows *sql.Rows) ([]store.MCPAccessInfo, error) {
 	defer rows.Close()
 
 	result := make([]store.MCPAccessInfo, 0)

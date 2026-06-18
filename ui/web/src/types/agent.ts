@@ -52,6 +52,24 @@ export interface ContextPruningConfig {
   };
 }
 
+export interface DeliveryGeneratorConfig {
+  enabled?: boolean;
+  mode?: "sidecar_generated" | "llm_generated" | "fixed_template" | "off";
+  provider?: string;
+  model?: string;
+  timeout_ms?: number;
+  max_tokens?: number;
+  max_chars?: number;
+  min_delay_ms?: number;
+  templates?: string[];
+}
+
+export interface DeliveryBehaviorConfig {
+  enabled?: boolean;
+  intermediate_replies?: DeliveryGeneratorConfig;
+  quick_ack?: DeliveryGeneratorConfig;
+}
+
 export interface SandboxConfig {
   mode?: "off" | "non-main" | "all";
   image?: string;
@@ -108,11 +126,17 @@ export type EffectiveChatGPTOAuthRoutingStrategy =
 
 export type ChatGPTOAuthRoutingOverrideMode = "inherit" | "custom";
 export type ReasoningOverrideMode = "inherit" | "custom";
+export type InboundDebounceOverrideMode = "inherit" | "custom";
 
 export interface AgentReasoningConfig {
   override_mode?: ReasoningOverrideMode;
   effort?: string;
   fallback?: "downgrade" | "provider_default" | "off";
+}
+
+export interface InboundDebounceConfig {
+  override_mode?: InboundDebounceOverrideMode;
+  inbound_debounce_ms?: number;
 }
 
 export interface ChatGPTOAuthRoutingConfig {
@@ -188,6 +212,15 @@ export interface AgentData {
   other_config?: Record<string, unknown> | null;
   budget_monthly_cents?: number | null;
   tenant_id?: string;
+  grant_gateway_operator_access?: boolean;
+  gateway_operator_bootstrap?: GatewayOperatorBootstrapResult | null;
+}
+
+export interface GatewayOperatorBootstrapResult {
+  status: "granted" | "warning" | "skipped" | string;
+  binary_id?: string;
+  grant_id?: string;
+  warning?: string;
 }
 
 export interface AgentShareData {

@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { useTranslation } from "react-i18next";
+import { Copy, Download } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -15,11 +16,17 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { SearchInput } from "@/components/shared/search-input";
 import { MarkdownRenderer } from "@/components/shared/markdown-renderer";
+import { toast } from "@/stores/use-toast-store";
 import type { SkillInfo, SkillFile, SkillVersions } from "@/types/skill";
 import { buildTree } from "./skill-file-helpers";
 import { FileBrowser } from "./skill-file-browser";
-import { parseSkillDetailVersionParam, shouldLoadSkillDetailFile } from "./lib/skill-detail-deeplink";
+import { normalizeSkillDetailTab, parseSkillDetailVersionParam, shouldLoadSkillDetailFile } from "./lib/skill-detail-deeplink";
+import { getSkillAccessModeKey } from "./lib/skill-access-mode";
+import type { SkillExportFormat } from "./lib/skill-export-download";
+import { SkillEvolutionPanel } from "./skill-evolution-panel";
 
 interface SkillDetailDialogProps {
   skill: SkillInfo & { content: string };
@@ -28,6 +35,10 @@ interface SkillDetailDialogProps {
   selectedFilePath: string | null;
   onStateChange: (updates: Record<string, string | null>) => void;
   onClose: () => void;
+  exportFormat: SkillExportFormat;
+  downloadLoading: boolean;
+  onExportFormatChange: (format: SkillExportFormat) => void;
+  onDownloadSkill: () => void;
   getSkillVersions: (id: string) => Promise<SkillVersions>;
   getSkillFiles: (id: string, version?: number) => Promise<SkillFile[]>;
   getSkillFileContent: (id: string, path: string, version?: number) => Promise<{ content: string; path: string; size: number }>;
@@ -40,12 +51,22 @@ export function SkillDetailDialog({
   selectedFilePath,
   onStateChange,
   onClose,
+  exportFormat,
+  downloadLoading,
+  onExportFormatChange,
+  onDownloadSkill,
   getSkillVersions,
   getSkillFiles,
   getSkillFileContent,
 }: SkillDetailDialogProps) {
   const { t } = useTranslation("skills");
   const hasFiles = !!skill.id;
+  const hasEvolution = !!skill.id;
+  const activeDetailTab = normalizeSkillDetailTab(detailTab, hasFiles, hasEvolution);
+  const accessModeKey = getSkillAccessModeKey(skill.visibility);
+  const accessModeLabel = accessModeKey === "unknown"
+    ? t("accessMode.unknown", { value: skill.visibility || t("unknownOwner") })
+    : t(`accessMode.${accessModeKey}`);
 
   // Version state
   const [versions, setVersions] = useState<SkillVersions | null>(null);
@@ -57,18 +78,24 @@ export function SkillDetailDialog({
   const [files, setFiles] = useState<SkillFile[]>([]);
   const [filesLoading, setFilesLoading] = useState(false);
   const [activePath, setActivePath] = useState<string | null>(null);
+  const [fileQuery, setFileQuery] = useState("");
 
   // File content state
   const [fileContent, setFileContent] = useState<{ content: string; path: string; size: number } | null>(null);
   const [contentLoading, setContentLoading] = useState(false);
 
-  const tree = useMemo(() => buildTree(files), [files]);
+  const filteredFiles = useMemo(
+    () => filterSkillFiles(files, fileQuery, activePath),
+    [activePath, fileQuery, files],
+  );
+  const tree = useMemo(() => buildTree(filteredFiles), [filteredFiles]);
 
   useEffect(() => {
     setVersions(null);
     setSelectedVersion(parseSkillDetailVersionParam(selectedVersionParam));
     setFiles([]);
     setActivePath(null);
+    setFileQuery("");
     setFileContent(null);
   }, [skill.id, selectedVersionParam]);
 
@@ -113,7 +140,7 @@ export function SkillDetailDialog({
   }, [selectedVersion, loadFiles]);
 
   useEffect(() => {
-    if (detailTab !== "files" || !hasFiles) return;
+    if (activeDetailTab !== "files" || !hasFiles) return;
     loadVersions();
     const versionParam = parseSkillDetailVersionParam(selectedVersionParam);
     if (versionParam !== null && versionParam !== selectedVersion) {
@@ -123,15 +150,15 @@ export function SkillDetailDialog({
     if (selectedVersion == null && skill.version) {
       setSelectedVersion(skill.version);
     }
-  }, [detailTab, hasFiles, loadVersions, selectedVersion, selectedVersionParam, skill.version]);
+  }, [activeDetailTab, hasFiles, loadVersions, selectedVersion, selectedVersionParam, skill.version]);
 
   useEffect(() => {
-    if (!shouldLoadSkillDetailFile(detailTab, selectedFilePath, files.length, activePath)) return;
+    if (!shouldLoadSkillDetailFile(activeDetailTab, selectedFilePath, files.length, activePath)) return;
     loadFileContent(selectedFilePath);
-  }, [activePath, detailTab, files.length, loadFileContent, selectedFilePath]);
+  }, [activePath, activeDetailTab, files.length, loadFileContent, selectedFilePath]);
 
   const handleTabChange = (tab: string) => {
-    onStateChange({ detailTab: tab });
+    onStateChange({ detailTab: tab, version: tab === "files" ? selectedVersionParam : null, file: tab === "files" ? activePath : null });
     if (tab === "files" && hasFiles) {
       loadVersions();
       if (files.length === 0 && !filesLoading) {
@@ -155,6 +182,26 @@ export function SkillDetailDialog({
     loadFileContent(path);
   };
 
+  const copyDeeplink = async () => {
+    const url = new URL(window.location.href);
+    url.pathname = "/skills";
+    const next = new URLSearchParams(url.search);
+    next.set("skill", skill.id || skill.slug || skill.name);
+    next.set("detailTab", activeDetailTab);
+    if (activeDetailTab === "files" && selectedVersion != null) next.set("version", String(selectedVersion));
+    else next.delete("version");
+    if (activeDetailTab === "files" && activePath) next.set("file", activePath);
+    else next.delete("file");
+    url.search = next.toString();
+
+    try {
+      await navigator.clipboard.writeText(url.toString());
+      toast.success(t("detail.copySuccess"));
+    } catch (err) {
+      toast.error(t("detail.copyFailed"), err instanceof Error ? err.message : String(err));
+    }
+  };
+
   useEffect(() => {
     if (hasFiles) loadVersions();
   }, [hasFiles, loadVersions]);
@@ -170,11 +217,37 @@ export function SkillDetailDialog({
               {skill.name}
               <Badge variant="outline">{skill.source || "file"}</Badge>
               {skill.visibility && (
-                <Badge variant="secondary">{skill.visibility}</Badge>
+                <Badge variant="secondary">{accessModeLabel}</Badge>
               )}
             </DialogTitle>
-            {versions && versions.versions.length > 1 ? (
-              <div className="flex shrink-0 items-center gap-2">
+            <div className="flex shrink-0 flex-wrap items-center gap-2">
+              <Select value={exportFormat} onValueChange={(value) => onExportFormatChange(value as SkillExportFormat)}>
+                <SelectTrigger className="h-8 w-[104px]" aria-label={t("export.format")}>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="zip">ZIP</SelectItem>
+                  <SelectItem value="tar.gz">tar.gz</SelectItem>
+                  <SelectItem value="tgz">tgz</SelectItem>
+                </SelectContent>
+              </Select>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-8 gap-1"
+                disabled={downloadLoading || !skill.id}
+                onClick={onDownloadSkill}
+              >
+                <Download className="h-3.5 w-3.5" />
+                {downloadLoading ? t("export.downloading") : t("export.download")}
+              </Button>
+              <Button type="button" variant="outline" size="sm" className="h-8 gap-1" onClick={copyDeeplink}>
+                <Copy className="h-3.5 w-3.5" />
+                {t("detail.copyLink")}
+              </Button>
+              {versions && versions.versions.length > 1 ? (
+                <>
                 <span className="text-sm text-muted-foreground">{t("detail.version")}</span>
                 <Select
                   value={String(headerVersion ?? versions.current)}
@@ -191,12 +264,13 @@ export function SkillDetailDialog({
                     ))}
                   </SelectContent>
                 </Select>
-              </div>
-            ) : headerVersion ? (
-              <Badge variant="outline" className="w-fit shrink-0 font-normal">
-                v{headerVersion}
-              </Badge>
-            ) : null}
+                </>
+              ) : headerVersion ? (
+                <Badge variant="outline" className="w-fit shrink-0 font-normal">
+                  v{headerVersion}
+                </Badge>
+              ) : null}
+            </div>
           </div>
           {skill.description && (
             <p className="text-sm text-muted-foreground">{skill.description}</p>
@@ -219,10 +293,11 @@ export function SkillDetailDialog({
           )}
         </DialogHeader>
 
-        <Tabs value={detailTab === "files" && hasFiles ? "files" : "content"} className="flex-1 overflow-hidden flex flex-col" onValueChange={handleTabChange}>
+        <Tabs value={activeDetailTab} className="flex-1 overflow-hidden flex flex-col" onValueChange={handleTabChange}>
           <TabsList>
             <TabsTrigger value="content">{t("detail.content")}</TabsTrigger>
             {hasFiles && <TabsTrigger value="files">{t("detail.files")}</TabsTrigger>}
+            {hasEvolution && <TabsTrigger value="evolution">{t("evolution.tab")}</TabsTrigger>}
           </TabsList>
 
           <TabsContent value="content" className="flex-1 overflow-y-auto mt-2 -mx-4 px-4 sm:-mx-6 sm:px-6">
@@ -231,12 +306,25 @@ export function SkillDetailDialog({
                 <MarkdownRenderer content={skill.content} />
               </div>
             ) : (
-              <p className="text-sm text-muted-foreground">{t("detail.noContent")}</p>
+              <div className="rounded-md border border-dashed bg-muted/20 p-6 text-sm text-muted-foreground">
+                {t("detail.noContent")}
+              </div>
             )}
           </TabsContent>
 
           {hasFiles && (
             <TabsContent value="files" className="flex-1 overflow-hidden flex flex-col mt-2 gap-2">
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                <SearchInput
+                  value={fileQuery}
+                  onChange={setFileQuery}
+                  placeholder={t("detail.fileSearch")}
+                  className="w-full sm:max-w-xs"
+                />
+                <span className="text-xs text-muted-foreground">
+                  {t("detail.filesShown", { shown: filteredFiles.length, total: files.length })}
+                </span>
+              </div>
               <FileBrowser
                 tree={tree}
                 filesLoading={filesLoading}
@@ -247,8 +335,36 @@ export function SkillDetailDialog({
               />
             </TabsContent>
           )}
+
+          {hasEvolution && (
+            <TabsContent value="evolution" className="flex-1 overflow-y-auto mt-2 -mx-4 px-4 sm:-mx-6 sm:px-6">
+              <SkillEvolutionPanel skill={skill} active={activeDetailTab === "evolution"} />
+            </TabsContent>
+          )}
         </Tabs>
       </DialogContent>
     </Dialog>
   );
+}
+
+function filterSkillFiles(files: SkillFile[], query: string, activePath: string | null): SkillFile[] {
+  const q = query.trim().toLowerCase();
+  if (!q) return files;
+
+  const byPath = new Map(files.map((file) => [file.path, file]));
+  const visible = new Set<string>();
+
+  for (const file of files) {
+    const matches = file.path.toLowerCase().includes(q) || file.name.toLowerCase().includes(q) || file.path === activePath;
+    if (!matches) continue;
+    visible.add(file.path);
+    let parentPath = file.path.includes("/") ? file.path.slice(0, file.path.lastIndexOf("/")) : "";
+    while (parentPath) {
+      visible.add(parentPath);
+      const nextSlash = parentPath.lastIndexOf("/");
+      parentPath = nextSlash >= 0 ? parentPath.slice(0, nextSlash) : "";
+    }
+  }
+
+  return files.filter((file) => visible.has(file.path) || (file.isDir && byPath.has(file.path) && visible.has(file.path)));
 }

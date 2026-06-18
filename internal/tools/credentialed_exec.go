@@ -39,8 +39,8 @@ var wrapperBinaries = map[string]bool{
 
 // normalizeBinaryName returns the lowercased file base of a binary reference.
 // Examples: "/usr/bin/gh" → "gh", "./GH" → "gh", "  Gh  " → "gh".
-// Applied at BOTH the gate lookup and lookupCredentialedBinary so the two
-// layers agree on identity. (Red Team F5)
+// Applied at both the gate lookup and lookupCredentialedBinary so the two
+// layers agree on identity.
 func normalizeBinaryName(s string) string {
 	return filepath.Base(strings.TrimSpace(strings.ToLower(s)))
 }
@@ -357,6 +357,10 @@ func matchesBinaryVerbose(args []string, denyPatternsJSON json.RawMessage) strin
 func (t *ExecTool) executeCredentialed(ctx context.Context, cred *store.SecureCLIBinary,
 	binary string, args []string, cwd string, sandboxKey string, rawCommand string) *Result {
 
+	// Attach a per-request scrub bag so adapter-derived secrets stay isolated
+	// from other tenants/goroutines (see scrub.go WithScrubBag).
+	ctx = WithScrubBag(ctx)
+
 	// Step 0: Reject NUL bytes (defense-in-depth — also checked in Execute()).
 	if strings.ContainsRune(rawCommand, '\x00') {
 		return ErrorResult("command contains invalid NUL byte")
@@ -370,7 +374,62 @@ func (t *ExecTool) executeCredentialed(ctx context.Context, cred *store.SecureCL
 		return credentialedShellOperatorError(rawCommand, ops)
 	}
 
-	// Step 2: Resolve binary to absolute path and verify against config
+	// Step 2: Per-binary deny check (deny_args)
+	denyArgs, allowAudits := applyCommandKeywordAllowlist(binary, args, t.commandKeywordAllowlistSnapshot())
+	if p := matchesBinaryDeny(denyArgs, cred.DenyArgs); p != "" {
+		return credentialedDenyError(binary, args, p)
+	}
+	// Per-binary verbose deny check (deny_verbose) — per-arg start-anchored match
+	// so `-v` blocks `-v`/`-vv`/`-v=1` but not `--version`.
+	if p := matchesBinaryVerbose(args, cred.DenyVerbose); p != "" {
+		return credentialedDenyError(binary, args, p)
+	}
+	for _, audit := range allowAudits {
+		slog.Info("security.command_keyword_allowlist",
+			"binary", audit.Command,
+			"subcommand", audit.Subcommand,
+			"arg", audit.Arg,
+			"keyword", audit.Keyword,
+			"rule_id", audit.RuleID,
+			"reason", audit.Reason,
+			"agent_id", store.AgentIDFromContext(ctx),
+			"user_id", store.UserIDFromContext(ctx),
+			"credential_user_id", store.CredentialUserIDFromContext(ctx),
+			"tenant_id", store.TenantIDFromContext(ctx),
+		)
+	}
+
+	// Step 3: Decrypt env vars from store (already decrypted by store layer).
+	// Per-user env overrides take priority over binary/grant env.
+	envMap, err := mergeCredentialedEnv(cred)
+	if err != nil {
+		return ErrorResult(fmt.Sprintf("credentialed exec: invalid env JSON for %q: %v", binary, err))
+	}
+	slog.Debug("secure_cli.env_merged",
+		"binary", binary,
+		"agent_id", store.AgentIDFromContext(ctx),
+		"tenant_id", store.TenantIDFromContext(ctx),
+		"credential_user_id_present", store.CredentialUserIDFromContext(ctx) != "",
+		"env_keys", sortedKeys(envMap),
+	)
+	if missing := missingRequiredCredentialEnv(binary, envMap); len(missing) > 0 {
+		slog.Warn("secure_cli.missing_required_env",
+			"binary", binary,
+			"agent_id", store.AgentIDFromContext(ctx),
+			"tenant_id", store.TenantIDFromContext(ctx),
+			"credential_user_id_present", store.CredentialUserIDFromContext(ctx) != "",
+			"missing_env_keys", missing,
+			"env_keys", sortedKeys(envMap),
+		)
+		return credentialedMissingEnvError(binary, missing)
+	}
+
+	// Step 4: Register credential values for output scrubbing
+	for _, v := range envMap {
+		AddScrubValuesCtx(ctx, v)
+	}
+
+	// Step 5: Resolve binary to absolute path and verify against config
 	absPath, err := resolveAndMatchBinary(binary, cred.BinaryPath)
 	if err != nil {
 		r := credentialedPathError(binary, err)
@@ -380,39 +439,140 @@ func (t *ExecTool) executeCredentialed(ctx context.Context, cred *store.SecureCL
 		return r
 	}
 
-	// Step 3: Per-binary deny check (deny_args)
-	if p := matchesBinaryDeny(args, cred.DenyArgs); p != "" {
-		return credentialedDenyError(binary, args, p)
-	}
-	// Per-binary verbose deny check (deny_verbose) — per-arg start-anchored match
-	// so `-v` blocks `-v`/`-vv`/`-v=1` but not `--version`.
-	if p := matchesBinaryVerbose(args, cred.DenyVerbose); p != "" {
-		return credentialedDenyError(binary, args, p)
-	}
-
-	// Step 4: Decrypt env vars from store (already decrypted by store layer).
-	// Per-user env overrides take priority over binary/grant env.
-	envMap, err := mergeCredentialedEnv(cred)
-	if err != nil {
-		return ErrorResult(fmt.Sprintf("credentialed exec: invalid env JSON for %q: %v", binary, err))
-	}
-
-	// Step 5: Register credential values for output scrubbing
-	for _, v := range envMap {
-		AddCredentialScrubValues(v)
-	}
-
 	// Step 6: Determine timeout
 	timeout := time.Duration(cred.TimeoutSeconds) * time.Second
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
 
+	// Step 6b: Resolve adapter from DB row (source of truth, NOT CLIPresets map).
+	// Passthrough is the default and a no-op — preserves bit-for-bit behavior
+	// for every legacy preset.
+	adapterName := ""
+	if cred.AdapterName != nil {
+		adapterName = *cred.AdapterName
+	}
+	adapter := AdapterFor(adapterName)
+
+	// Sandbox is incompatible with non-passthrough adapters in v1 — they need
+	// to materialize ephemeral files (SSH key, PAT helper) on the host fs that
+	// the sandboxed process can't read. Reject early before any ephemerals
+	// would be created.
+	inSandbox := t.sandboxMgr != nil && sandboxKey != ""
+	if inSandbox && adapter.Name() != "passthrough" {
+		return ErrorResult(fmt.Sprintf("credentialed exec: %q adapter not supported in sandbox mode yet", adapter.Name()))
+	}
+
+	if adapter.ShouldInject(args) {
+		userCred := userCredFromBinary(ctx, cred)
+		if r := validateAdapterCredentialReady(adapter.Name(), binary, userCred); r != nil {
+			return r
+		}
+		// Plant the resolved exec cwd so adapters (e.g. git) can run any
+		// pre-flight sub-exec from the right repo, not goclaw's daemon CWD.
+		prepareCtx := WithExecCwd(ctx, cwd)
+		inj, err := adapter.Prepare(prepareCtx, cred, userCred, args)
+		if err != nil {
+			return ErrorResult(ScrubCredentialsCtx(ctx, fmt.Sprintf("credentialed exec: %s adapter prepare failed: %v", adapter.Name(), err)))
+		}
+		if inj != nil {
+			if inj.Cleanup != nil {
+				defer func() {
+					if cerr := inj.Cleanup(); cerr != nil {
+						// Scrub cerr — os.Remove errors embed the full tmpfile
+						// path, which is in inj.ScrubValues precisely because
+						// it's adapter-sensitive (e.g. SSH key keypath).
+						slog.Warn("security.adapter_cleanup_failed",
+							"adapter", adapter.Name(),
+							"binary", binary,
+							"error", ScrubCredentialsCtx(ctx, cerr.Error()),
+						)
+					}
+				}()
+			}
+			if len(inj.ArgvPrefix) > 0 {
+				args = append(append([]string{}, inj.ArgvPrefix...), args...)
+			}
+			maps.Copy(envMap, inj.Env)
+			if len(inj.ScrubValues) > 0 {
+				AddScrubValuesCtx(ctx, inj.ScrubValues...)
+			}
+			emitSystemEnvInjectionAudit(adapter.Name(), binary,
+				store.CredentialUserIDFromContext(ctx), cred.CredentialSource, inj, effectiveHostScope(cred))
+		}
+	}
+
 	// Step 7: Execute — sandbox or host
-	if t.sandboxMgr != nil && sandboxKey != "" {
+	if inSandbox {
 		return t.executeCredentialedSandbox(ctx, absPath, args, cwd, sandboxKey, envMap, timeout)
 	}
 	return t.executeCredentialedHost(ctx, absPath, args, cwd, envMap, timeout)
+}
+
+// userCredFromBinary synthesizes adapter credential input from LookupByBinary's
+// effective credential fields. The adapter contract still uses
+// SecureCLIUserCredential, but the material can come from user, context, or
+// agent scoped rows.
+func userCredFromBinary(ctx context.Context, bin *store.SecureCLIBinary) *store.SecureCLIUserCredential {
+	if bin == nil {
+		return nil
+	}
+	if len(bin.CredentialEnv) > 0 || bin.CredentialType != nil || bin.CredentialHostScope != nil {
+		return &store.SecureCLIUserCredential{
+			BinaryID:       bin.ID,
+			UserID:         credentialSubjectForAdapter(ctx, bin),
+			EncryptedEnv:   bin.CredentialEnv,
+			CredentialType: bin.CredentialType,
+			HostScope:      bin.CredentialHostScope,
+		}
+	}
+	if len(bin.UserEnv) == 0 && bin.UserCredentialType == nil && bin.UserHostScope == nil {
+		return nil
+	}
+	return &store.SecureCLIUserCredential{
+		BinaryID:       bin.ID,
+		UserID:         store.CredentialUserIDFromContext(ctx),
+		EncryptedEnv:   bin.UserEnv,
+		CredentialType: bin.UserCredentialType,
+		HostScope:      bin.UserHostScope,
+	}
+}
+
+func credentialSubjectForAdapter(ctx context.Context, bin *store.SecureCLIBinary) string {
+	if bin != nil && bin.CredentialSubjectID != "" {
+		return bin.CredentialSubjectID
+	}
+	return store.CredentialUserIDFromContext(ctx)
+}
+
+func validateAdapterCredentialReady(adapterName, binary string, cred *store.SecureCLIUserCredential) *Result {
+	if adapterName != "git" {
+		return nil
+	}
+	if cred == nil || cred.CredentialType == nil || strings.TrimSpace(*cred.CredentialType) == "" {
+		return credentialedGitCredentialResolutionError(binary, "no typed git credential selected")
+	}
+	switch strings.TrimSpace(*cred.CredentialType) {
+	case "pat", "ssh_key":
+		if cred.HostScope == nil || strings.TrimSpace(*cred.HostScope) == "" {
+			return credentialedGitCredentialResolutionError(binary, "typed git credential is missing host_scope")
+		}
+		return nil
+	case "env":
+		return credentialedGitCredentialResolutionError(binary, "legacy env credential cannot authenticate adapter-managed git remotes")
+	default:
+		return nil
+	}
+}
+
+func effectiveHostScope(bin *store.SecureCLIBinary) *string {
+	if bin == nil {
+		return nil
+	}
+	if bin.CredentialHostScope != nil {
+		return bin.CredentialHostScope
+	}
+	return bin.UserHostScope
 }
 
 func mergeCredentialedEnv(cred *store.SecureCLIBinary) (map[string]string, error) {
@@ -421,18 +581,79 @@ func mergeCredentialedEnv(cred *store.SecureCLIBinary) (map[string]string, error
 		return envMap, nil
 	}
 	if len(cred.EncryptedEnv) > 0 {
-		if err := json.Unmarshal(cred.EncryptedEnv, &envMap); err != nil {
+		baseEnv, err := store.FlattenSecureCLIEnv(cred.EncryptedEnv)
+		if err != nil {
 			return nil, err
 		}
+		maps.Copy(envMap, baseEnv)
+	}
+	if len(cred.CredentialEnv) > 0 && isEnvCredentialType(cred.CredentialType) {
+		scopedEnv, err := store.FlattenSecureCLIEnv(cred.CredentialEnv)
+		if err != nil {
+			return nil, err
+		}
+		maps.Copy(envMap, scopedEnv)
+		return envMap, nil
 	}
 	if len(cred.UserEnv) > 0 {
-		var userEnvMap map[string]string
-		if err := json.Unmarshal(cred.UserEnv, &userEnvMap); err != nil {
+		if !isEnvCredentialType(cred.UserCredentialType) {
+			return envMap, nil
+		}
+		userEnvMap, err := store.FlattenSecureCLIEnv(cred.UserEnv)
+		if err != nil {
 			return nil, err
 		}
 		maps.Copy(envMap, userEnvMap)
 	}
 	return envMap, nil
+}
+
+func isEnvCredentialType(typ *string) bool {
+	return typ == nil || *typ == "" || *typ == "env"
+}
+
+func missingRequiredCredentialEnv(binary string, envMap map[string]string) []string {
+	required := requiredCredentialEnvVars(binary)
+	if len(required) == 0 {
+		return nil
+	}
+	missing := make([]string, 0, len(required))
+	for _, key := range required {
+		if strings.TrimSpace(envMap[key]) == "" {
+			missing = append(missing, key)
+		}
+	}
+	return missing
+}
+
+// validateExecCwd checks that cmd.Dir exists and is a directory before
+// cmd.Start(). Empty cwd is allowed (Go interprets as "inherit parent's dir").
+//
+// Why: on Linux, Go's syscall.forkAndExecInChild reports any child-side error
+// (chdir, execve, missing PT_INTERP, etc.) as `&PathError{Op: "fork/exec",
+// Path: argv0, Err: errno}`. The label `fork/exec PATH:` always names the
+// binary even when chdir was the actual failure. A stale stored workspace
+// (e.g. /app/workspace/clax persisted from a Docker-era deployment but used
+// on a bare-metal host) then surfaces as `fork/exec /usr/bin/gh: no such file
+// or directory` — sending operators down the wrong investigation path.
+//
+// Returns nil when cwd is empty, exists and is a directory; otherwise an
+// error naming the actual problem with the working directory.
+func validateExecCwd(cwd string) error {
+	if cwd == "" {
+		return nil
+	}
+	info, err := os.Stat(cwd)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("working directory does not exist: %q", cwd)
+		}
+		return fmt.Errorf("working directory inaccessible: %q: %w", cwd, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("working directory is not a directory: %q", cwd)
+	}
+	return nil
 }
 
 // executeCredentialedHost runs a credentialed command directly on the host.
@@ -443,6 +664,14 @@ func (t *ExecTool) executeCredentialedHost(ctx context.Context, absPath string, 
 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+
+	// Pre-flight cmd.Dir validation. On Linux, Go's clone+chdir+execve failure
+	// path collapses every child-side error into "fork/exec PATH: <errno-string>"
+	// — so a missing cmd.Dir surfaces as if absPath itself were missing. Catch
+	// this case explicitly so the error names the real culprit.
+	if err := validateExecCwd(cwd); err != nil {
+		return ErrorResult(fmt.Sprintf("credentialed exec: %v (binary %s does exist)", err, absPath))
+	}
 
 	// Plain exec.Command (not CommandContext) so we own the kill sequence.
 	cmd := exec.Command(absPath, args...)
@@ -489,7 +718,16 @@ func (t *ExecTool) executeCredentialedHost(ctx context.Context, absPath string, 
 func (t *ExecTool) executeCredentialedSandbox(ctx context.Context, absPath string, args []string,
 	cwd string, sandboxKey string, envMap map[string]string, timeout time.Duration) *Result {
 
-	sb, err := t.sandboxMgr.Get(ctx, sandboxKey, t.workspace, SandboxConfigFromCtx(ctx))
+	mountWorkspace, err := effectiveSandboxWorkspace(ctx, t.workspace)
+	if err != nil {
+		return ErrorResult(err.Error())
+	}
+	containerCwd, cwdErr := sandboxCwdForHostPath(cwd, mountWorkspace, sandbox.DefaultContainerWorkdir)
+	if cwdErr != nil {
+		return ErrorResult(fmt.Sprintf("credentialed sandbox path mapping: %v", cwdErr))
+	}
+
+	sb, err := t.sandboxMgr.Get(ctx, sandboxKey, mountWorkspace, SandboxConfigFromCtx(ctx))
 	if err != nil {
 		slog.Warn("security.credentialed_exec_sandbox_unavailable",
 			"binary", absPath, "error", err)
@@ -498,7 +736,7 @@ func (t *ExecTool) executeCredentialedSandbox(ctx context.Context, absPath strin
 
 	// Direct exec inside sandbox: [absPath, args...] with env injection
 	command := append([]string{absPath}, args...)
-	result, err := sb.Exec(ctx, command, cwd, sandbox.WithEnv(envMap))
+	result, err := sb.Exec(ctx, command, containerCwd, sandbox.WithEnv(envMap))
 	if err != nil {
 		return ErrorResult(fmt.Sprintf("credentialed sandbox exec: %v", err))
 	}
@@ -511,13 +749,13 @@ func (t *ExecTool) executeCredentialedSandbox(ctx context.Context, absPath strin
 		output += "STDERR:\n" + result.Stderr
 	}
 	if result.ExitCode != 0 {
-		scrubbed := ScrubCredentials(output)
+		scrubbed := ScrubCredentialsCtx(ctx, output)
 		return credentialedExecFailError(absPath, args, result.ExitCode, scrubbed+MaybeSandboxHint(result.ExitCode, scrubbed))
 	}
 	if output == "" {
 		output = "(command completed with no output)"
 	}
-	output = ScrubCredentials(output)
+	output = ScrubCredentialsCtx(ctx, output)
 	output = capExecOutput(output, execMaxOutputChars)
 	return SilentResult(output)
 }
@@ -589,13 +827,13 @@ func formatCredentialedResult(binary string, args []string,
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			exitCode = exitErr.ExitCode()
 		}
-		return credentialedExecFailError(binary, args, exitCode, ScrubCredentials(output))
+		return credentialedExecFailError(binary, args, exitCode, ScrubCredentialsCtx(ctx, output))
 	}
 
 	if output == "" {
 		output = "(command completed with no output)"
 	}
-	output = ScrubCredentials(output)
+	output = ScrubCredentialsCtx(ctx, output)
 	output = capExecOutput(output, execMaxOutputChars)
 	return SilentResult(output)
 }
@@ -613,7 +851,7 @@ func (t *ExecTool) lookupCredentialedBinary(ctx context.Context, command string)
 	}
 	// Normalize lookup key so path/case variants (/usr/bin/gh, ./gh, GH) all
 	// resolve to the same registry row. Same helper is used by the gate
-	// branch in Execute — identity must agree at both layers. (Red Team F5)
+	// branch in Execute because identity must agree at both layers.
 	normBinary := normalizeBinaryName(binary)
 	// Get agent ID from context for scoped lookup
 	agentID := store.AgentIDFromContext(ctx)
@@ -678,6 +916,28 @@ func credentialedDenyError(binary string, args []string, pattern string) *Result
 			"This operation requires admin approval and cannot be performed automatically.",
 			binary, strings.Join(args, " "), pattern),
 		ForUser: fmt.Sprintf("Operation '%s %s' is blocked by security policy.", binary, strings.Join(args, " ")),
+		IsError: true,
+	}
+}
+
+func credentialedMissingEnvError(binary string, keys []string) *Result {
+	return &Result{
+		ForLLM: fmt.Sprintf("[CREDENTIALED EXEC] Credential config missing required credential env.\n"+
+			"Binary: %s\nMissing env keys: %s\n"+
+			"Configure the missing key as a SecureCLI user credential for the same user context, then grant this binary to the target agent.",
+			binary, strings.Join(keys, ", ")),
+		ForUser: fmt.Sprintf("CLI credential for %q is missing required env: %s.", binary, strings.Join(keys, ", ")),
+		IsError: true,
+	}
+}
+
+func credentialedGitCredentialResolutionError(binary, reason string) *Result {
+	return &Result{
+		ForLLM: fmt.Sprintf("[CREDENTIALED EXEC] Git credential resolution failed.\n"+
+			"Binary: %s\nReason: %s\n"+
+			"Configure a SecureCLI git credential with Credential Type = Personal Access Token or SSH Private Key and Host Scope matching the remote host, then grant this binary to the target agent.",
+			binary, reason),
+		ForUser: "Git credential resolution failed. Configure a host-scoped PAT or SSH key for this agent.",
 		IsError: true,
 	}
 }

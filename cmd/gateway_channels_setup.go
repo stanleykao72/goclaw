@@ -667,16 +667,22 @@ func registerConfigChannels(cfg *config.Config, channelMgr *channels.Manager, ms
 }
 
 // wireChannelRPCMethods registers WS RPC methods for channels, instances, agent links, and teams.
-func wireChannelRPCMethods(server *gateway.Server, pgStores *store.Stores, channelMgr *channels.Manager, agentRouter *agent.Router, msgBus *bus.MessageBus, dataDir string) {
+// Returns the channel-instances methods handler so the caller can register
+// per-channel-type orphan cleaners (e.g. Bitrix24 imbot.unregister) after
+// per-channel dependencies (portal store, encryption key) are in scope.
+func wireChannelRPCMethods(server *gateway.Server, pgStores *store.Stores, channelMgr *channels.Manager, instanceLoader *channels.InstanceLoader, agentRouter *agent.Router, msgBus *bus.MessageBus, cfg *config.Config, dataDir string) *methods.ChannelInstancesMethods {
 	// Register channels RPC methods (after channelMgr is initialized with all channels)
 	methods.NewChannelsMethods(channelMgr).Register(server.Router())
+	methods.NewChatBehaviorMethods(cfg, channelMgr).Register(server.Router())
 
 	// Register channel instances WS RPC methods
+	var chInstancesM *methods.ChannelInstancesMethods
 	if pgStores.ChannelInstances != nil {
-		methods.NewChannelInstancesMethods(pgStores.ChannelInstances, pgStores.Agents, msgBus, msgBus).Register(server.Router())
+		chInstancesM = methods.NewChannelInstancesMethods(pgStores.ChannelInstances, pgStores.Agents, msgBus, msgBus, channelMgr)
+		chInstancesM.Register(server.Router())
 		zalomethods.NewQRMethods(pgStores.ChannelInstances, msgBus).Register(server.Router())
 		zalomethods.NewContactsMethods(pgStores.ChannelInstances).Register(server.Router())
-		whatsapp.NewQRMethods(pgStores.ChannelInstances, channelMgr).Register(server.Router())
+		whatsapp.NewQRMethods(pgStores.ChannelInstances, channelMgr, instanceLoader).Register(server.Router())
 	}
 
 	// Register agent links WS RPC methods
@@ -688,6 +694,8 @@ func wireChannelRPCMethods(server *gateway.Server, pgStores *store.Stores, chann
 	if pgStores.Teams != nil {
 		methods.NewTeamsMethods(pgStores.Teams, pgStores.Agents, pgStores.AgentLinks, agentRouter, msgBus, msgBus, dataDir).Register(server.Router())
 	}
+
+	return chInstancesM
 }
 
 // wireChannelEventSubscribers sets up event subscribers for channel instance cache invalidation,
@@ -709,6 +717,19 @@ func wireChannelEventSubscribers(
 			}
 			payload, ok := event.Payload.(bus.CacheInvalidatePayload)
 			if !ok || payload.Kind != bus.CacheKindChannelInstances {
+				return
+			}
+			if payload.Key != "" {
+				id, err := uuid.Parse(payload.Key)
+				if err != nil {
+					slog.Warn("channel instance targeted reload skipped: invalid id", "id", payload.Key, "error", err)
+					return
+				}
+				go func() {
+					if err := instanceLoader.LoadInstanceByID(store.WithCrossTenant(context.Background()), id); err != nil {
+						slog.Warn("channel instance targeted reload failed", "id", payload.Key, "error", err)
+					}
+				}()
 				return
 			}
 			go instanceLoader.Reload(context.Background())

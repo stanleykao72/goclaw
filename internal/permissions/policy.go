@@ -211,6 +211,7 @@ func isAdminMethod(method string) bool {
 		protocol.MethodConfigPatch,
 		protocol.MethodConfigSchema,
 		protocol.MethodConfigDefaults,
+		protocol.MethodChatBehaviorPreview,
 		protocol.MethodConfigPermissionsList,
 		protocol.MethodConfigPermissionsCheck,
 		protocol.MethodConfigPermissionsGrant,
@@ -229,6 +230,10 @@ func isAdminMethod(method string) bool {
 		protocol.MethodChannelInstancesCreate,
 		protocol.MethodChannelInstancesUpdate,
 		protocol.MethodChannelInstancesDelete,
+
+		// Bitrix24 portal management — admin-only writes (credentials + delete).
+		protocol.MethodBitrixPortalsCreate,
+		protocol.MethodBitrixPortalsDelete,
 
 		// Pairing management (approve/revoke/list/deny require admin).
 		protocol.MethodPairingApprove,
@@ -362,6 +367,7 @@ func isReadMethod(method string) bool {
 		// Sessions read
 		protocol.MethodSessionsList,
 		protocol.MethodSessionsPreview,
+		protocol.MethodRunTimelineGet,
 
 		// Skills read
 		protocol.MethodSkillsList,
@@ -377,6 +383,12 @@ func isReadMethod(method string) bool {
 		protocol.MethodChannelsStatus,
 		protocol.MethodChannelInstancesList,
 		protocol.MethodChannelInstancesGet,
+
+		// Bitrix24 portal read — any tenant member can list portals to populate
+		// the channel-form dropdown; get_install_url is needed to resume a
+		// half-finished authorize flow.
+		protocol.MethodBitrixPortalsList,
+		protocol.MethodBitrixPortalsGetInstallURL,
 
 		// Usage / quota
 		protocol.MethodUsageGet,

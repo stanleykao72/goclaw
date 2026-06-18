@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -200,10 +201,13 @@ func processNormalMessage(
 		"user_id", userID,
 	)
 
-	// Enable streaming when the channel supports it (so agent emits chunk events).
-	// The channel decides per chat type via separate dm_stream / group_stream flags.
 	isGroup := peerKind == string(sessions.PeerGroup)
-	enableStream := deps.ChannelMgr != nil && deps.ChannelMgr.IsStreamingChannel(msg.Channel, isGroup)
+	channelStream := deps.ChannelMgr != nil && deps.ChannelMgr.IsStreamingChannel(msg.Channel, isGroup)
+	reasoningDelivery := channels.ResolveReasoningDelivery("", nil)
+	if deps.ChannelMgr != nil {
+		reasoningDelivery = deps.ChannelMgr.ResolveReasoningDelivery(msg.Channel)
+	}
+	providerStream := channels.ShouldStreamProviderForDelivery(channelStream, reasoningDelivery)
 
 	// Group chats allow concurrent runs (multiple users can chat simultaneously).
 	maxConcurrent := 1
@@ -220,6 +224,14 @@ func processNormalMessage(
 		if mid := msg.Metadata["message_id"]; mid != "" {
 			outMeta["reply_to_message_id"] = mid
 		}
+		// Address the asker so multi-user group chats render a clear "this
+		// reply is for X" signal. Today this is Bitrix24-specific (channel
+		// renders [USER=<id>][/USER] BBCode); other channels ignore the key.
+		// Skip synthetic senders (ticker, notification, system) — those have
+		// no real user to @mention.
+		if msg.SenderID != "" && !bus.IsInternalSender(msg.SenderID) {
+			outMeta["bitrix_address_user_id"] = msg.SenderID
+		}
 	}
 
 	// Register run with channel manager for streaming/reaction event forwarding.
@@ -230,10 +242,17 @@ func processNormalMessage(
 	if lk := msg.Metadata["local_key"]; lk != "" {
 		chatIDForRun = lk
 	}
-	blockReply := deps.ChannelMgr != nil && deps.ChannelMgr.ResolveBlockReply(msg.Channel, deps.Cfg.Gateway.BlockReply)
+	chatBehavior := channels.ResolvedChatBehavior{}
+	if deps.ChannelMgr != nil {
+		workspaceBehavior := channels.ChatBehaviorConfigWithIntermediateDefault(deps.Cfg.Gateway.ChatBehavior, deps.Cfg.Gateway.BlockReply)
+		agentBehavior := channels.ParseAgentDeliveryBehaviorConfig(agentLoop.OtherConfig())
+		chatBehavior = deps.ChannelMgr.ResolveChatBehaviorWithAgent(msg.Channel, workspaceBehavior, agentBehavior)
+	}
+	blockReply := deps.ChannelMgr != nil && chatBehavior.IntermediateReplies.Enabled
+	deliveryRuntime := buildDeliveryRuntime(ctx, deps, agentLoop, chatBehavior, msg, userID, peerKind, resolveChannelType(deps.ChannelMgr, msg.Channel), agentID)
 	toolStatus := deps.Cfg.Gateway.ToolStatus == nil || *deps.Cfg.Gateway.ToolStatus // default true
 	if deps.ChannelMgr != nil {
-		deps.ChannelMgr.RegisterRun(runID, msg.Channel, chatIDForRun, messageID, outMeta, msg.TenantID, enableStream, blockReply, toolStatus)
+		deps.ChannelMgr.RegisterRunWithDelivery(runID, msg.Channel, chatIDForRun, messageID, outMeta, msg.TenantID, channelStream, blockReply, toolStatus, chatBehavior, deliveryRuntime, reasoningDelivery)
 	}
 
 	// Group-aware system prompt: help the LLM adapt tone and behavior for group chats.
@@ -265,6 +284,42 @@ func processNormalMessage(
 		extraPrompt += identity
 	}
 
+	// Append Bitrix24 entity binding hint so MCP-equipped agents can resolve
+	// "this deal/task/lead" deterministically. The channel layer (bitrix24/handle.go)
+	// forwards data[PARAMS][CHAT_ENTITY_TYPE] + CHAT_ENTITY_ID into Metadata
+	// whenever the chat is bound to a Bitrix24 module entity. Plain user-created
+	// chats omit both keys → no hint added (avoids polluting unrelated chats).
+	//
+	// We deliberately keep this simple "system prompt injection" approach for now.
+	// The LLM still has to call MCP tools to fetch fresh data — we only tell it
+	// WHICH entity is in scope, not WHAT the data is. See
+	// plans/bitrix24-mcp-refactor/reports/event-payloads.md for the metadata
+	// contract and the phase plan for the optional pre-fetch upgrade.
+	if et, eid := msg.Metadata["bitrix_chat_entity_type"], msg.Metadata["bitrix_chat_entity_id"]; et != "" && eid != "" {
+		// Defense-in-depth against prompt injection from webhook-sourced metadata.
+		// Bitrix server-side normally constrains these to short alphanumeric ids
+		// (e.g. "DEAL|2064", "TASKS"), but treating them as untrusted prevents a
+		// malicious or compromised portal from steering the system prompt via
+		// crafted CHAT_ENTITY_ID values.
+		if isSafeBitrixEntityToken(et, 64) && isSafeBitrixEntityToken(eid, 128) {
+			if extraPrompt != "" {
+				extraPrompt += "\n\n"
+			}
+			extraPrompt += fmt.Sprintf(
+				"## Channel context — Bitrix24 entity binding\n"+
+					"This chat is bound to a Bitrix24 entity (type=%s, id=%s).\n"+
+					"When the user refers to \"this deal\", \"this task\", \"this lead\", or similar deictic phrases, treat them as referring to id %s.\n"+
+					"CRM ids use pipe format (e.g. \"DEAL|2064\" — split on '|' and use the numeric part with the matching MCP tool such as crm.deal.get / crm.lead.get / crm.contact.get / crm.company.get).\n"+
+					"Tasks ids are plain numbers — pass directly to tasks.task.get.\n"+
+					"Do not ask the user which deal/task this is; you already know.",
+				et, eid, eid,
+			)
+		} else {
+			slog.Warn("security.bitrix24.entity_metadata_rejected",
+				"channel", msg.Channel, "et_len", len(et), "eid_len", len(eid))
+		}
+	}
+
 	// Per-topic skill filter override (from group/topic config hierarchy).
 	var skillFilter []string
 	if ts := msg.Metadata[tools.MetaTopicSkills]; ts != "" {
@@ -289,7 +344,11 @@ func processNormalMessage(
 			if locale == "" {
 				locale = "en"
 			}
-			intent := agent.ClassifyIntent(ctx, loop.Provider(), loop.Model(), msg.Content)
+			classifyCtx := ctx
+			if uid := loop.UUID(); uid != uuid.Nil {
+				classifyCtx = store.WithAgentID(classifyCtx, uid)
+			}
+			intent := agent.ClassifyIntentWithUsageCaps(classifyCtx, deps.UsageCaps, loop.Provider(), loop.Model(), msg.Content)
 			switch intent {
 			case agent.IntentStatusQuery:
 				status := deps.Agents.GetActivity(sessionKey)
@@ -381,33 +440,37 @@ func processNormalMessage(
 
 	// Schedule through main lane (per-session concurrency controlled by maxConcurrent)
 	outCh := deps.Sched.ScheduleWithOpts(schedCtx, "main", agent.RunRequest{
-		SessionKey:        sessionKey,
-		Message:           msg.Content,
-		Media:             reqMedia,
-		ForwardMedia:      fwdMedia,
-		Channel:           msg.Channel,
-		ChannelType:       resolveChannelType(deps.ChannelMgr, msg.Channel),
-		ChatTitle:         msg.Metadata[tools.MetaChatTitle],
-		ChatID:            msg.ChatID,
-		WorkspaceChatID:   msg.ChatID,
-		PeerKind:          peerKind,
-		LocalKey:          msg.Metadata["local_key"],
-		UserID:            userID,
-		SenderID:          effectiveSenderID,
-		Role:              effectiveRole,
-		SenderName:        resolveSenderName(msg),
-		RunID:             runID,
-		Stream:            enableStream,
-		HistoryLimit:      msg.HistoryLimit,
-		ToolAllow:         msg.ToolAllow,
-		ExtraSystemPrompt: extraPrompt,
-		SkillFilter:       skillFilter,
+		SessionKey:   sessionKey,
+		Message:      msg.Content,
+		Media:        reqMedia,
+		ForwardMedia: fwdMedia,
+		Channel:      msg.Channel,
+		ChannelType:  resolveChannelType(deps.ChannelMgr, msg.Channel),
+		// Forward Bitrix24 portal domain from channel metadata so the
+		// system prompt can teach the LLM the correct entity URL host.
+		// Empty for non-bitrix24 channels — section is skipped downstream.
+		BitrixPortalDomain: msg.Metadata["bitrix_portal"],
+		ChatTitle:          msg.Metadata[tools.MetaChatTitle],
+		ChatID:             msg.ChatID,
+		WorkspaceChatID:    msg.ChatID,
+		PeerKind:           peerKind,
+		LocalKey:           msg.Metadata["local_key"],
+		UserID:             userID,
+		SenderID:           effectiveSenderID,
+		Role:               effectiveRole,
+		SenderName:         resolveSenderName(msg),
+		RunID:              runID,
+		Stream:             providerStream,
+		HistoryLimit:       msg.HistoryLimit,
+		ToolAllow:          msg.ToolAllow,
+		ExtraSystemPrompt:  extraPrompt,
+		SkillFilter:        skillFilter,
 	}, scheduler.ScheduleOpts{
 		MaxConcurrent: maxConcurrent,
 	})
 
 	// Handle result asynchronously to not block the flush callback.
-	go func(agentKey, channel, chatID, session, rID, peerKind, inboundContent string, meta map[string]string, blockReplyEnabled bool, ptd *tools.PendingTeamDispatch, tenantID, agentUUID uuid.UUID, agentOtherConfig []byte) {
+	go func(agentKey, channel, chatID, session, rID, peerKind, inboundContent string, meta map[string]string, blockReplyEnabled bool, chatBehavior channels.ResolvedChatBehavior, streaming bool, ptd *tools.PendingTeamDispatch, tenantID, agentUUID uuid.UUID, agentOtherConfig []byte) {
 		outcome := <-outCh
 
 		// Release team create lock — tasks already visible in DB, other goroutines can list.
@@ -423,7 +486,10 @@ func processNormalMessage(
 		}
 
 		// Clean up run tracking (in case HandleAgentEvent didn't fire for terminal events)
+		interimDelivered := 0
+		lastInterimReply := ""
 		if deps.ChannelMgr != nil {
+			interimDelivered, lastInterimReply = deps.ChannelMgr.InterimDeliverySnapshot(rID)
 			deps.ChannelMgr.UnregisterRun(rID)
 		}
 
@@ -482,10 +548,11 @@ func processNormalMessage(
 			return
 		}
 
-		// Dedup: if block replies were delivered and the final content matches the last
+		// Dedup: if interim replies were delivered and the final content matches the last
 		// block reply, suppress the final message to avoid duplicate delivery.
-		// Only applies when blockReply is enabled (otherwise nothing was delivered).
-		if blockReplyEnabled && outcome.Result.BlockReplies > 0 && outcome.Result.Content == outcome.Result.LastBlockReply && len(outcome.Result.Media) == 0 {
+		// This uses channel delivery state, not emitted pipeline events, because streaming
+		// runs and quick-ack-disabled initial block replies can intentionally suppress them.
+		if interimDelivered > 0 && outcome.Result.Content == lastInterimReply && len(outcome.Result.Media) == 0 {
 			slog.Debug("inbound: dedup final message (matches last block reply)",
 				"channel", channel, "run_id", rID)
 			deps.MsgBus.PublishOutbound(bus.OutboundMessage{
@@ -521,11 +588,113 @@ func processNormalMessage(
 
 		appendMediaToOutbound(&outMsg, outcome.Result.Media)
 
-		deps.MsgBus.PublishOutbound(outMsg)
+		parts := []string{replyContent}
+		if !streaming && len(outMsg.Media) == 0 {
+			parts = channels.SplitFinalMessages(replyContent, chatBehavior.FinalSplit)
+		}
+		for i, part := range parts {
+			msgPart := outMsg
+			msgPart.Content = part
+			if i > 0 {
+				msgPart.Metadata = channels.CopyFollowupRoutingMeta(meta)
+				if chatBehavior.FinalSplit.DelayMs > 0 {
+					time.Sleep(time.Duration(chatBehavior.FinalSplit.DelayMs) * time.Millisecond)
+				}
+			}
+			deps.MsgBus.PublishOutbound(msgPart)
+		}
 
 		// Auto-set followup when lead agent replies on a real channel with in_progress tasks.
 		if deps.TeamStore != nil && channel != tools.ChannelSystem && channel != tools.ChannelTeammate && channel != tools.ChannelDashboard {
 			go autoSetFollowup(ctx, deps.TeamStore, deps.AgentStore, agentKey, channel, chatID, replyContent)
 		}
-	}(agentID, msg.Channel, msg.ChatID, sessionKey, runID, peerKind, msg.Content, outMeta, blockReply, ptd, msg.TenantID, agentLoop.UUID(), agentLoop.OtherConfig())
+	}(agentID, msg.Channel, msg.ChatID, sessionKey, runID, peerKind, msg.Content, outMeta, blockReply, chatBehavior, channelStream, ptd, msg.TenantID, agentLoop.UUID(), agentLoop.OtherConfig())
+}
+
+func buildDeliveryRuntime(ctx context.Context, deps *ConsumerDeps, agentLoop agent.Agent, behavior channels.ResolvedChatBehavior, msg bus.InboundMessage, userID, peerKind, channelType, agentKey string) channels.DeliveryRuntime {
+	locale := msg.Metadata["locale"]
+	if locale == "" {
+		locale = "auto"
+	}
+	runtime := channels.DeliveryRuntime{
+		Locale:       locale,
+		Inbound:      msg.Content,
+		PeerKind:     peerKind,
+		Channel:      channelType,
+		AgentName:    agentKey,
+		PersonaBrief: deliveryPersonaBrief(ctx, agentLoop, userID),
+	}
+	if behavior.Enabled && behavior.QuickAck.Enabled {
+		switch behavior.QuickAck.Mode {
+		case channels.QuickAckModeLLMGenerated, channels.QuickAckModeSidecar, "":
+			runtime.QuickAckGenerator = buildDeliveryGenerator(ctx, deps, agentLoop, msg.TenantID, behavior.QuickAck.Provider, behavior.QuickAck.Model)
+		}
+	}
+	if behavior.Enabled && behavior.IntermediateReplies.Enabled {
+		switch behavior.IntermediateReplies.Mode {
+		case channels.IntermediateModeSidecar, channels.QuickAckModeLLMGenerated, "":
+			runtime.ProgressGenerator = buildDeliveryGenerator(ctx, deps, agentLoop, msg.TenantID, behavior.IntermediateReplies.Provider, behavior.IntermediateReplies.Model)
+		}
+	}
+	return runtime
+}
+
+type deliveryPersonaProvider interface {
+	DeliveryPersonaBrief(context.Context, string) string
+}
+
+func deliveryPersonaBrief(ctx context.Context, agentLoop agent.Agent, userID string) string {
+	if agentLoop == nil {
+		return ""
+	}
+	if provider, ok := agentLoop.(deliveryPersonaProvider); ok {
+		return provider.DeliveryPersonaBrief(ctx, userID)
+	}
+	return ""
+}
+
+func buildDeliveryGenerator(ctx context.Context, deps *ConsumerDeps, agentLoop agent.Agent, tenantID uuid.UUID, providerName, model string) channels.DeliveryMessageGenerator {
+	provider := agentLoop.Provider()
+	resolvedProviderName := agentLoop.ProviderName()
+	if providerName != "" && deps.ProviderReg != nil {
+		if p, err := deps.ProviderReg.Get(ctx, providerName); err == nil {
+			provider = p
+			resolvedProviderName = providerName
+		} else {
+			slog.Warn("channel delivery: configured provider unavailable, falling back to agent provider", "provider", providerName, "error", err)
+		}
+	}
+	if provider == nil {
+		return nil
+	}
+	if model == "" {
+		model = agentLoop.Model()
+	}
+	return channels.ProviderDeliveryMessageGenerator{
+		Provider:     provider,
+		ProviderName: resolvedProviderName,
+		Model:        model,
+		UsageCaps:    deps.UsageCaps,
+		TenantID:     tenantID,
+		AgentID:      agentLoop.UUID(),
+	}
+}
+
+// isSafeBitrixEntityToken validates a webhook-sourced Bitrix entity token before
+// it is interpolated into the agent system prompt. Rejects empty, oversized, or
+// control-character payloads to prevent prompt-injection from a crafted portal
+// event. Allowed character set is intentionally permissive (Bitrix entity ids
+// include letters, digits, '|', '_', '-') — the goal is to block newlines and
+// formatting characters that could break out of the prompt template, not to
+// enforce a strict id grammar.
+func isSafeBitrixEntityToken(s string, maxLen int) bool {
+	if s == "" || len(s) > maxLen {
+		return false
+	}
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
 }

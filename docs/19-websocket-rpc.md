@@ -106,6 +106,8 @@ Send a message to an agent and trigger execution.
 
 When `stream: true`, intermediate events are emitted: `chunk`, `tool.call`, `tool.result`, `run.started`, `run.completed`.
 
+Rapid text-only `chat.send` requests for the same user and session are debounced by `gateway.inbound_debounce_ms`: `0` means no debounce and positive values set the wait window. Agents can override the global value with `other_config.inbound_debounce_ms`; unset inherits the global config. The merged message keeps request params from the latest send and joins text with newlines. Cancel keywords bypass debounce and abort the active run immediately. Media sends bypass the wait window and drain any pending text into the same dispatch.
+
 ### `chat.history`
 
 Retrieve chat history for a session.
@@ -230,9 +232,55 @@ Delete an agent (admin only).
 | `sessions.patch` | Update label, model, metadata |
 | `sessions.delete` | Delete session |
 | `sessions.reset` | Clear session messages |
+| `run.timeline.get` | Get archived run/session timeline items |
 
 **`sessions.list` request:** `{agentId, limit, offset}`
 **Response:** `{sessions[], total, limit, offset}`
+
+### `run.timeline.get`
+
+Fetch display-safe timeline entries captured during agent runs. Pass `runId` for
+one run, or `sessionKey` for the session archive panel. At least one is
+required. `limit` defaults to `200` and is capped at `500`; `offset` paginates.
+Viewer role can read this method. Non-admin callers only receive entries whose
+`user_id` matches their connected user.
+
+**Request:**
+
+```json
+{
+  "runId": "run-123",
+  "sessionKey": "agent:demo:direct:user-1",
+  "limit": 100,
+  "offset": 0
+}
+```
+
+**Response:**
+
+```json
+{
+  "runId": "run-123",
+  "sessionKey": "agent:demo:direct:user-1",
+  "items": [{
+    "id": "019e...",
+    "run_id": "run-123",
+    "session_key": "agent:demo:direct:user-1",
+    "seq": 1,
+    "item_type": "assistant.message",
+    "status": "completed",
+    "title": "assistant",
+    "preview": "I will check that now.",
+    "created_at": "2026-05-29T10:00:00Z"
+  }],
+  "limit": 100,
+  "offset": 0
+}
+```
+
+Timeline items include `activity`, `assistant.message`, `tool.call`,
+`tool.result`, and `run.status`. Tool entries store bounded previews only;
+raw reasoning/thinking is not persisted.
 
 ---
 

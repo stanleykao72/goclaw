@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
+	usagecaps "github.com/nextlevelbuilder/goclaw/internal/usage/caps"
 )
 
 // textReadableMIMEs are MIME types whose content can be returned directly without LLM analysis.
@@ -68,10 +69,22 @@ var documentModelDefaults = map[string]string{
 type ReadDocumentTool struct {
 	registry    *providers.Registry
 	mediaLoader MediaPathLoader
+	usageCaps   *usagecaps.Service
+	localParser DocumentParser
 }
 
 func NewReadDocumentTool(registry *providers.Registry, mediaLoader MediaPathLoader) *ReadDocumentTool {
 	return &ReadDocumentTool{registry: registry, mediaLoader: mediaLoader}
+}
+
+func (t *ReadDocumentTool) SetUsageCapService(svc *usagecaps.Service) {
+	t.usageCaps = svc
+}
+
+// SetLocalParser injects the local-first document extractor. When nil (default)
+// or disabled, read_document behaves exactly as before — straight to the chain.
+func (t *ReadDocumentTool) SetLocalParser(p DocumentParser) {
+	t.localParser = p
 }
 
 func (t *ReadDocumentTool) Name() string { return "read_document" }
@@ -94,6 +107,10 @@ func (t *ReadDocumentTool) Parameters() map[string]any {
 				"type":        "string",
 				"description": "Optional: specific media_id from <media:document> tag. If omitted, uses most recent document.",
 			},
+			"path": map[string]any{
+				"type":        "string",
+				"description": "Optional file path from a <media:document path=\"...\"> tag. Use this when the tag provides a path or the file is an archive that should be inspected with exec.",
+			},
 		},
 		"required": []string{"prompt"},
 	}
@@ -105,14 +122,22 @@ func (t *ReadDocumentTool) Execute(ctx context.Context, args map[string]any) *Re
 		prompt = "Analyze this document and describe its contents."
 	}
 	mediaID, _ := args["media_id"].(string)
+	docPathArg, _ := args["path"].(string)
 
 	// Resolve document file path from MediaRefs in context.
-	docPath, docMime, err := t.resolveDocumentFile(ctx, mediaID)
+	docPath, docMime, err := t.resolveDocumentFile(ctx, mediaID, docPathArg)
 	if err != nil {
 		return ErrorResult(err.Error())
 	}
 
 	slog.Info("read_document: resolved file", "path", docPath, "mime", docMime, "media_id", mediaID)
+
+	if isArchiveDocumentPath(docPath) {
+		return NewResult(fmt.Sprintf(
+			"Archive file available at %s. read_document does not analyze archive containers directly. Use exec to inspect or extract it, for example: unzip -l %q or unzip -q %q -d <output-dir>, then use list_files/read_file on extracted files.",
+			docPath, docPath, docPath,
+		))
+	}
 
 	// Read document file.
 	data, err := os.ReadFile(docPath)
@@ -128,10 +153,29 @@ func (t *ReadDocumentTool) Execute(ctx context.Context, args map[string]any) *Re
 	if textReadableMIMEs[docMime] || strings.HasPrefix(docMime, "text/") {
 		content := string(data)
 		if len(data) > documentMaxTextBytes {
-			content = content[:documentMaxTextBytes] + "\n\n[... truncated at 500KB ...]"
+			content = content[:documentMaxTextBytes] + docTruncationMarker
 		}
 		slog.Info("read_document: returning text content directly", "mime", docMime, "size", len(data))
 		return NewResult(content)
+	}
+
+	// Local-first extraction (opt-in): for PDF/DOCX with an available local
+	// binary, extract text without any cloud LLM call. Any miss — disabled,
+	// unsupported mime, missing binary, empty/poor output, or exec error —
+	// falls through unchanged to the vision chain below. The file was already
+	// read + 20MB-checked above; the extractor opens that same path itself.
+	if t.localParser != nil && t.localParser.Supports(docMime) {
+		// Defense-in-depth: confirm the path is workspace-confined before
+		// handing it to a subprocess. A rejection routes to vision rather than
+		// erroring, preserving today's behavior for MediaRef-derived paths.
+		if safePath, verr := t.validateExecPath(ctx, docPath); verr != nil {
+			slog.Warn("security.read_document_local_path_rejected", "path", docPath, "reason", verr.Error())
+		} else if text, err := t.localParser.Extract(ctx, safePath, docMime); err == nil {
+			slog.Info("read_document: local extraction hit", "mime", docMime, "bytes", len(text))
+			return NewResult(text) // no Provider/Model/Usage => no LLM spend
+		} else {
+			slog.Info("read_document: local extraction miss, falling back", "mime", docMime, "reason", err.Error())
+		}
 	}
 
 	chain := ResolveMediaProviderChain(ctx, "read_document", "", "",
@@ -157,4 +201,21 @@ func (t *ReadDocumentTool) Execute(ctx context.Context, args map[string]any) *Re
 	result.Provider = chainResult.Provider
 	result.Model = chainResult.Model
 	return result
+}
+
+// validateExecPath confirms a resolved document path is workspace-confined
+// before it is passed to a local extractor subprocess. It reuses the same
+// allow/deny resolution as the explicit-path argument branch so MediaRef-derived
+// paths get the same boundary check at the exec boundary. Callers fall back to
+// the vision chain on error rather than surfacing it to the user.
+func (t *ReadDocumentTool) validateExecPath(ctx context.Context, path string) (string, error) {
+	workspace := ToolWorkspaceFromCtx(ctx)
+	resolved, err := resolvePathWithAllowed(path, workspace, effectiveRestrict(ctx, true), allowedWithTeamWorkspace(ctx, nil))
+	if err != nil {
+		return "", err
+	}
+	if err := checkDeniedPath(resolved, workspace, nil); err != nil {
+		return "", err
+	}
+	return resolved, nil
 }

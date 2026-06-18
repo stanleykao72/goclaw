@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { useTranslation } from "react-i18next";
-import { Settings2, Loader2, Save, AlertTriangle, Info, ExternalLink, Network, Cog } from "lucide-react";
+import { Settings2, Loader2, Save, AlertTriangle, Info, ExternalLink, Network, Cog, Brain } from "lucide-react";
 import { Link } from "react-router";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
@@ -17,7 +17,7 @@ import { toast } from "@/stores/use-toast-store";
 import { EMBEDDING_MODELS, DEFAULT_EMBEDDING_MODELS, DEFAULTS, parseBool, type InitState } from "./system-settings-constants";
 import { SystemSettingsEmbeddingCard } from "./system-settings-embedding-card";
 import { SystemSettingsCompactionCard } from "./system-settings-compaction-card";
-import { Eye, MessageSquareText, Brain } from "lucide-react";
+import { SystemSettingsSkillsCard } from "./system-settings-skills-card";
 
 interface SystemSettingsModalProps {
   open: boolean;
@@ -41,8 +41,6 @@ export function SystemSettingsModal({ open, onOpenChange }: SystemSettingsModalP
   const { verifyEmbedding, embVerifying, embResult, resetEmb } = useProviderVerify();
 
   // UX Behavior
-  const [toolStatus, setToolStatus] = useState(true);
-  const [blockReply, setBlockReply] = useState(false);
   const [intentClassify, setIntentClassify] = useState(true);
 
   // Compaction
@@ -60,6 +58,11 @@ export function SystemSettingsModal({ open, onOpenChange }: SystemSettingsModalP
   // Background Workers
   const [bgProvider, setBgProvider] = useState("");
   const [bgModel, setBgModel] = useState("");
+  const [skillUploadMaxSize, setSkillUploadMaxSize] = useState("20");
+  const [skillSlashEnabled, setSkillSlashEnabled] = useState(true);
+  const [skillSlashSuggest, setSkillSlashSuggest] = useState(true);
+  const [skillSlashPartial, setSkillSlashPartial] = useState(false);
+  const [skillSlashPrefix, setSkillSlashPrefix] = useState("/");
 
   const applyConfigs = useCallback((
     configs: Record<string, string>,
@@ -68,7 +71,6 @@ export function SystemSettingsModal({ open, onOpenChange }: SystemSettingsModalP
     const s: InitState = {
       embProvider: configs["embedding.provider"] ?? "", embModel: configs["embedding.model"] ?? "",
       embMaxChunkLen: configs["embedding.max_chunk_len"] ?? "", embChunkOverlap: configs["embedding.chunk_overlap"] ?? "",
-      toolStatus: parseBool(configs["gateway.tool_status"], true), blockReply: parseBool(configs["gateway.block_reply"], false),
       intentClassify: parseBool(configs["gateway.intent_classify"], true),
       compProvider: configs["compaction.provider"] ?? "", compModel: configs["compaction.model"] ?? "",
       compThreshold: configs["compaction.threshold"] ?? "", compKeepRecent: configs["compaction.keep_recent"] ?? "",
@@ -76,13 +78,23 @@ export function SystemSettingsModal({ open, onOpenChange }: SystemSettingsModalP
       kgProvider: kgSettings?.extraction_provider ?? "", kgModel: kgSettings?.extraction_model ?? "",
       kgMinConfidence: String(kgSettings?.min_confidence ?? 0.75),
       bgProvider: configs["background.provider"] ?? "", bgModel: configs["background.model"] ?? "",
+      skillUploadMaxSize: configs["skills.max_upload_size_mb"] ?? "20",
+      skillSlashEnabled: parseBool(configs["skills.slash_commands.enabled"], true),
+      skillSlashSuggest: parseBool(configs["skills.slash_commands.suggest_not_found"], true),
+      skillSlashPartial: parseBool(configs["skills.slash_commands.partial_matching"], false),
+      skillSlashPrefix: configs["skills.slash_commands.prefix"] ?? "/",
     };
     setInit(s);
     setEmbProvider(s.embProvider); setEmbModel(s.embModel); setEmbMaxChunkLen(s.embMaxChunkLen); setEmbChunkOverlap(s.embChunkOverlap);
-    setToolStatus(s.toolStatus); setBlockReply(s.blockReply); setIntentClassify(s.intentClassify);
+    setIntentClassify(s.intentClassify);
     setCompProvider(s.compProvider); setCompModel(s.compModel); setCompThreshold(s.compThreshold); setCompKeepRecent(s.compKeepRecent); setCompMaxTokens(s.compMaxTokens);
     setKgProvider(s.kgProvider); setKgModel(s.kgModel); setKgMinConfidence(s.kgMinConfidence);
     setBgProvider(s.bgProvider); setBgModel(s.bgModel);
+    setSkillUploadMaxSize(s.skillUploadMaxSize);
+    setSkillSlashEnabled(s.skillSlashEnabled);
+    setSkillSlashSuggest(s.skillSlashSuggest);
+    setSkillSlashPartial(s.skillSlashPartial);
+    setSkillSlashPrefix(s.skillSlashPrefix);
     resetEmb();
   }, [resetEmb]);
 
@@ -116,8 +128,6 @@ export function SystemSettingsModal({ open, onOpenChange }: SystemSettingsModalP
       if (embModel !== init.embModel) updates["embedding.model"] = embModel;
       if (embMaxChunkLen !== init.embMaxChunkLen) updates["embedding.max_chunk_len"] = embMaxChunkLen;
       if (embChunkOverlap !== init.embChunkOverlap) updates["embedding.chunk_overlap"] = embChunkOverlap;
-      if (toolStatus !== init.toolStatus) updates["gateway.tool_status"] = String(toolStatus);
-      if (blockReply !== init.blockReply) updates["gateway.block_reply"] = String(blockReply);
       if (intentClassify !== init.intentClassify) updates["gateway.intent_classify"] = String(intentClassify);
       if (compProvider !== init.compProvider) updates["compaction.provider"] = compProvider;
       if (compModel !== init.compModel) updates["compaction.model"] = compModel;
@@ -126,6 +136,11 @@ export function SystemSettingsModal({ open, onOpenChange }: SystemSettingsModalP
       if (compMaxTokens !== init.compMaxTokens) updates["compaction.max_tokens"] = compMaxTokens;
       if (bgProvider !== init.bgProvider) updates["background.provider"] = bgProvider;
       if (bgModel !== init.bgModel) updates["background.model"] = bgModel;
+      if (skillUploadMaxSize !== init.skillUploadMaxSize) updates["skills.max_upload_size_mb"] = skillUploadMaxSize;
+      if (skillSlashEnabled !== init.skillSlashEnabled) updates["skills.slash_commands.enabled"] = String(skillSlashEnabled);
+      if (skillSlashSuggest !== init.skillSlashSuggest) updates["skills.slash_commands.suggest_not_found"] = String(skillSlashSuggest);
+      if (skillSlashPartial !== init.skillSlashPartial) updates["skills.slash_commands.partial_matching"] = String(skillSlashPartial);
+      if (skillSlashPrefix !== init.skillSlashPrefix) updates["skills.slash_commands.prefix"] = skillSlashPrefix.trim() || "/";
       for (const [key, value] of Object.entries(updates)) await http.put(`/v1/system-configs/${key}`, { value });
       const kgChanged = kgProvider !== init.kgProvider || kgModel !== init.kgModel || kgMinConfidence !== init.kgMinConfidence;
       if (kgChanged) {
@@ -139,8 +154,6 @@ export function SystemSettingsModal({ open, onOpenChange }: SystemSettingsModalP
   };
 
   const uxItems: FeatureSwitchItem[] = [
-    { icon: Eye, iconClass: "text-blue-500", label: t("ux.toolStatus"), hint: t("ux.toolStatusHint"), checked: toolStatus, onCheckedChange: setToolStatus, infoWhenOn: t("ux.toolStatusInfo"), infoClass: "border-blue-200 bg-blue-50 text-blue-700 dark:border-blue-800 dark:bg-blue-950/30 dark:text-blue-300" },
-    { icon: MessageSquareText, iconClass: "text-emerald-500", label: t("ux.blockReply"), hint: t("ux.blockReplyHint"), checked: blockReply, onCheckedChange: setBlockReply, infoWhenOn: t("ux.blockReplyInfo"), infoClass: "border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-800 dark:bg-emerald-950/30 dark:text-emerald-300" },
     { icon: Brain, iconClass: "text-orange-500", label: t("ux.intentClassify"), hint: t("ux.intentClassifyHint"), checked: intentClassify, onCheckedChange: setIntentClassify, infoWhenOn: t("ux.intentClassifyInfo"), infoClass: "border-orange-200 bg-orange-50 text-orange-700 dark:border-orange-800 dark:bg-orange-950/30 dark:text-orange-300" },
   ];
 
@@ -202,6 +215,19 @@ export function SystemSettingsModal({ open, onOpenChange }: SystemSettingsModalP
             </Card>
 
             <FeatureSwitchGroup title={t("ux.title")} description={t("ux.description")} items={uxItems} />
+
+            <SystemSettingsSkillsCard
+              uploadMaxSize={skillUploadMaxSize}
+              setUploadMaxSize={setSkillUploadMaxSize}
+              slashEnabled={skillSlashEnabled}
+              setSlashEnabled={setSkillSlashEnabled}
+              slashSuggest={skillSlashSuggest}
+              setSlashSuggest={setSkillSlashSuggest}
+              slashPartial={skillSlashPartial}
+              setSlashPartial={setSkillSlashPartial}
+              slashPrefix={skillSlashPrefix}
+              setSlashPrefix={setSkillSlashPrefix}
+            />
 
             <SystemSettingsCompactionCard
               compProvider={compProvider} setCompProvider={setCompProvider}

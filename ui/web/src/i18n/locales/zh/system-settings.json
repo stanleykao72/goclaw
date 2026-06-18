@@ -30,12 +30,6 @@
   "ux": {
     "title": "UX行为",
     "description": "控制网关如何向用户展示Agent活动。",
-    "toolStatus": "执行时显示工具名称",
-    "toolStatusHint": "Agent运行时显示当前工具名称。",
-    "toolStatusInfo": "Agent运行时在流式预览中显示工具名称。",
-    "blockReply": "工具调用时显示中间文本",
-    "blockReplyHint": "工具调用过程中流式传输部分助手文本。",
-    "blockReplyInfo": "工具执行期间向用户流式传输中间文本。",
     "intentClassify": "意图分类",
     "intentClassifyHint": "在路由到Agent之前分类用户意图。",
     "intentClassifyInfo": "消息被分类以优化Agent路由和行为。"
@@ -63,6 +57,20 @@
     "providerPlaceholder": "(Agent默认)",
     "modelPlaceholder": "(默认)",
     "info": "用于知识库文档摘要、会话整合和梦境。留空则回退到Agent默认Provider。"
+  },
+  "skills": {
+    "title": "技能",
+    "description": "租户技能包和斜杠命令设置。",
+    "maxUploadSize": "最大上传大小",
+    "maxUploadSizeHint": "单个 ZIP 文件限制，单位 MB。允许范围：1-500。",
+    "slashEnabled": "启用斜杠命令",
+    "slashEnabledHint": "在用户提示开头检测 /skill-name 和 /use skill-name。",
+    "slashSuggest": "建议相似技能",
+    "slashSuggestHint": "找不到请求的技能时显示接近匹配项。",
+    "slashPartial": "允许部分匹配",
+    "slashPartialHint": "允许像 /frontend 这样的唯一前缀激活匹配技能。",
+    "slashPrefix": "命令前缀",
+    "slashPrefixHint": "技能命令前使用的单个字符。"
   },
   "compaction": {
     "title": "待处理消息压缩",

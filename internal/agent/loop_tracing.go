@@ -14,6 +14,7 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 	"github.com/nextlevelbuilder/goclaw/internal/tools"
 	"github.com/nextlevelbuilder/goclaw/internal/tracing"
+	usagecaps "github.com/nextlevelbuilder/goclaw/internal/usage/caps"
 )
 
 func (l *Loop) emit(event AgentEvent) {
@@ -51,20 +52,42 @@ func (l *Loop) IsRunning() bool { return l.activeRuns.Load() > 0 }
 type spanOption func(*spanOverrides)
 
 type spanOverrides struct {
-	model    string
-	provider string
+	model                 string
+	provider              string
+	usageCapAttempts      []usagecaps.TraceMetadata
+	modelFallbackAttempts []providers.ModelFallbackAttemptMetadata
 }
 
 func withModel(m string) spanOption    { return func(o *spanOverrides) { o.model = m } }
 func withProvider(p string) spanOption { return func(o *spanOverrides) { o.provider = p } }
+func withUsageCapMetadata(metadata usagecaps.TraceMetadata) spanOption {
+	return func(o *spanOverrides) {
+		if !metadata.Empty() {
+			o.usageCapAttempts = append(o.usageCapAttempts, metadata)
+		}
+	}
+}
+
+func withModelFallbackAttempt(metadata providers.ModelFallbackAttemptMetadata) spanOption {
+	return func(o *spanOverrides) {
+		if !metadata.Empty() {
+			o.modelFallbackAttempts = append(o.modelFallbackAttempts, metadata)
+		}
+	}
+}
 
 // resolveSpan returns (model, provider) applying any overrides on top of agent defaults.
 func (l *Loop) resolveSpan(opts []spanOption) (string, string) {
+	o := l.resolveSpanOverrides(opts)
+	return o.model, o.provider
+}
+
+func (l *Loop) resolveSpanOverrides(opts []spanOption) spanOverrides {
 	o := spanOverrides{model: l.model, provider: l.provider.Name()}
 	for _, fn := range opts {
 		fn(&o)
 	}
-	return o.model, o.provider
+	return o
 }
 
 // ---------------------------------------------------------------------------
@@ -150,6 +173,13 @@ func (l *Loop) emitLLMSpanEnd(ctx context.Context, spanID uuid.UUID, start time.
 		"status":      store.SpanStatusCompleted,
 	}
 	var spanMetadata json.RawMessage
+	spanOpts := l.resolveSpanOverrides(opts)
+	if spanOpts.provider != "" {
+		updates["provider"] = spanOpts.provider
+	}
+	if spanOpts.model != "" {
+		updates["model"] = spanOpts.model
+	}
 
 	if callErr != nil {
 		updates["status"] = store.SpanStatusError
@@ -176,8 +206,7 @@ func (l *Loop) emitLLMSpanEnd(ctx context.Context, spanID uuid.UUID, start time.
 			}
 		}
 		// Calculate cost if pricing config is available.
-		model, providerName := l.resolveSpan(opts)
-		if pricing := tracing.LookupPricing(l.modelPricing, providerName, model); pricing != nil {
+		if pricing := tracing.LookupPricing(l.modelPricing, spanOpts.provider, spanOpts.model); pricing != nil {
 			cost := tracing.CalculateCost(pricing, resp.Usage)
 			if cost > 0 {
 				updates["total_cost"] = cost
@@ -202,6 +231,12 @@ func (l *Loop) emitLLMSpanEnd(ctx context.Context, spanID uuid.UUID, start time.
 	}
 	if decision := providers.ReasoningDecisionFromContext(ctx); decision != nil {
 		spanMetadata = providers.MergeReasoningMetadata(spanMetadata, *decision)
+	}
+	if len(spanOpts.usageCapAttempts) > 0 {
+		spanMetadata = usagecaps.MergeTraceMetadata(spanMetadata, spanOpts.usageCapAttempts)
+	}
+	if len(spanOpts.modelFallbackAttempts) > 0 {
+		spanMetadata = providers.MergeModelFallbackMetadata(spanMetadata, spanOpts.modelFallbackAttempts)
 	}
 	if len(spanMetadata) > 0 {
 		updates["metadata"] = spanMetadata

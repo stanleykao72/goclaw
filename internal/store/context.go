@@ -50,6 +50,8 @@ const (
 	CredentialUserIDKey contextKey = "goclaw_credential_user_id"
 	// SenderNameKey is the display name from channel metadata (for bootstrap auto-contact).
 	SenderNameKey contextKey = "goclaw_sender_name"
+	// ChannelContextScopeKey carries the channel/group/user scope for runtime grants and credentials.
+	ChannelContextScopeKey contextKey = "goclaw_channel_context_scope"
 	// AgentAudioKey carries the immutable agent audio snapshot for TTS tool dispatch.
 	AgentAudioKey contextKey = "goclaw_agent_audio"
 	// MemoryBackendKey carries the per-agent memory backend ("db" | "vault").
@@ -136,10 +138,19 @@ func WithCredentialUserID(ctx context.Context, id string) context.Context {
 	return context.WithValue(ctx, CredentialUserIDKey, id)
 }
 
+// ExplicitCredentialUserIDFromContext returns only the explicitly injected credential identity.
+// Unlike CredentialUserIDFromContext, it does not fall back to UserID.
+func ExplicitCredentialUserIDFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(CredentialUserIDKey).(string); ok {
+		return v
+	}
+	return ""
+}
+
 // CredentialUserIDFromContext returns the resolved identity for credential lookups.
 // Falls back to RunContext.CredentialUserID, then UserIDFromContext.
 func CredentialUserIDFromContext(ctx context.Context) string {
-	if v, ok := ctx.Value(CredentialUserIDKey).(string); ok && v != "" {
+	if v := ExplicitCredentialUserIDFromContext(ctx); v != "" {
 		return v
 	}
 	if rc := RunContextFromCtx(ctx); rc != nil && rc.CredentialUserID != "" {

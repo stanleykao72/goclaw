@@ -13,7 +13,7 @@ var (
 	debPackageNameRE               = regexp.MustCompile(`^[a-z0-9][a-z0-9+.-]*$`)
 	systemLookPath                 = exec.LookPath
 	systemCommandCombinedOutput    = runSystemCommandCombinedOutput
-	aptSystemPackageAliases        = map[string]string{"pip3": "python3-pip", "github-cli": "gh"}
+	aptSystemPackageAliases        = map[string]string{"pip3": "python3-pip", "github-cli": "gh", "go": "golang-go", "golang": "golang-go"}
 	errSystemPackageMgrUnavailable = "system package manager unavailable on this runtime"
 )
 
@@ -37,6 +37,7 @@ func installSystemPackage(ctx context.Context, requested string) (bool, string) 
 	}
 	if err := addSystemPackageRecord(requested, pkg, "apt"); err != nil {
 		slog.Warn("skills: system package record add failed", "package", requested, "resolved", pkg, "error", err)
+		return false, fmt.Sprintf("package installed but package record update failed: %v", err)
 	}
 	return true, ""
 }
@@ -57,6 +58,7 @@ func uninstallSystemPackage(ctx context.Context, requested string) (bool, string
 	}
 	if err := removeSystemPackageRecord(requested, pkg, "apt"); err != nil {
 		slog.Warn("skills: system package record remove failed", "package", requested, "resolved", pkg, "error", err)
+		return false, fmt.Sprintf("package removed but package record update failed: %v", err)
 	}
 	return true, ""
 }

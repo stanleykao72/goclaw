@@ -20,6 +20,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
+	"github.com/nextlevelbuilder/goclaw/internal/config"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
 
@@ -71,6 +72,7 @@ const (
 
 // Channel type constants used across channel packages and gateway wiring.
 const (
+	TypeBitrix24     = "bitrix24"
 	TypeDiscord      = "discord"
 	TypeFacebook     = "facebook"
 	TypeFeishu       = "feishu"
@@ -141,10 +143,40 @@ type StreamingChannel interface {
 	ReasoningStreamEnabled() bool
 }
 
+// ChannelDestroyer extends Channel with a deletion hook. Channels that
+// implement this are notified BEFORE their channel_instance row is removed
+// from the DB so they can release external resources that won't survive a
+// normal Stop() — e.g. Bitrix24 channels call imbot.unregister to delete
+// the bot on the portal; without this hook the bot lingers as a zombie.
+//
+// Implementation must be best-effort: handlers log Destroy failures and
+// proceed with DB deletion regardless. Blocking the delete on a permanently
+// dead upstream would leave the row stuck forever with no recovery path.
+//
+// Channels without external state (Telegram, Discord, Slack — the channel
+// itself IS the bot, identified by a token stored locally) don't implement
+// this interface; their Stop() already handles all cleanup.
+type ChannelDestroyer interface {
+	Channel
+	Destroy(ctx context.Context) error
+}
+
 // BlockReplyChannel is optionally implemented by channels that override
 // the gateway-level block_reply setting. Returns nil to inherit the gateway default.
 type BlockReplyChannel interface {
 	BlockReplyEnabled() *bool
+}
+
+// ChatBehaviorChannel is optionally implemented by channels that override
+// gateway-level human-like delivery behavior. Nil means inherit the gateway default.
+type ChatBehaviorChannel interface {
+	ChatBehaviorConfig() *config.ChatBehaviorConfig
+}
+
+// ReasoningDeliveryChannel is optionally implemented by channels that expose
+// how model reasoning should be delivered to end users.
+type ReasoningDeliveryChannel interface {
+	ReasoningDeliveryConfig() (mode string, legacyReasoningStream *bool)
 }
 
 // WebhookChannel extends Channel with an HTTP handler that can be mounted
@@ -323,9 +355,9 @@ func (c *BaseChannel) CheckDMPolicy(ctx context.Context, senderID, dmPolicy stri
 		if c.pairingService != nil {
 			paired, err := c.pairingService.IsPaired(ctx, senderID, c.name)
 			if err != nil {
-				slog.Warn("security.pairing_check_failed, assuming paired (fail-open)",
+				slog.Warn("security.pairing_check_failed, denying access (fail-closed)",
 					"sender_id", senderID, "channel", c.name, "error", err)
-				return PolicyAllow
+				return PolicyDeny
 			}
 			if paired {
 				return PolicyAllow
@@ -362,9 +394,9 @@ func (c *BaseChannel) CheckGroupPolicy(ctx context.Context, senderID, chatID, gr
 		if c.pairingService != nil {
 			paired, err := c.pairingService.IsPaired(ctx, groupSenderID, c.name)
 			if err != nil {
-				slog.Warn("security.pairing_check_failed, assuming paired (fail-open)",
+				slog.Warn("security.pairing_check_failed, denying access (fail-closed)",
 					"group_sender", groupSenderID, "channel", c.name, "error", err)
-				return PolicyAllow
+				return PolicyDeny
 			}
 			if paired {
 				c.MarkGroupApproved(chatID)

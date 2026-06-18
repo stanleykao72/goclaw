@@ -7,9 +7,11 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/channels"
 	"github.com/nextlevelbuilder/goclaw/internal/config"
+	"github.com/nextlevelbuilder/goclaw/internal/providers"
 	"github.com/nextlevelbuilder/goclaw/internal/scheduler"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 	"github.com/nextlevelbuilder/goclaw/internal/tools"
+	usagecaps "github.com/nextlevelbuilder/goclaw/internal/usage/caps"
 )
 
 // ConsumerDeps bundles shared dependencies for consumer message handlers.
@@ -28,6 +30,8 @@ type ConsumerDeps struct {
 	ContactCollector *store.ContactCollector
 	TaskRunSessions  sync.Map
 	SubagentMgr      *tools.SubagentManager
+	UsageCaps        *usagecaps.Service
+	ProviderReg      *providers.Registry
 	BgWg             sync.WaitGroup
 	GetAnnounceMu    func(string) *sync.Mutex
 }

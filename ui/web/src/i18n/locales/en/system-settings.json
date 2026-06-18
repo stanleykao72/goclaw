@@ -30,12 +30,6 @@
   "ux": {
     "title": "UX Behavior",
     "description": "Control how the gateway displays agent activity to users.",
-    "toolStatus": "Show tool name during execution",
-    "toolStatusHint": "Display the active tool name while the agent is running.",
-    "toolStatusInfo": "Tool names are shown in streaming preview while the agent runs.",
-    "blockReply": "Show intermediate text during tool calls",
-    "blockReplyHint": "Stream partial assistant text while tools are being invoked.",
-    "blockReplyInfo": "Intermediate text is streamed to users during tool execution.",
     "intentClassify": "Intent classification",
     "intentClassifyHint": "Classify user intent before routing to the agent.",
     "intentClassifyInfo": "Messages are classified to optimize agent routing and behavior."
@@ -63,6 +57,20 @@
     "providerPlaceholder": "(agent default)",
     "modelPlaceholder": "(default)",
     "info": "Used for vault enrichment (document summarization), consolidation (session summaries), and dreaming. Leave empty to fall back to the agent default provider."
+  },
+  "skills": {
+    "title": "Skills",
+    "description": "Tenant skill package and slash command settings.",
+    "maxUploadSize": "Max upload size",
+    "maxUploadSizeHint": "Per-file ZIP limit in MB. Allowed range: 1-500.",
+    "slashEnabled": "Enable slash commands",
+    "slashEnabledHint": "Detect /skill-name and /use skill-name at the start of user prompts.",
+    "slashSuggest": "Suggest similar skills",
+    "slashSuggestHint": "Show close matches when a requested skill is not found.",
+    "slashPartial": "Allow partial matching",
+    "slashPartialHint": "Let unique prefixes like /frontend activate matching skills.",
+    "slashPrefix": "Command prefix",
+    "slashPrefixHint": "Single character used before skill commands."
   },
   "compaction": {
     "title": "Pending Message Compaction",

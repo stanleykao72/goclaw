@@ -34,11 +34,48 @@ type SecureCLIBinary struct {
 	IsGlobal       bool            `json:"is_global" db:"is_global"`
 	Enabled        bool            `json:"enabled" db:"enabled"`
 	CreatedBy      string          `json:"created_by" db:"created_by"`
-	UserEnv        []byte          `json:"-" db:"-"` // per-user encrypted env (populated by LookupByBinary LEFT JOIN)
+	// AdapterName routes the binary to a CredentialAdapter at exec time.
+	// NULL/empty → passthrough adapter (legacy env-vars injection only).
+	// Non-empty (e.g. "git") → typed adapter resolved via tools.LookupAdapter.
+	AdapterName *string `json:"adapter_name,omitempty" db:"adapter_name"`
+	UserEnv     []byte  `json:"-" db:"-"` // per-user encrypted env (populated by LookupByBinary LEFT JOIN)
+	// UserCredentialType + UserHostScope mirror the joined user-credential row
+	// (populated by LookupByBinary). NULL when the user has no credential or the
+	// credential is legacy env-only.
+	UserCredentialType *string `json:"-" db:"-"`
+	UserHostScope      *string `json:"-" db:"-"`
+	// CredentialEnv + metadata carry the effective typed credential selected
+	// for runtime injection. Source can be "user", "context", "agent", or "".
+	CredentialEnv       []byte  `json:"-" db:"-"`
+	CredentialType      *string `json:"-" db:"-"`
+	CredentialHostScope *string `json:"-" db:"-"`
+	CredentialSource    string  `json:"credential_source,omitempty" db:"-"`
+	CredentialSubjectID string  `json:"credential_subject_id,omitempty" db:"-"`
 	// EnvKeys is set by HTTP handlers only (names from decrypted env, no values); not a DB column.
 	EnvKeys []string `json:"env_keys,omitempty" db:"-"`
+	// Env is set by HTTP handlers only. Sensitive values are masked; value entries are visible.
+	Env map[string]SecureCLIEnvResponseEntry `json:"env,omitempty" db:"-"`
 	// AgentGrantsSummary is populated by List only — lightweight per-grant summary (no env bytes).
 	AgentGrantsSummary []AgentGrantSummary `json:"agent_grants_summary" db:"-"`
+}
+
+// SetEffectiveCredential records the credential material selected for runtime
+// injection. The legacy User* fields remain populated for older call sites that
+// still synthesize adapter credentials from the binary row.
+func (b *SecureCLIBinary) SetEffectiveCredential(env []byte, credentialType, hostScope *string, source, subjectID string) {
+	if b == nil {
+		return
+	}
+	b.CredentialEnv = env
+	b.CredentialType = credentialType
+	b.CredentialHostScope = hostScope
+	b.CredentialSource = source
+	b.CredentialSubjectID = subjectID
+	if source == "user" || source == "context" {
+		b.UserEnv = env
+		b.UserCredentialType = credentialType
+		b.UserHostScope = hostScope
+	}
 }
 
 // MergeGrantOverrides applies agent grant overrides onto a binary config.
@@ -75,6 +112,31 @@ type SecureCLIUserCredential struct {
 	UpdatedAt string          `json:"updated_at" db:"updated_at"`
 	// EncryptedEnv is decrypted JSON — never serialized to API.
 	EncryptedEnv []byte `json:"-" db:"encrypted_env"`
+	// CredentialType selects the wire shape carried in EncryptedEnv.
+	// NULL/empty → legacy env-vars map. Future: 'pat', 'ssh_key', 'pg_password_file'.
+	CredentialType *string `json:"credential_type,omitempty" db:"credential_type"`
+	// HostScope binds the credential to a specific hostname (e.g. 'github.com').
+	// Required when CredentialType ∈ {'pat','ssh_key'}; NULL for legacy env creds.
+	HostScope *string `json:"host_scope,omitempty" db:"host_scope"`
+}
+
+// SecureCLIAgentCredential holds per-agent encrypted env overrides for a binary.
+type SecureCLIAgentCredential struct {
+	ID        uuid.UUID       `json:"id" db:"id"`
+	BinaryID  uuid.UUID       `json:"binary_id" db:"binary_id"`
+	AgentID   uuid.UUID       `json:"agent_id" db:"agent_id"`
+	AgentKey  string          `json:"agent_key,omitempty" db:"-"`
+	Name      string          `json:"name,omitempty" db:"-"`
+	Metadata  json.RawMessage `json:"metadata,omitempty" db:"metadata"`
+	CreatedBy string          `json:"created_by" db:"created_by"`
+	CreatedAt string          `json:"created_at" db:"created_at"`
+	UpdatedAt string          `json:"updated_at" db:"updated_at"`
+	// EncryptedEnv is decrypted JSON — never serialized to API.
+	EncryptedEnv []byte `json:"-" db:"encrypted_env"`
+	// CredentialType selects the wire shape carried in EncryptedEnv.
+	CredentialType *string `json:"credential_type,omitempty" db:"credential_type"`
+	// HostScope binds the credential to a specific hostname.
+	HostScope *string `json:"host_scope,omitempty" db:"host_scope"`
 }
 
 // SecureCLIAgentGrant represents a per-agent grant with optional setting overrides.
@@ -92,6 +154,8 @@ type SecureCLIAgentGrant struct {
 	EncryptedEnv []byte `json:"-" db:"encrypted_env"`
 	// EnvKeys is populated by HTTP handlers only (sorted key names, no values). Not a DB column.
 	EnvKeys []string `json:"env_keys,omitempty" db:"-"`
+	// Env is populated by HTTP handlers only for sanitized responses.
+	Env map[string]SecureCLIEnvResponseEntry `json:"env,omitempty" db:"-"`
 	// EnvSet indicates whether this grant has an env override. Not a DB column.
 	EnvSet    bool      `json:"env_set" db:"-"`
 	CreatedAt time.Time `json:"created_at" db:"created_at"`
@@ -131,8 +195,24 @@ type SecureCLIStore interface {
 
 	GetUserCredentials(ctx context.Context, binaryID uuid.UUID, userID string) (*SecureCLIUserCredential, error)
 	SetUserCredentials(ctx context.Context, binaryID uuid.UUID, userID string, encryptedEnv []byte) error
+	// SetUserCredentialsTyped writes a typed user credential (PAT, SSH key, etc.).
+	// credentialType and hostScope are nil for legacy env-vars credentials —
+	// in that case behavior is identical to SetUserCredentials.
+	SetUserCredentialsTyped(ctx context.Context, binaryID uuid.UUID, userID string, encryptedEnv []byte, credentialType, hostScope *string) error
 	DeleteUserCredentials(ctx context.Context, binaryID uuid.UUID, userID string) error
 	ListUserCredentials(ctx context.Context, binaryID uuid.UUID) ([]SecureCLIUserCredential, error)
+}
+
+// SecureCLIAgentCredentialStore manages per-agent credential material for
+// secure CLI binaries. It intentionally does not grant binary access.
+type SecureCLIAgentCredentialStore interface {
+	BinaryExists(ctx context.Context, binaryID uuid.UUID) (bool, error)
+	AgentExists(ctx context.Context, agentID uuid.UUID) (bool, error)
+	GetAgentCredentials(ctx context.Context, binaryID uuid.UUID, agentID uuid.UUID) (*SecureCLIAgentCredential, error)
+	SetAgentCredentials(ctx context.Context, binaryID uuid.UUID, agentID uuid.UUID, encryptedEnv []byte, createdBy string) error
+	SetAgentCredentialsTyped(ctx context.Context, binaryID uuid.UUID, agentID uuid.UUID, encryptedEnv []byte, credentialType, hostScope *string, createdBy string) error
+	DeleteAgentCredentials(ctx context.Context, binaryID uuid.UUID, agentID uuid.UUID) error
+	ListAgentCredentials(ctx context.Context, binaryID uuid.UUID) ([]SecureCLIAgentCredential, error)
 }
 
 // SecureCLIAgentGrantStore manages per-agent grants for secure CLI binaries.

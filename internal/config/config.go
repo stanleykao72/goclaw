@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
+	"strings"
 	"sync"
 	"time"
 
@@ -47,6 +49,7 @@ type Config struct {
 	Providers ProvidersConfig `json:"providers"`
 	Gateway   GatewayConfig   `json:"gateway"`
 	Tools     ToolsConfig     `json:"tools"`
+	Skills    SkillsConfig    `json:"skills"`
 	Sessions  SessionsConfig  `json:"sessions"`
 	Database  DatabaseConfig  `json:"database"`
 	Tts       TtsConfig       `json:"tts"`
@@ -70,9 +73,8 @@ type Config struct {
 // empty string → default 1h.
 //
 // ScratchDir is the tmp workspace used by the update executor for download
-// + extract + staging before atomic swap. Defaults to "{BinDir}/../tmp" when
-// empty; operators MAY set explicitly to avoid symlink-resolution issues
-// (red-team H6).
+// + extract + staging before atomic swap. Empty or unusable values fall back to
+// "{runtimeDir}/tmp"; operators MAY set an explicit writable path.
 type PackagesConfig struct {
 	GitHubToken     string `json:"github_token,omitempty"`      // Phase 2 stub
 	UpdatesCheckTTL string `json:"updates_check_ttl,omitempty"` // e.g. "1h"
@@ -129,7 +131,82 @@ type DatabaseConfig struct {
 
 // SkillsConfig configures the skills storage system.
 type SkillsConfig struct {
-	StorageDir string `json:"storage_dir,omitempty"` // directory for skill content (default: dataDir/skills-store/)
+	StorageDir      string                  `json:"storage_dir,omitempty"`        // directory for skill content (default: dataDir/skills-store/)
+	MaxUploadSizeMB int                     `json:"max_upload_size_mb,omitempty"` // per-file ZIP upload limit
+	SlashCommands   SkillSlashCommandConfig `json:"slash_commands"`
+}
+
+// SkillSlashCommandConfig controls explicit slash-command skill activation.
+type SkillSlashCommandConfig struct {
+	Enabled         *bool  `json:"enabled,omitempty"`
+	SuggestNotFound *bool  `json:"suggest_not_found,omitempty"`
+	PartialMatching bool   `json:"partial_matching,omitempty"`
+	Prefix          string `json:"prefix,omitempty"`
+}
+
+const (
+	DefaultSkillMaxUploadSizeMB = 20
+	MinSkillMaxUploadSizeMB     = 1
+	MaxSkillMaxUploadSizeMB     = 500
+
+	DefaultSkillSlashCommandPrefix = "/"
+
+	SkillMaxUploadSizeSystemConfigKey        = "skills.max_upload_size_mb"
+	SkillSlashCommandsEnabledSystemConfigKey = "skills.slash_commands.enabled"
+	SkillSlashSuggestNotFoundSystemConfigKey = "skills.slash_commands.suggest_not_found"
+	SkillSlashPartialMatchingSystemConfigKey = "skills.slash_commands.partial_matching"
+	SkillSlashCommandPrefixSystemConfigKey   = "skills.slash_commands.prefix"
+)
+
+func ClampSkillMaxUploadSizeMB(value int) int {
+	if value == 0 {
+		return DefaultSkillMaxUploadSizeMB
+	}
+	if value < MinSkillMaxUploadSizeMB {
+		return MinSkillMaxUploadSizeMB
+	}
+	if value > MaxSkillMaxUploadSizeMB {
+		return MaxSkillMaxUploadSizeMB
+	}
+	return value
+}
+
+func (c SkillsConfig) EffectiveMaxUploadSizeMB() int {
+	return ClampSkillMaxUploadSizeMB(c.MaxUploadSizeMB)
+}
+
+func (c SkillsConfig) EffectiveMaxUploadSizeBytes() int64 {
+	return int64(c.EffectiveMaxUploadSizeMB()) << 20
+}
+
+func (c SkillSlashCommandConfig) EffectiveEnabled() bool {
+	if c.Enabled == nil {
+		return true
+	}
+	return *c.Enabled
+}
+
+func (c SkillSlashCommandConfig) EffectiveSuggestNotFound() bool {
+	if c.SuggestNotFound == nil {
+		return true
+	}
+	return *c.SuggestNotFound
+}
+
+func (c SkillSlashCommandConfig) EffectivePartialMatching() bool {
+	return c.PartialMatching
+}
+
+func (c SkillSlashCommandConfig) EffectivePrefix() string {
+	prefix := strings.TrimSpace(c.Prefix)
+	if prefix == "" {
+		return DefaultSkillSlashCommandPrefix
+	}
+	runes := []rune(prefix)
+	if len(runes) != 1 || runes[0] == ' ' || runes[0] == '\t' || runes[0] == '\n' || runes[0] == '\r' {
+		return DefaultSkillSlashCommandPrefix
+	}
+	return prefix
 }
 
 // AgentBinding maps a channel/peer pattern to a specific agent.
@@ -484,6 +561,7 @@ func (c *Config) ReplaceFrom(src *Config) {
 	c.Providers = src.Providers
 	c.Gateway = src.Gateway
 	c.Tools = src.Tools
+	c.Skills = src.Skills
 	c.Sessions = src.Sessions
 	c.Database = src.Database
 	c.Tts = src.Tts
@@ -491,6 +569,36 @@ func (c *Config) ReplaceFrom(src *Config) {
 	c.Telemetry = src.Telemetry
 	c.Tailscale = src.Tailscale
 	c.Bindings = src.Bindings
+}
+
+// Clone returns a deep copy of the config while holding the read lock.
+func (c *Config) Clone() *Config {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	data, err := json.Marshal(c)
+	if err != nil {
+		return &Config{}
+	}
+	cp := Default()
+	if err := json.Unmarshal(data, cp); err != nil {
+		return &Config{}
+	}
+	return cp
+}
+
+// ShellDenyGroupsSnapshot returns a copy of the current global shell deny-group
+// overrides. Callers can safely resolve patterns without racing config reloads.
+func (c *Config) ShellDenyGroupsSnapshot() map[string]bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if len(c.Tools.ShellDenyGroups) == 0 {
+		return nil
+	}
+	groups := make(map[string]bool, len(c.Tools.ShellDenyGroups))
+	maps.Copy(groups, c.Tools.ShellDenyGroups)
+	return groups
 }
 
 // IdentityConfig defines agent persona / display identity.

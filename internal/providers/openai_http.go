@@ -45,6 +45,11 @@ func (p *OpenAIProvider) doRequest(ctx context.Context, body any) (io.ReadCloser
 	if p.siteTitle != "" {
 		httpReq.Header.Set("X-Title", p.siteTitle)
 	}
+	// Static per-provider headers (e.g. fixed User-Agent for kimi_coding).
+	// Applied after the standard headers so providers can override them if needed.
+	for k, v := range p.extraHeaders {
+		httpReq.Header.Set(k, v)
+	}
 
 	resp, err := p.client.Do(httpReq)
 	if err != nil {
@@ -125,12 +130,18 @@ func (p *OpenAIProvider) parseResponse(resp *openAIResponse) *ChatResponse {
 			PromptTokens:     resp.Usage.PromptTokens,
 			CompletionTokens: resp.Usage.CompletionTokens,
 			TotalTokens:      resp.Usage.TotalTokens,
+			RequestCount:     1,
 		}
 		if resp.Usage.PromptTokensDetails != nil {
 			result.Usage.CacheReadTokens = resp.Usage.PromptTokensDetails.CachedTokens
+			result.Usage.CacheCreationTokens = resp.Usage.PromptTokensDetails.CacheWriteTokens
+			result.Usage.PromptTokensIncludeCachedSegments = true
 		}
 		if resp.Usage.CompletionTokensDetails != nil && resp.Usage.CompletionTokensDetails.ReasoningTokens > 0 {
 			result.Usage.ThinkingTokens = resp.Usage.CompletionTokensDetails.ReasoningTokens
+		}
+		if resp.Usage.ServerToolUse != nil {
+			result.Usage.WebSearchCount = resp.Usage.ServerToolUse.WebSearchRequests
 		}
 	}
 

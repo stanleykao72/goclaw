@@ -84,6 +84,12 @@ type Server struct {
 
 	httpServer *http.Server
 	mux        *http.ServeMux
+
+	// publicURLSnapshot remembers the gateway's externally reachable base URL
+	// learned from inbound HTTP requests. Reset to a fresh snapshot per Server
+	// so test servers don't share state. Read by RPC methods that need to
+	// advertise URLs back to external systems (e.g. Bitrix24 install link).
+	publicURLSnapshot *PublicURLSnapshot
 }
 
 // SetPostTurnProcessor sets the post-turn processor for team task dispatch in HTTP API handlers.
@@ -94,12 +100,13 @@ func (s *Server) SetPostTurnProcessor(pt tools.PostTurnProcessor) {
 // NewServer creates a new gateway server.
 func NewServer(cfg *config.Config, eventPub bus.EventPublisher, agents *agent.Router, sess store.SessionStore, toolsReg ...*tools.Registry) *Server {
 	s := &Server{
-		cfg:       cfg,
-		eventPub:  eventPub,
-		agents:    agents,
-		sessions:  sess,
-		clients:   make(map[string]*Client),
-		startedAt: time.Now(),
+		cfg:               cfg,
+		eventPub:          eventPub,
+		agents:            agents,
+		sessions:          sess,
+		clients:           make(map[string]*Client),
+		startedAt:         time.Now(),
+		publicURLSnapshot: NewPublicURLSnapshot(),
 	}
 
 	s.upgrader = websocket.Upgrader{
@@ -124,6 +131,10 @@ func NewServer(cfg *config.Config, eventPub bus.EventPublisher, agents *agent.Ro
 
 // RateLimiter returns the server's rate limiter for use by method handlers.
 func (s *Server) RateLimiter() *RateLimiter { return s.rateLimiter }
+
+// PublicURLSnapshot returns the snapshot of the gateway's externally reachable
+// base URL. Updated by the snapshot middleware on every inbound request.
+func (s *Server) PublicURLSnapshot() *PublicURLSnapshot { return s.publicURLSnapshot }
 
 // checkOrigin validates WebSocket connection origin against the allowed origins whitelist.
 // If no origins are configured, all origins are allowed (backward compatibility / dev mode).
@@ -185,12 +196,19 @@ func (s *Server) BuildMux() *http.ServeMux {
 		mux.Handle("/v1/tools/invoke", toolsHandler)
 	}
 
+	// Read-only HTTP compatibility for automation clients.
+	if s.sessions != nil {
+		httpapi.NewSessionsHandler(s.sessions, s.cfg.Gateway.OwnerIDs).RegisterRoutes(mux)
+	}
+
 	// Register all HTTP API handlers (agents, skills, teams, storage, etc.)
 	for _, h := range s.handlers {
 		if h != nil {
 			h.RegisterRoutes(mux)
 		}
 	}
+
+	httpapi.RegisterAPINotFoundRoute(mux)
 
 	// MCP bridge: expose GoClaw tools to Claude CLI via streamable-http.
 	// Only listens on localhost (CLI runs on the same machine).
@@ -213,9 +231,17 @@ func (s *Server) BuildMux() *http.ServeMux {
 	}
 
 	// Embedded web UI (built with -tags embedui). Catch-all after all API routes.
+	// When the build does NOT include the embedui tag, webui.Handler() returns nil
+	// and there's no handler for "/" — http.ServeMux would then return an opaque
+	// 404 for the root URL, confusing operators who open the deployed URL in a
+	// browser to check the service. Install a minimal JSON index handler in that
+	// case so the root responds with something useful (and any unmatched path
+	// still returns 404, just with a JSON body).
 	if h := webui.Handler(); h != nil {
 		mux.Handle("/", h)
 		slog.Info("serving embedded web UI")
+	} else {
+		mux.HandleFunc("/", s.handleIndex)
 	}
 
 	s.mux = mux
@@ -268,6 +294,11 @@ func bridgeContextMiddleware(gatewayToken string, agentStore store.AgentStore, n
 					if agentStore != nil {
 						ag, err := agentStore.GetByIDUnscoped(ctx, id)
 						if err == nil && ag != nil {
+							// Propagate the agent key so bridged session tools (sessions_list/
+							// history/send) can resolve identity via ToolAgentKeyFromCtx. The MCP
+							// bridge otherwise injects only the agent UUID, leaving the key empty
+							// -> session tools fail with "agent context required".
+							ctx = tools.WithToolAgentKey(ctx, ag.AgentKey)
 							groups := ag.ParseShellDenyGroups()
 							if groups != nil {
 								ctx = store.WithShellDenyGroups(ctx, groups)
@@ -339,6 +370,13 @@ func (s *Server) Start(ctx context.Context) error {
 	if os.Getenv("GOCLAW_DESKTOP") == "1" {
 		handler = desktopCORS(mux)
 	}
+	// NOTE: The public-URL snapshot is intentionally NOT updated by a global
+	// middleware. An unauthenticated probe with a forged Host header could
+	// otherwise poison the URL we hand back to clients (which then ends up
+	// in OAuth callbacks and would leak tokens to an attacker-controlled
+	// host). Instead, the snapshot is updated inside handleConnect AFTER
+	// token authentication succeeds (see internal/gateway/router.go), and
+	// from /bitrix24/install (already gated by valid OAuth state).
 
 	addr := fmt.Sprintf("%s:%d", s.cfg.Gateway.Host, s.cfg.Gateway.Port)
 	s.httpServer = &http.Server{
@@ -370,6 +408,11 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	client := NewClient(conn, s, clientIP(r))
+	// Capture the public URL from the HTTP upgrade request. We DON'T snapshot
+	// it server-wide yet — that happens only after the client authenticates
+	// in handleConnect. This prevents an unauthenticated probe with a forged
+	// Host header from poisoning the gateway-wide public URL.
+	client.setUpgradeURL(derivePublicURLFromRequest(r))
 	s.registerClient(client)
 
 	defer func() {
@@ -385,6 +428,24 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, `{"status":"ok","protocol":%d}`, protocol.ProtocolVersion)
+}
+
+// handleIndex is the fallback "/" handler when no embedded web UI is present.
+// It returns a small JSON service-info document for exact-match "/" requests
+// and a JSON 404 for everything else — http.ServeMux routes "/" as a
+// catch-all, so unrelated paths fall through here too.
+func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.URL.Path != "/" {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":"not found"}`))
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w,
+		`{"service":"goclaw","status":"ok","protocol":%d,`+
+			`"endpoints":["/health","/v1/chat/completions","/v1/responses","/v1/tools/invoke","/ws"]}`,
+		protocol.ProtocolVersion)
 }
 
 // clientIP extracts the real client IP from the request, checking proxy headers first.
@@ -471,6 +532,11 @@ func (s *Server) SetSecureCLIHandler(h *httpapi.SecureCLIHandler) {
 
 // SetSecureCLIGrantHandler sets the per-agent secure CLI grant handler.
 func (s *Server) SetSecureCLIGrantHandler(h *httpapi.SecureCLIGrantHandler) {
+	s.handlers = append(s.handlers, h)
+}
+
+// SetBrowserCookiesHandler sets the selected browser-cookie sync handler.
+func (s *Server) SetBrowserCookiesHandler(h *httpapi.BrowserCookiesHandler) {
 	s.handlers = append(s.handlers, h)
 }
 
@@ -580,6 +646,11 @@ func (s *Server) SetActivityHandler(h *httpapi.ActivityHandler) {
 	s.handlers = append(s.handlers, h)
 }
 
+// SetRuntimeLogsHandler sets the runtime log aggregate handler.
+func (s *Server) SetRuntimeLogsHandler(h *httpapi.RuntimeLogsHandler) {
+	s.handlers = append(s.handlers, h)
+}
+
 // SetSystemConfigsHandler sets the system configs handler.
 func (s *Server) SetSystemConfigsHandler(h *httpapi.SystemConfigsHandler) {
 	s.handlers = append(s.handlers, h)
@@ -587,6 +658,11 @@ func (s *Server) SetSystemConfigsHandler(h *httpapi.SystemConfigsHandler) {
 
 // SetUsageHandler sets the usage analytics handler.
 func (s *Server) SetUsageHandler(h *httpapi.UsageHandler) { s.handlers = append(s.handlers, h) }
+
+// SetUsageCapsHandler sets usage cap and model pricing handlers.
+func (s *Server) SetUsageCapsHandler(h *httpapi.UsageCapsHandler) {
+	s.handlers = append(s.handlers, h)
+}
 
 // SetBackupHandler sets the system backup handler.
 func (s *Server) SetBackupHandler(h *httpapi.BackupHandler) { s.handlers = append(s.handlers, h) }

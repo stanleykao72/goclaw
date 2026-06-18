@@ -91,6 +91,17 @@ ui/desktop/                   Wails v2 desktop app (React frontend + embedded ga
 - **Telegram formatting:** LLM output → `SanitizeAssistantContent()` → `markdownToTelegramHTML()` → `chunkHTML()` → `sendHTML()`. Tables rendered as ASCII in `<pre>` tags
 - **i18n:** Web UI uses `i18next` with namespace-split locale files in `ui/web/src/i18n/locales/{lang}/`. Backend uses `internal/i18n` message catalog with `i18n.T(locale, key, args...)`. Locale propagated via `store.WithLocale(ctx)` — WS `connect` param `locale`, HTTP `Accept-Language` header. Supported: en (default), vi, zh. New user-facing strings: add key to `internal/i18n/keys.go`, add translations to all 3 catalog files. New UI strings: add key to all 3 locale dirs. Bootstrap templates (SOUL.md, etc.) stay English-only (LLM consumption).
 
+## Cross-Surface Feature/Fix Parity
+
+Every feature implementation or bug fix must audit and update all affected product surfaces before it is marked complete:
+
+- **Gateway server:** handlers, WebSocket methods, stores, migrations, provider/runtime behavior, background jobs.
+- **API contract:** request/response structs, `pkg/protocol`, OpenAPI/docs, compatibility shims, tests built from real response shapes.
+- **Web UI:** `ui/web` screens, hooks, i18n, validation, loading/error states, and contract consumers.
+- **CLI/runtime package:** `cmd` commands, operator/runtime package commands, installers/manifests, response parsers, and runtime package docs.
+
+Do not ship a backend-only change when the web UI, CLI/runtime package, or API contract must also change. If a surface is not affected, state `Surface parity: <surface> N/A because ...` in the plan, PR, or final report. For cross-repo CLI work, verify the current CLI/runtime package repo and release channel before claiming parity.
+
 ## Running
 
 ```bash
@@ -123,7 +134,7 @@ make desktop-dmg VERSION=0.1.0               # Create .dmg installer (macOS only
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
 | `ci.yaml` | push main, PR→main/dev | Go build+test+vet, Web build |
-| `dev-beta-release.yaml` | push dev | Go build+test+vet, Web build, semantic beta prerelease, beta Docker |
+| `dev-beta-release.yaml` | push dev | Go build+test+vet, Web build, semantic beta prerelease, beta Docker, zuey VPS deploy |
 | `release.yaml` | tag `v[0-9]+.[0-9]+.[0-9]+` | Binaries + Docker (4 variants + web) + Discord |
 | `release-beta.yaml` | tag `v*-beta*` / `v*-rc*` | Beta binaries + Docker + GitHub prerelease |
 | `release-desktop.yaml` | tag `lite-v*` | Desktop app (macOS+Windows), auto prerelease for `-beta`/`-rc` tags |
@@ -165,7 +176,7 @@ OTel and Tailscale variants are not pre-built — build from source with the app
 ### Tag Pattern Safety
 
 - `release.yaml`: tag-triggered (`v[0-9]+.[0-9]+.[0-9]+`) — clean semver only, no beta/rc
-- `dev-beta-release.yaml`: branch-triggered on `dev`; creates `vX.Y.Z-beta.N` tags after CI passes
+- `dev-beta-release.yaml`: branch-triggered on `dev`; creates `vX.Y.Z-beta.N` tags after CI passes, then deploys that tag to zuey via the protected gateway upgrade endpoint
 - `release-beta.yaml`: tag-triggered (`v*-beta*`, `v*-rc*`) — never matches clean semver
 - `release-desktop.yaml`: tag-triggered (`lite-v*`) — `lite-` prefix prevents overlap
 - Stable and desktop tag patterns remain distinct. `dev` branch pushes create beta releases only after CI passes

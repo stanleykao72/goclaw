@@ -64,6 +64,8 @@ Each tool carries structured metadata describing side-effect class, group member
 
 Capabilities are inferred from tool name when no explicit metadata is registered. The policy engine can use capability class to gate entire sets (e.g. restrict an agent to read-only tools).
 
+The agent loop also uses this metadata for parallel tool-call scheduling. Only registered read-only tools are eligible for bounded parallel raw I/O. Mutating, async, MCP-bridged, `exec`/`bash`, `wait`, and unknown tools stay sequential by default. `PreToolUse` hooks run before any parallel I/O so hooks can block or rewrite arguments consistently.
+
 ---
 
 ## 4. Built-in Tool Inventory
@@ -164,8 +166,8 @@ Memory layers: L1 (`memory_search`) returns ranked abstracts; L2 (`memory_expand
 | Tool | Description |
 |---|---|
 | `read_image` | Analyze/describe images using vision AI (Gemini, Anthropic, OpenRouter, DashScope) |
-| `read_audio` | Transcribe audio to text |
-| `read_document` | Extract and analyze documents (PDF, images) via Gemini or Resolve service |
+| `read_audio` | Transcribe audio to text using Gemini File API, native OpenAI audio input, or OpenAI-compatible transcription models; unsupported provider/model routes fail closed instead of sending audio as image data |
+| `read_document` | Extract and analyze documents (PDF, DOCX, images). Supports local-first extraction via pdftotext/pandoc before falling back to cloud vision (opt-in via config) |
 | `read_video` | Analyze/transcribe video content |
 
 ### Skills & Content
@@ -215,6 +217,23 @@ User-facing parameter schemas for the most commonly configured tools.
 - `primary`: provider (`elevenlabs`, `openai`, `edge`, `minimax`).
 - Per-agent overrides: `agent.other_config.tts_voice_id`, `agent.other_config.tts_model_id`.
 
+### `document_parser` config shape
+```json
+{
+  "local_first": false,
+  "max_pages": 200,
+  "timeout_sec": 30,
+  "min_text_len": 16
+}
+```
+Controls local-first document text extraction in the `read_document` tool.
+- `local_first`: Enable local extraction via `pdftotext` (PDF) and `pandoc` (DOCX) before cloud vision fallback (default `false` — opt-in). Requires binaries on PATH; present in `full` Docker variant or builds with `ENABLE_FULL_SKILLS=true`.
+- `max_pages`: Page limit for PDF extraction (default 200). Passed to `pdftotext -l`.
+- `timeout_sec`: Per-extraction timeout in seconds (default 30). Process group killed on timeout.
+- `min_text_len`: Minimum characters (after trim) to consider extraction successful; shorter output triggers cloud fallback (default 16).
+
+**Note:** Config values are captured at tool construction (startup) and not picked up by hot-reload. Binary availability is re-checked per call, so runtime binary installations are detected without restart. Any extraction miss (disabled, unsupported mime, missing binary, timeout, empty output) transparently falls back to the cloud vision chain with no caller-visible difference.
+
 ### Custom tool definition
 ```json
 {
@@ -245,6 +264,32 @@ User-facing parameter schemas for the most commonly configured tools.
 }
 ```
 Available presets: `gh`, `gcloud`, `aws`, `kubectl`, `terraform`.
+
+### Credentialed CLI keyword allowlist
+
+`config.tools.commandKeywordAllowlist` lets operators allow specific product or security vocabulary inside selected credentialed CLI content arguments without disabling `deny_args`.
+
+Example:
+
+```json
+{
+  "tools": {
+    "commandKeywordAllowlist": [
+      {
+        "id": "github-content",
+        "command": "gh",
+        "subcommands": ["issue create", "issue edit", "pr create", "pr comment"],
+        "args": ["--body", "--title"],
+        "argPositions": [],
+        "keywords": ["secret", "secrets", "token", "credential"],
+        "reason": "Allow security vocabulary in GitHub issue and PR prose"
+      }
+    ]
+  }
+}
+```
+
+The rule above allows `gh issue create --body "secret rotation notes"` but still blocks command paths like `gh secret set TOKEN`. `argPositions` are 0-based after the matched subcommand. The scanner evaluates command arguments only; it does not read the contents of files passed through arguments such as `--body-file`.
 
 ---
 
@@ -346,6 +391,13 @@ Custom tools are shell-based tools defined at runtime via the HTTP API — no re
 | `env` | no | Encrypted environment variables injected at runtime |
 | `enabled` | no | Toggle without deleting (default true) |
 
+Credentialed CLI env entries support two API/UI kinds:
+
+- `sensitive` (default): encrypted at rest, masked in normal API responses, replace-only in UI, and flattened only at credential injection time.
+- `value`: encrypted at rest but visible to authorized admins in API/UI for non-secret settings such as public URLs, domains, limits, regions, and feature flags.
+
+Legacy env JSON like `{"TOKEN":"..."}` is still accepted and treated as `sensitive`.
+
 **Execution:** Template placeholders are rendered with shell-escaped argument values, then run via `sh -c`. The same deny-pattern check as the `exec` tool applies — no reverse shells, no `curl | sh`, etc.
 
 **Scope:**
@@ -363,6 +415,35 @@ Tool output is automatically scrubbed before being returned to the LLM or the us
 **Dynamic scrubbing** — values can be registered at runtime (e.g. server IPs, deployment-specific tokens). Thread-safe; checked alongside static patterns on every tool result.
 
 The exact patterns are intentionally not published here (defense-in-depth). The scrubber is always enabled in the registry by default.
+
+### 8a. Credential adapter framework
+
+For tool binaries that need per-user typed credentials (PAT, SSH key,
+kubeconfig, `.pgpass`, etc.), the `CredentialAdapter` interface in
+`internal/tools/credential_adapter.go` transforms a stored credential into
+the argv/env/ephemeral-file shape the binary expects.
+
+- **`Name() string`** — the value stored in `secure_cli_binaries.adapter_name`.
+- **`ShouldInject(argv []string) bool`** — gate that skips local-only
+  subcommands (e.g. `git status` does not trigger injection).
+- **`Prepare(...) (*Injection, error)`** — returns the four-field
+  `Injection{ArgvPrefix, Env, Cleanup, ScrubValues}` consumed by
+  `credentialed_exec.go`.
+
+Adapters are registered in their own `init()` via `RegisterAdapter`. Lookup
+falls back to the `passthrough` no-op adapter on unknown/empty names, so
+unrelated presets (`gh`, `aws`, `gcloud`, `kubectl`, `terraform`, `gws`)
+keep their legacy env-injection path bit-for-bit.
+
+Per-injection audit: every adapter run emits one
+`slog.Warn("security.system_env_injection", …)` line with the field schema
+documented in [09-security.md § 14](./09-security.md#14-cli-credential-adapters).
+
+To author a new adapter (kubectl, docker, npm, aws, …), follow the worked
+mappings + interface-validation gate in
+[credential-adapter-playbook.md](./credential-adapter-playbook.md). User-facing
+config for the shipped `git` adapter is documented in
+[git-credential-adapter.md](./git-credential-adapter.md).
 
 ---
 
@@ -382,6 +463,8 @@ Merged settings map:
 
 Merge is per-tool-name: tenant entry for `web_search` wins wholesale over global default — no deep field merge. Tools that do not read the settings map are unaffected.
 
+`exec` reads `settings.timeout_seconds` for host command execution. The REST API validates `exec` settings as a JSON object with optional integer `timeout_seconds` in the `1..3600` range. Missing or invalid runtime values fall back to 60 seconds, while values above the maximum are clamped to 3600 seconds for defense in depth. Docker sandbox tool calls still use `sandbox_config.timeout_sec`; this setting only controls the host `exec` built-in.
+
 **Secret vs non-secret split:**
 - Non-secret config (provider priorities, limits, domain policies) → `builtin_tool_tenant_configs.settings`
 - Secrets (API keys, tokens) → `config_secrets` table (AES-256-GCM encrypted, tenant-scoped)
@@ -390,11 +473,11 @@ Never put credentials in the settings JSON blob — backend does not validate th
 
 **Cache invalidation:** settings changes propagate via pub/sub (tenant-scoped). Next agent turn re-resolves automatically.
 
-**Tenant admin workflow:** Settings → Builtin Tools → gear icon → JSON editor → Save. Changes take effect on the next agent turn. "Reset to default" reverts to platform defaults.
+**Tenant admin workflow:** Settings → Builtin Tools → gear icon → typed form when available, otherwise JSON editor → Save. Changes take effect on the next agent turn. "Reset to default" reverts to platform defaults.
 
 **Master-scope guard:** Writes to global `builtin_tools` table require master tenant scope. Tenant admins use the `/tenant-config` endpoint. Same guard applies on the WS config methods.
 
-Current adopters: `web_search`, `web_fetch`, `tts`, `create_image`, `read_image`, `create_audio`, `read_audio`, `knowledge_graph_search`.
+Current adopters: `exec`, `web_search`, `web_fetch`, `tts`, `create_image`, `read_image`, `create_audio`, `read_audio`, `knowledge_graph_search`.
 
 ### Shell Deny-Groups (Runtime Config)
 
@@ -406,7 +489,7 @@ Current adopters: `web_search`, `web_fetch`, `tts`, `create_image`, `read_image`
 - Per-key: agent value takes precedence over global value
 - Multi-tenant invariant: each tenant's config is isolated
 
-**Live reload:** Changes to `config.tools.shellDenyGroups` propagate via `bus.TopicConfigChanged` pub/sub. Next agent turn automatically applies new toggles.
+**Live reload:** Changes to `config.tools.shellDenyGroups` and `config.tools.commandKeywordAllowlist` propagate via `bus.TopicConfigChanged` pub/sub. Next agent turn automatically applies new toggles.
 
 **Deny-group classes** (from `internal/tools/shell_deny_groups.go` — all denied by default):
 

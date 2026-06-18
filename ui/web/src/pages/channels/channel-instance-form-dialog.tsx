@@ -18,6 +18,8 @@ import { CHANNEL_TYPES } from "@/constants/channels";
 import { channelInstanceSchema, type ChannelInstanceFormData } from "@/schemas/channel.schema";
 import { ChannelInstanceFormStep } from "./channel-instance-form-step";
 import { flattenConfig, unflattenConfig } from "@/lib/config-flatten";
+import { BitrixPortalCreateModal } from "./bitrix24/bitrix-portal-create-modal";
+import { useBitrixPortals } from "./bitrix24/use-bitrix-portals";
 
 type WizardStep = "form" | "auth" | "config";
 
@@ -47,6 +49,12 @@ export function ChannelInstanceFormDialog({
   const [step, setStep] = useState<WizardStep>("form");
   const [createdInstanceId, setCreatedInstanceId] = useState<string | null>(null);
   const [authCompleted, setAuthCompleted] = useState(false);
+  const [portalModalOpen, setPortalModalOpen] = useState(false);
+  const [resumePortalName, setResumePortalName] = useState<string | undefined>(undefined);
+  // Cache portal list so submit can verify the chosen portal is `installed`
+  // before calling the channel create RPC — prevents creating a channel that
+  // would fail at Start() because the portal hasn't completed authorization.
+  const portalsQuery = useBitrixPortals({ enabled: open });
 
   const form = useForm<ChannelInstanceFormData>({
     resolver: zodResolver(channelInstanceSchema),
@@ -126,7 +134,12 @@ export function ChannelInstanceFormDialog({
     setConfigValues((prev) => ({ ...prev, [key]: value }));
   }, []);
 
-  const coerceBoolSelects = (cfg: Record<string, unknown>, schema: FieldDef[]) => {
+  const coerceSelects = (cfg: Record<string, unknown>, schema: FieldDef[]) => {
+    const selectKeys = new Set(schema.filter((f) => f.type === "select").map((f) => f.key));
+    for (const key of selectKeys) {
+      if (cfg[key] === "inherit") delete cfg[key];
+    }
+
     const boolSelectKeys = new Set(
       schema.filter((f) => f.type === "select" && f.options?.some((o) => o.value === "true")).map((f) => f.key),
     );
@@ -151,7 +164,15 @@ export function ChannelInstanceFormDialog({
     const cleanConfig = Object.fromEntries(
       Object.entries(configValues).filter(([, v]) => v !== undefined && v !== "" && v !== null),
     );
-    coerceBoolSelects(cleanConfig, configSchema[values.channelType] ?? []);
+    coerceSelects(cleanConfig, configSchema[values.channelType] ?? []);
+
+    // Drop the legacy bitrix24 public_url field if it leaked from an older
+    // channel row's config — gateway now derives the URL from the portal's
+    // install callback (see plans/260513-1648-bitrix24-portal-self-service-ux).
+    // Keeping it in submit re-saves dead data forever.
+    if (values.channelType === "bitrix24") {
+      delete cleanConfig.public_url;
+    }
 
     // Config required check (create-only): validate after cleanConfig is built so empty strings are caught.
     if (!instance) {
@@ -161,6 +182,26 @@ export function ChannelInstanceFormDialog({
       );
       if (missingCfg.length > 0) {
         setError(t("form.errors.requiredFields", { fields: missingCfg.map((f: FieldDef) => f.label).join(", ") }));
+        return;
+      }
+    }
+
+    // Bitrix24 portal must be installed before a channel can reference it —
+    // the channel runtime calls imbot.register on Start() which needs OAuth
+    // tokens. Block here so the user gets a clear error instead of a
+    // mysterious "channel won't start" later. Edit flow skipped because the
+    // portal may have been valid when the channel was first created.
+    if (!instance && values.channelType === "bitrix24" && cleanConfig.portal) {
+      const portals = portalsQuery.data ?? [];
+      const selected = portals.find((p) => p.name === cleanConfig.portal);
+      if (!selected) {
+        setError(t("bitrix24.errors.portalRequired", { defaultValue: "Please select a portal." }));
+        return;
+      }
+      if (!selected.installed) {
+        setError(t("bitrix24.errors.portalNotInstalled", {
+          defaultValue: "This portal has not completed authorization. Authorize it before creating a channel.",
+        }));
         return;
       }
     }
@@ -208,7 +249,7 @@ export function ChannelInstanceFormDialog({
     const cleanConfig = Object.fromEntries(
       Object.entries(configValues).filter(([, v]) => v !== undefined && v !== "" && v !== null),
     );
-    coerceBoolSelects(cleanConfig, configSchema[channelType] ?? []);
+    coerceSelects(cleanConfig, configSchema[channelType] ?? []);
     setLoading(true);
     setError("");
     try {
@@ -272,6 +313,14 @@ export function ChannelInstanceFormDialog({
             onCancel={() => onOpenChange(false)}
             onSubmit={handleSubmit}
             submitLabel={submitLabel}
+            onPortalCreateRequest={channelType === "bitrix24" ? () => {
+              setResumePortalName(undefined);
+              setPortalModalOpen(true);
+            } : undefined}
+            onPortalResumeAuthorize={channelType === "bitrix24" ? (portalName) => {
+              setResumePortalName(portalName);
+              setPortalModalOpen(true);
+            } : undefined}
           />
         )}
 
@@ -301,6 +350,22 @@ export function ChannelInstanceFormDialog({
           </>
         )}
       </DialogContent>
+      {channelType === "bitrix24" && (
+        <BitrixPortalCreateModal
+          open={portalModalOpen}
+          onOpenChange={(v) => {
+            setPortalModalOpen(v);
+            if (!v) setResumePortalName(undefined);
+          }}
+          resumePortalName={resumePortalName}
+          onCreated={(portalName) => {
+            setPortalModalOpen(false);
+            setResumePortalName(undefined);
+            // Auto-select the just-installed (or resumed) portal in the channel form.
+            handleConfigChange("portal", portalName);
+          }}
+        />
+      )}
     </Dialog>
   );
 }

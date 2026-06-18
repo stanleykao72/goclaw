@@ -12,11 +12,13 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
 
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
+	"github.com/nextlevelbuilder/goclaw/internal/config"
 	"github.com/nextlevelbuilder/goclaw/internal/skills"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
@@ -670,6 +672,65 @@ func TestHandleUpload_ReturnsGrantErrors(t *testing.T) {
 	}
 }
 
+func TestResolveSkillUploadLimitMBPrecedenceAndClamp(t *testing.T) {
+	ctx := store.WithTenantID(context.Background(), store.MasterTenantID)
+	handler, _, _, _ := newTestUploadHandler(t)
+	handler.SetUploadLimitConfig(config.SkillsConfig{MaxUploadSizeMB: 30})
+
+	if got := handler.resolveSkillUploadLimitMB(ctx, nil); got != 30 {
+		t.Fatalf("global limit = %d, want 30", got)
+	}
+	if got := handler.resolveSkillUploadLimitMB(ctx, map[string]string{"max_upload_size_mb": "100"}); got != 100 {
+		t.Fatalf("frontmatter limit = %d, want 100", got)
+	}
+
+	handler.SetSystemConfigStore(&skillUploadSystemConfigStore{data: map[string]string{skillUploadMaxSizeConfigKey: "40"}})
+	if got := handler.resolveSkillUploadLimitMB(ctx, map[string]string{"max_upload_size_mb": "100"}); got != 40 {
+		t.Fatalf("tenant limit = %d, want 40", got)
+	}
+
+	handler.SetSystemConfigStore(&skillUploadSystemConfigStore{data: map[string]string{skillUploadMaxSizeConfigKey: "999"}})
+	if got := handler.resolveSkillUploadLimitMB(ctx, nil); got != config.MaxSkillMaxUploadSizeMB {
+		t.Fatalf("clamped tenant limit = %d, want %d", got, config.MaxSkillMaxUploadSizeMB)
+	}
+}
+
+func TestUploadRejectsZipAboveConfiguredLimit(t *testing.T) {
+	handler, _, ctx, _ := newTestUploadHandler(t)
+	handler.SetUploadLimitConfig(config.SkillsConfig{MaxUploadSizeMB: 1})
+
+	req := newZipUploadRequestWithBinary(t, ctx, map[string][]byte{
+		"SKILL.md":  []byte(skillMarkdown("Large Skill", "large-skill")),
+		"large.bin": bytes.Repeat([]byte("x"), (1<<20)+1),
+	})
+	w := httptest.NewRecorder()
+	handler.handleUpload(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "exceeds") || !strings.Contains(w.Body.String(), "1 MB") {
+		t.Fatalf("body = %s, want configured upload limit error", w.Body.String())
+	}
+}
+
+func TestUploadAllowsFrontmatterLimitAboveGlobalDefault(t *testing.T) {
+	handler, _, ctx, _ := newTestUploadHandler(t)
+	handler.SetUploadLimitConfig(config.SkillsConfig{MaxUploadSizeMB: 1})
+	skillMD := "---\nname: Video Skill\nslug: video-skill\nmax_upload_size_mb: 2\n---\nSkill body\n"
+
+	req := newZipUploadRequestWithBinary(t, ctx, map[string][]byte{
+		"SKILL.md":  []byte(skillMD),
+		"large.bin": bytes.Repeat([]byte("x"), (1<<20)+(128<<10)),
+	})
+	w := httptest.NewRecorder()
+	handler.handleUpload(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+}
+
 func newTestUploadHandler(t *testing.T) (*SkillsHandler, *skillManageStoreStub, context.Context, string) {
 	t.Helper()
 
@@ -738,6 +799,43 @@ func newZipUploadRequestWithManagers(t *testing.T, ctx context.Context, files ma
 	return req.WithContext(ctx)
 }
 
+func newZipUploadRequestWithBinary(t *testing.T, ctx context.Context, files map[string][]byte) *http.Request {
+	t.Helper()
+
+	var zipBuf bytes.Buffer
+	zw := zip.NewWriter(&zipBuf)
+	for name, content := range files {
+		header := &zip.FileHeader{Name: name, Method: zip.Store}
+		w, err := zw.CreateHeader(header)
+		if err != nil {
+			t.Fatalf("zip create %s: %v", name, err)
+		}
+		if _, err := w.Write(content); err != nil {
+			t.Fatalf("zip write %s: %v", name, err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("zip close: %v", err)
+	}
+
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	part, err := mw.CreateFormFile("file", "skill.zip")
+	if err != nil {
+		t.Fatalf("multipart file: %v", err)
+	}
+	if _, err := part.Write(zipBuf.Bytes()); err != nil {
+		t.Fatalf("multipart write: %v", err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatalf("multipart close: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/skills/upload", &body)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	return req.WithContext(ctx)
+}
+
 func newUploadManagerIDsFormRequest(t *testing.T, raw string) *http.Request {
 	t.Helper()
 
@@ -759,14 +857,46 @@ func skillMarkdown(name, slug string) string {
 }
 
 type skillManageStoreStub struct {
-	baseDir     string
-	version     int64
-	nextBySlug  map[string]int
-	skills      map[uuid.UUID]store.SkillInfo
-	systemDirs  map[string]string
-	hashBySlug  map[string]string // slug -> SKILL.md content hash (most recent)
-	grantCalls  []skillGrantCall
-	grantErrors map[uuid.UUID]error
+	baseDir        string
+	version        int64
+	nextBySlug     map[string]int
+	skills         map[uuid.UUID]store.SkillInfo
+	systemDirs     map[string]string
+	hashBySlug     map[string]string // slug -> SKILL.md content hash (most recent)
+	grantCalls     []skillGrantCall
+	userGrantCalls []skillUserGrantCall
+	grantErrors    map[uuid.UUID]error
+	lastUpdates    map[uuid.UUID]map[string]any
+	agentGrants    map[uuid.UUID][]store.SkillAgentGrantInfo
+	userGrants     map[uuid.UUID][]store.SkillUserGrantInfo
+}
+
+type skillUploadSystemConfigStore struct {
+	data map[string]string
+}
+
+func (s *skillUploadSystemConfigStore) Get(_ context.Context, key string) (string, error) {
+	if v, ok := s.data[key]; ok {
+		return v, nil
+	}
+	return "", errors.New("not found")
+}
+
+func (s *skillUploadSystemConfigStore) Set(_ context.Context, key, value string) error {
+	if s.data == nil {
+		s.data = map[string]string{}
+	}
+	s.data[key] = value
+	return nil
+}
+
+func (s *skillUploadSystemConfigStore) Delete(_ context.Context, key string) error {
+	delete(s.data, key)
+	return nil
+}
+
+func (s *skillUploadSystemConfigStore) List(_ context.Context) (map[string]string, error) {
+	return s.data, nil
 }
 
 type skillGrantCall struct {
@@ -777,6 +907,12 @@ type skillGrantCall struct {
 	CanManage bool
 }
 
+type skillUserGrantCall struct {
+	SkillID   uuid.UUID
+	UserID    string
+	GrantedBy string
+}
+
 func newSkillManageStoreStub(baseDir string) *skillManageStoreStub {
 	return &skillManageStoreStub{
 		baseDir:     baseDir,
@@ -785,10 +921,13 @@ func newSkillManageStoreStub(baseDir string) *skillManageStoreStub {
 		systemDirs:  map[string]string{},
 		hashBySlug:  map[string]string{},
 		grantErrors: map[uuid.UUID]error{},
+		lastUpdates: map[uuid.UUID]map[string]any{},
+		agentGrants: map[uuid.UUID][]store.SkillAgentGrantInfo{},
+		userGrants:  map[uuid.UUID][]store.SkillUserGrantInfo{},
 	}
 }
 
-func (s *skillManageStoreStub) seedSystemSkill(slug, dir string) {
+func (s *skillManageStoreStub) seedSystemSkill(slug, dir string) uuid.UUID {
 	id := uuid.New()
 	s.skills[id] = store.SkillInfo{
 		ID:       id.String(),
@@ -803,6 +942,7 @@ func (s *skillManageStoreStub) seedSystemSkill(slug, dir string) {
 		IsSystem: true,
 	}
 	s.systemDirs[slug] = dir
+	return id
 }
 
 func (s *skillManageStoreStub) seedCustomSkill(slug, dir, status string, missing []string) uuid.UUID {
@@ -811,6 +951,9 @@ func (s *skillManageStoreStub) seedCustomSkill(slug, dir, status string, missing
 
 func (s *skillManageStoreStub) seedCustomSkillForTenant(tenantID uuid.UUID, slug, dir, status string, missing []string) uuid.UUID {
 	id := uuid.New()
+	if s.nextBySlug[slug] < 1 {
+		s.nextBySlug[slug] = 1
+	}
 	s.skills[id] = store.SkillInfo{
 		ID:          id.String(),
 		TenantID:    tenantID.String(),
@@ -915,6 +1058,20 @@ func (s *skillManageStoreStub) UpdateSkill(ctx context.Context, id uuid.UUID, up
 	if status, ok := updates["status"].(string); ok {
 		skill.Status = status
 	}
+	if visibility, ok := updates["visibility"].(string); ok {
+		skill.Visibility = visibility
+	}
+	if version, ok := updates["version"].(int); ok {
+		skill.Version = version
+		if version > s.nextBySlug[skill.Slug] {
+			s.nextBySlug[skill.Slug] = version
+		}
+	}
+	if filePath, ok := updates["file_path"].(string); ok {
+		skill.BaseDir = filePath
+		skill.Path = filepath.Join(filePath, "SKILL.md")
+	}
+	s.lastUpdates[id] = maps.Clone(updates)
 	s.skills[id] = skill
 	return nil
 }
@@ -1011,21 +1168,99 @@ func (s *skillManageStoreStub) GrantToAgent(_ context.Context, skillID uuid.UUID
 func (s *skillManageStoreStub) RevokeFromAgent(context.Context, uuid.UUID, uuid.UUID) error {
 	return nil
 }
-func (s *skillManageStoreStub) GrantToUser(context.Context, uuid.UUID, string, string) error {
+func (s *skillManageStoreStub) GrantToUser(_ context.Context, skillID uuid.UUID, userID, grantedBy string) error {
+	s.userGrantCalls = append(s.userGrantCalls, skillUserGrantCall{SkillID: skillID, UserID: userID, GrantedBy: grantedBy})
 	return nil
 }
 func (s *skillManageStoreStub) RevokeFromUser(context.Context, uuid.UUID, string) error { return nil }
-func (s *skillManageStoreStub) ListWithGrantStatus(context.Context, uuid.UUID) ([]store.SkillWithGrantStatus, error) {
-	return nil, nil
+func (s *skillManageStoreStub) ListAccessible(ctx context.Context, agentID uuid.UUID, userID string) ([]store.SkillInfo, error) {
+	actorID := store.ActorIDFromContext(ctx)
+	if actorID == "" {
+		actorID = userID
+	}
+	out := make([]store.SkillInfo, 0, len(s.skills))
+	for id, skill := range s.skills {
+		if skill.Status != "active" || !skill.Enabled || !s.canAccessSkill(ctx, skill) {
+			continue
+		}
+		switch skill.Visibility {
+		case skills.VisibilityPublic:
+			out = append(out, skill)
+		case skills.VisibilityPrivate:
+			if skill.OwnerID == userID || skill.OwnerID == actorID {
+				out = append(out, skill)
+			}
+		case skills.VisibilityInternal:
+			if s.hasAgentGrant(id, agentID) || s.hasUserGrant(id, userID) || s.hasUserGrant(id, actorID) {
+				out = append(out, skill)
+			}
+		default:
+			if skill.IsSystem {
+				out = append(out, skill)
+			}
+		}
+	}
+	return out, nil
 }
-func (s *skillManageStoreStub) ListAgentGrantsForSkill(context.Context, uuid.UUID) ([]store.SkillAgentGrantInfo, error) {
-	return nil, nil
+func (s *skillManageStoreStub) ListWithGrantStatus(ctx context.Context, agentID uuid.UUID) ([]store.SkillWithGrantStatus, error) {
+	out := make([]store.SkillWithGrantStatus, 0, len(s.skills))
+	for id, skill := range s.skills {
+		if skill.Status != "active" || !s.canAccessSkill(ctx, skill) {
+			continue
+		}
+		row := store.SkillWithGrantStatus{
+			ID:          id,
+			Name:        skill.Name,
+			Slug:        skill.Slug,
+			Description: skill.Description,
+			Visibility:  skill.Visibility,
+			Version:     skill.Version,
+			IsSystem:    skill.IsSystem,
+		}
+		for _, grant := range s.agentGrants[id] {
+			if grant.AgentID == agentID {
+				row.Granted = true
+				row.CanManage = grant.CanManage
+				pinned := grant.PinnedVersion
+				row.PinnedVer = &pinned
+				break
+			}
+		}
+		out = append(out, row)
+	}
+	return out, nil
+}
+func (s *skillManageStoreStub) hasAgentGrant(skillID, agentID uuid.UUID) bool {
+	for _, grant := range s.agentGrants[skillID] {
+		if grant.AgentID == agentID {
+			return true
+		}
+	}
+	return false
+}
+func (s *skillManageStoreStub) hasUserGrant(skillID uuid.UUID, userID string) bool {
+	for _, grant := range s.userGrants[skillID] {
+		if grant.UserID == userID {
+			return true
+		}
+	}
+	return false
+}
+func (s *skillManageStoreStub) ListAgentGrantsForSkill(_ context.Context, skillID uuid.UUID) ([]store.SkillAgentGrantInfo, error) {
+	return append([]store.SkillAgentGrantInfo(nil), s.agentGrants[skillID]...), nil
+}
+func (s *skillManageStoreStub) ListUserGrantsForSkill(_ context.Context, skillID uuid.UUID) ([]store.SkillUserGrantInfo, error) {
+	return append([]store.SkillUserGrantInfo(nil), s.userGrants[skillID]...), nil
 }
 func (s *skillManageStoreStub) AgentCanManageSkill(context.Context, uuid.UUID, uuid.UUID) (bool, error) {
 	return false, nil
 }
-func (s *skillManageStoreStub) GetSkillFilePath(context.Context, uuid.UUID) (string, string, int, bool, bool) {
-	return "", "", 0, false, false
+func (s *skillManageStoreStub) GetSkillFilePath(ctx context.Context, id uuid.UUID) (string, string, int, bool, bool) {
+	skill, ok := s.skills[id]
+	if !ok || !s.canAccessSkill(ctx, skill) {
+		return "", "", 0, false, false
+	}
+	return skill.BaseDir, skill.Slug, skill.Version, skill.IsSystem, true
 }
 
 // ---------------------------------------------------------------------------

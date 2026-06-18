@@ -1,6 +1,7 @@
 package http
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -10,12 +11,25 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
+	"github.com/nextlevelbuilder/goclaw/internal/channelmemory"
 	"github.com/nextlevelbuilder/goclaw/internal/channels"
+	"github.com/nextlevelbuilder/goclaw/internal/config"
 	"github.com/nextlevelbuilder/goclaw/internal/i18n"
 	"github.com/nextlevelbuilder/goclaw/internal/permissions"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
 )
+
+// OrphanChannelCleaner runs channel-type-specific cleanup when a delete
+// arrives for a channel that's NOT loaded in the runtime Manager (e.g. it
+// was disabled so InstanceLoader removed it). Closure injected from
+// cmd/gateway.go captures the per-channel dependencies (portal store,
+// encryption key) so the handler doesn't need to import per-channel
+// packages directly.
+//
+// Returns nil for no-op cases (nothing to clean) so callers can ignore the
+// error in those situations; real failures (store read, decode) propagate.
+type OrphanChannelCleaner func(ctx context.Context, tenantID uuid.UUID, configJSON []byte) error
 
 // ChannelInstancesHandler handles channel instance CRUD endpoints.
 type ChannelInstancesHandler struct {
@@ -26,6 +40,15 @@ type ChannelInstancesHandler struct {
 	tenantStore     store.TenantStore
 	msgBus          *bus.MessageBus
 	memberResolver  channels.MemberResolver // optional — enriches file_writer metadata on addwriter
+	channelMgr      *channels.Manager       // optional — enables ChannelDestroyer hook on delete
+	memoryService   *channelmemory.Service
+	mcpStore        store.MCPServerStore
+	secureCLIStore  store.SecureCLIStore
+	mcpContextStore store.MCPContextAdminStore
+	cliContextStore store.SecureCLIContextAdminStore
+	// orphanCleaners is keyed by channel_type; called when channelMgr.GetChannel
+	// returns false. Keeps handler agnostic of per-channel packages.
+	orphanCleaners map[string]OrphanChannelCleaner
 }
 
 // NewChannelInstancesHandler creates a handler for channel instance management endpoints.
@@ -37,6 +60,39 @@ func NewChannelInstancesHandler(s store.ChannelInstanceStore, agentStore store.A
 // metadata when the caller supplies neither DisplayName nor Username.
 func (h *ChannelInstancesHandler) SetMemberResolver(r channels.MemberResolver) {
 	h.memberResolver = r
+}
+
+// SetChannelManager wires the channel Manager so handleDelete can invoke
+// ChannelDestroyer.Destroy() before removing the DB row — required for
+// Bitrix24 to imbot.unregister its bot on portal-side. Setter-pattern (vs
+// constructor param) because the Manager is created AFTER this handler
+// in cmd/gateway.go's startup ordering.
+func (h *ChannelInstancesHandler) SetChannelManager(mgr *channels.Manager) {
+	h.channelMgr = mgr
+}
+
+// SetCapabilityStores wires MCP and Secure CLI stores for channel-context
+// capability visibility. Kept as a setter to preserve startup ordering.
+func (h *ChannelInstancesHandler) SetCapabilityStores(mcpStore store.MCPServerStore, secureCLIStore store.SecureCLIStore) {
+	h.mcpStore = mcpStore
+	h.secureCLIStore = secureCLIStore
+	if contextStore, ok := mcpStore.(store.MCPContextAdminStore); ok {
+		h.mcpContextStore = contextStore
+	}
+	if contextStore, ok := secureCLIStore.(store.SecureCLIContextAdminStore); ok {
+		h.cliContextStore = contextStore
+	}
+}
+
+// RegisterOrphanCleaner registers a per-channel-type cleanup function that
+// fires during handleDelete when the channel is no longer loaded in the
+// Manager (typically because admin disabled it). Without this, deleting a
+// disabled Bitrix24 channel leaves the bot as a zombie on the portal.
+func (h *ChannelInstancesHandler) RegisterOrphanCleaner(channelType string, fn OrphanChannelCleaner) {
+	if h.orphanCleaners == nil {
+		h.orphanCleaners = make(map[string]OrphanChannelCleaner)
+	}
+	h.orphanCleaners[channelType] = fn
 }
 
 // RegisterRoutes registers all channel instance routes on the given mux.
@@ -69,9 +125,42 @@ func (h *ChannelInstancesHandler) RegisterRoutes(mux *http.ServeMux) {
 	if h.configPermStore != nil {
 		mux.HandleFunc("GET /v1/channels/instances/{id}/writers/groups", h.auth(h.handleWriterGroups))
 		mux.HandleFunc("GET /v1/channels/instances/{id}/writers", h.auth(h.handleListWriters))
+		mux.HandleFunc("POST /v1/channels/instances/{id}/writers/test", h.auth(h.handleTestWriter))
 		mux.HandleFunc("POST /v1/channels/instances/{id}/writers", h.adminAuth(h.handleAddWriter))
 		mux.HandleFunc("DELETE /v1/channels/instances/{id}/writers/{userId}", h.adminAuth(h.handleRemoveWriter))
 	}
+
+	if h.contactStore != nil {
+		mux.HandleFunc("GET /v1/channels/instances/{id}/contexts", h.auth(h.handleListContexts))
+		mux.HandleFunc("GET /v1/channels/instances/{id}/contexts/{scopeType}/{scopeKey}/members", h.auth(h.handleListContextMembers))
+	}
+	mux.HandleFunc("GET /v1/channels/instances/{id}/contexts/{scopeType}/{scopeKey}/capabilities", h.auth(h.handleListContextCapabilities))
+	mux.HandleFunc("GET /v1/channels/instances/{id}/contexts/{scopeType}/{scopeKey}/mcp-grants", h.adminAuth(h.handleListContextMCPGrants))
+	mux.HandleFunc("PUT /v1/channels/instances/{id}/contexts/{scopeType}/{scopeKey}/mcp-grants/{serverID}", h.adminAuth(h.handleUpsertContextMCPGrant))
+	mux.HandleFunc("DELETE /v1/channels/instances/{id}/contexts/{scopeType}/{scopeKey}/mcp-grants/{serverID}", h.adminAuth(h.handleDeleteContextMCPGrant))
+	mux.HandleFunc("GET /v1/channels/instances/{id}/contexts/{scopeType}/{scopeKey}/mcp-credentials", h.adminAuth(h.handleListContextMCPCredentials))
+	mux.HandleFunc("PUT /v1/channels/instances/{id}/contexts/{scopeType}/{scopeKey}/mcp-credentials/{serverID}", h.adminAuth(h.handleSetContextMCPCredentials))
+	mux.HandleFunc("DELETE /v1/channels/instances/{id}/contexts/{scopeType}/{scopeKey}/mcp-credentials/{serverID}", h.adminAuth(h.handleDeleteContextMCPCredentials))
+	mux.HandleFunc("GET /v1/channels/instances/{id}/contexts/{scopeType}/{scopeKey}/cli-grants", h.adminAuth(h.handleListContextCLIGrants))
+	mux.HandleFunc("PUT /v1/channels/instances/{id}/contexts/{scopeType}/{scopeKey}/cli-grants/{binaryID}", h.adminAuth(h.handleUpsertContextCLIGrant))
+	mux.HandleFunc("DELETE /v1/channels/instances/{id}/contexts/{scopeType}/{scopeKey}/cli-grants/{binaryID}", h.adminAuth(h.handleDeleteContextCLIGrant))
+	mux.HandleFunc("GET /v1/channels/instances/{id}/contexts/{scopeType}/{scopeKey}/cli-credentials", h.adminAuth(h.handleListContextCLICredentials))
+	mux.HandleFunc("PUT /v1/channels/instances/{id}/contexts/{scopeType}/{scopeKey}/cli-credentials/{binaryID}", h.adminAuth(h.handleSetContextCLICredentials))
+	mux.HandleFunc("DELETE /v1/channels/instances/{id}/contexts/{scopeType}/{scopeKey}/cli-credentials/{binaryID}", h.adminAuth(h.handleDeleteContextCLICredentials))
+
+	if h.memoryService != nil {
+		mux.HandleFunc("GET /v1/channels/instances/{id}/memory-extraction", h.auth(h.handleMemoryExtractionStatus))
+		mux.HandleFunc("PUT /v1/channels/instances/{id}/memory-extraction/settings", h.adminAuth(h.handleMemoryExtractionSettings))
+		mux.HandleFunc("POST /v1/channels/instances/{id}/memory-extraction/run", h.adminAuth(h.handleMemoryExtractionRun))
+		mux.HandleFunc("GET /v1/channels/instances/{id}/memory-extraction/items", h.auth(h.handleMemoryExtractionItems))
+		mux.HandleFunc("POST /v1/channels/instances/{id}/memory-extraction/items/{itemID}/approve", h.adminAuth(h.handleMemoryExtractionApprove))
+		mux.HandleFunc("POST /v1/channels/instances/{id}/memory-extraction/items/{itemID}/reject", h.adminAuth(h.handleMemoryExtractionReject))
+		mux.HandleFunc("DELETE /v1/channels/instances/{id}/memory-extraction/items/{itemID}", h.adminAuth(h.handleMemoryExtractionDelete))
+	}
+}
+
+func (h *ChannelInstancesHandler) SetMemoryExtractionService(svc *channelmemory.Service) {
+	h.memoryService = svc
 }
 
 func (h *ChannelInstancesHandler) auth(next http.HandlerFunc) http.HandlerFunc {
@@ -82,13 +171,13 @@ func (h *ChannelInstancesHandler) adminAuth(next http.HandlerFunc) http.HandlerF
 	return requireAuth(permissions.RoleAdmin, next)
 }
 
-func (h *ChannelInstancesHandler) emitCacheInvalidate() {
+func (h *ChannelInstancesHandler) emitCacheInvalidate(key string) {
 	if h.msgBus == nil {
 		return
 	}
 	h.msgBus.Broadcast(bus.Event{
 		Name:    protocol.EventCacheInvalidate,
-		Payload: bus.CacheInvalidatePayload{Kind: bus.CacheKindChannelInstances},
+		Payload: bus.CacheInvalidatePayload{Kind: bus.CacheKindChannelInstances, Key: key},
 	})
 }
 
@@ -180,7 +269,7 @@ func (h *ChannelInstancesHandler) handleCreate(w http.ResponseWriter, r *http.Re
 		ChannelType: body.ChannelType,
 		AgentID:     agentID,
 		Credentials: body.Credentials,
-		Config:      body.Config,
+		Config:      config.NormalizeChannelInstanceConfigRaw(body.ChannelType, body.Config),
 		Enabled:     enabled,
 		CreatedBy:   userID,
 	}
@@ -191,7 +280,7 @@ func (h *ChannelInstancesHandler) handleCreate(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	h.emitCacheInvalidate()
+	h.emitCacheInvalidate(inst.ID.String())
 	emitAudit(h.msgBus, r, "channel_instance.created", "channel_instance", inst.ID.String())
 	writeJSON(w, http.StatusCreated, maskInstanceHTTP(*inst))
 }
@@ -229,6 +318,7 @@ func (h *ChannelInstancesHandler) handleUpdate(w http.ResponseWriter, r *http.Re
 
 	// Allowlist: only permit known channel instance columns.
 	updates = filterAllowedKeys(updates, channelInstanceAllowedFields)
+	h.normalizeChannelInstanceConfigUpdate(r.Context(), id, updates)
 
 	if err := h.store.Update(r.Context(), id, updates); err != nil {
 		slog.Error("channel_instances.update", "error", err)
@@ -236,9 +326,23 @@ func (h *ChannelInstancesHandler) handleUpdate(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	h.emitCacheInvalidate()
+	h.emitCacheInvalidate("")
 	emitAudit(h.msgBus, r, "channel_instance.updated", "channel_instance", id.String())
 	writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
+}
+
+func (h *ChannelInstancesHandler) normalizeChannelInstanceConfigUpdate(ctx context.Context, id uuid.UUID, updates map[string]any) {
+	value, ok := updates["config"]
+	if !ok {
+		return
+	}
+	channelType, _ := updates["channel_type"].(string)
+	if channelType == "" {
+		if inst, err := h.store.Get(ctx, id); err == nil {
+			channelType = inst.ChannelType
+		}
+	}
+	updates["config"] = config.NormalizeChannelInstanceConfigValue(channelType, value)
 }
 
 func (h *ChannelInstancesHandler) handleDelete(w http.ResponseWriter, r *http.Request) {
@@ -260,13 +364,48 @@ func (h *ChannelInstancesHandler) handleDelete(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	// Best-effort: notify the channel impl so external resources (e.g. the
+	// Bitrix24 imbot.register'd bot) get cleaned up BEFORE the DB row is
+	// removed. Order matters: deleting the row first triggers a cache
+	// invalidate → InstanceLoader Reload Stop's the channel and clears
+	// in-memory botID, leaving the upstream bot orphaned.
+	//
+	// Two paths:
+	//   1. Channel still loaded in Manager → ChannelDestroyer.Destroy() —
+	//      uses cached botID, calls imbot.unregister directly via the live
+	//      Client. This is the normal path.
+	//   2. Channel NOT in Manager (e.g. admin disabled it earlier, so
+	//      InstanceLoader.Reload removed it) → fall back to a registered
+	//      orphan cleaner for this channel type. Reads bot_id from
+	//      persisted portal state. Without this branch, deleting a disabled
+	//      Bitrix24 channel orphans the bot on the portal.
+	//
+	// Channels without external state (Telegram, Discord, Slack, …) don't
+	// implement ChannelDestroyer AND don't register an orphan cleaner —
+	// both branches no-op for them.
+	if h.channelMgr != nil {
+		if ch, ok := h.channelMgr.GetChannel(inst.Name); ok {
+			if destroyer, ok := ch.(channels.ChannelDestroyer); ok {
+				if err := destroyer.Destroy(r.Context()); err != nil {
+					slog.Warn("channel_instances.delete: destroyer failed — proceeding with DB delete",
+						"name", inst.Name, "tenant_id", inst.TenantID, "type", inst.ChannelType, "err", err)
+				}
+			}
+		} else if cleaner, ok := h.orphanCleaners[inst.ChannelType]; ok && cleaner != nil {
+			if err := cleaner(r.Context(), inst.TenantID, inst.Config); err != nil {
+				slog.Warn("channel_instances.delete: orphan cleaner failed — proceeding with DB delete",
+					"name", inst.Name, "tenant_id", inst.TenantID, "type", inst.ChannelType, "err", err)
+			}
+		}
+	}
+
 	if err := h.store.Delete(r.Context(), id); err != nil {
 		slog.Error("channel_instances.delete", "error", err)
 		writeError(w, http.StatusInternalServerError, protocol.ErrInternal, i18n.T(locale, i18n.MsgFailedToDelete, "channel instance", "internal error"))
 		return
 	}
 
-	h.emitCacheInvalidate()
+	h.emitCacheInvalidate("")
 	emitAudit(h.msgBus, r, "channel_instance.deleted", "channel_instance", id.String())
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
@@ -310,18 +449,26 @@ func maskInstanceHTTP(inst store.ChannelInstanceData) map[string]any {
 
 // resolveAgentID looks up the channel instance and returns its agent_id.
 func (h *ChannelInstancesHandler) resolveAgentID(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {
+	inst, ok := h.resolveInstance(w, r)
+	if !ok {
+		return uuid.Nil, false
+	}
+	return inst.AgentID, true
+}
+
+func (h *ChannelInstancesHandler) resolveInstance(w http.ResponseWriter, r *http.Request) (*store.ChannelInstanceData, bool) {
 	locale := store.LocaleFromContext(r.Context())
 	instID, err := uuid.Parse(r.PathValue("id"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgInvalidID, "instance"))
-		return uuid.Nil, false
+		return nil, false
 	}
 	inst, err := h.store.Get(r.Context(), instID)
 	if err != nil {
 		writeError(w, http.StatusNotFound, protocol.ErrNotFound, i18n.T(locale, i18n.MsgInstanceNotFound))
-		return uuid.Nil, false
+		return nil, false
 	}
-	return inst.AgentID, true
+	return inst, true
 }
 
 func (h *ChannelInstancesHandler) handleWriterGroups(w http.ResponseWriter, r *http.Request) {
@@ -397,6 +544,68 @@ func (h *ChannelInstancesHandler) handleListWriters(w http.ResponseWriter, r *ht
 		writers = append(writers, wd)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"writers": writers})
+}
+
+func (h *ChannelInstancesHandler) handleTestWriter(w http.ResponseWriter, r *http.Request) {
+	inst, ok := h.resolveInstance(w, r)
+	if !ok {
+		return
+	}
+	locale := store.LocaleFromContext(r.Context())
+	var body struct {
+		GroupID string `json:"group_id"`
+		UserID  string `json:"user_id"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgInvalidJSON))
+		return
+	}
+	if body.GroupID == "" || body.UserID == "" {
+		writeError(w, http.StatusBadRequest, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgRequired, "group_id and user_id"))
+		return
+	}
+	channelName, _, groupOK := channels.ParseGroupScope(body.GroupID)
+	if !groupOK || channelName != inst.Name {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"allowed":      false,
+			"reason":       "invalid_group",
+			"instance_id":  inst.ID.String(),
+			"agent_id":     inst.AgentID.String(),
+			"group_id":     body.GroupID,
+			"user_id":      body.UserID,
+			"writer_count": 0,
+		})
+		return
+	}
+
+	writers, err := h.configPermStore.ListFileWriters(r.Context(), inst.AgentID, body.GroupID)
+	if err != nil {
+		slog.Error("channel_instances.test_writer", "error", err)
+		writeError(w, http.StatusInternalServerError, protocol.ErrInternal, i18n.T(locale, i18n.MsgFailedToList, "writers"))
+		return
+	}
+	allowed := false
+	for _, p := range writers {
+		if p.Permission == "allow" && p.UserID == body.UserID {
+			allowed = true
+			break
+		}
+	}
+	reason := "not_writer"
+	if allowed {
+		reason = "writer"
+	} else if len(writers) == 0 {
+		reason = "no_writers_configured"
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"allowed":      allowed,
+		"reason":       reason,
+		"instance_id":  inst.ID.String(),
+		"agent_id":     inst.AgentID.String(),
+		"group_id":     body.GroupID,
+		"user_id":      body.UserID,
+		"writer_count": len(writers),
+	})
 }
 
 func (h *ChannelInstancesHandler) handleAddWriter(w http.ResponseWriter, r *http.Request) {
@@ -489,6 +698,9 @@ func (h *ChannelInstancesHandler) handleListContacts(w http.ResponseWriter, r *h
 	if v := r.URL.Query().Get("channel_type"); v != "" {
 		opts.ChannelType = v
 	}
+	if v := r.URL.Query().Get("channel_instance"); v != "" {
+		opts.ChannelInstance = v
+	}
 	if v := r.URL.Query().Get("peer_kind"); v != "" {
 		opts.PeerKind = v
 	}
@@ -554,9 +766,13 @@ func (h *ChannelInstancesHandler) handleResolveContacts(w http.ResponseWriter, r
 }
 
 // isValidChannelType checks if the channel type is supported.
+//
+// Keep this list in sync with the WS twin in
+// internal/gateway/methods/channel_instances.go and with CHANNEL_TYPES in
+// ui/web/src/constants/channels.ts.
 func isValidChannelType(ct string) bool {
 	switch ct {
-	case "telegram", "discord", "slack", "whatsapp", "zalo_oa", "zalo_personal", "feishu", "line", "lineworks", "facebook", "pancake":
+	case "telegram", "discord", "slack", "whatsapp", "zalo_oa", "zalo_personal", "feishu", "line", "lineworks", "facebook", "pancake", "bitrix24":
 		return true
 	}
 	return false

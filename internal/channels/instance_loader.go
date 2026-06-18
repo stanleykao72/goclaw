@@ -16,6 +16,7 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/providerresolve"
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
+	usagecaps "github.com/nextlevelbuilder/goclaw/internal/usage/caps"
 )
 
 // reloadStartTimeout bounds how long Reload() will wait for a single channel's
@@ -39,6 +40,7 @@ type InstanceLoader struct {
 	agentStore        store.AgentStore
 	providerReg       *providers.Registry
 	pendingCompactCfg *config.PendingCompactionConfig
+	usageCaps         *usagecaps.Service
 	factories         map[string]ChannelFactory
 	manager           *Manager
 	msgBus            *bus.MessageBus
@@ -76,6 +78,10 @@ func (l *InstanceLoader) SetProviderRegistry(reg *providers.Registry) {
 // Must be called before LoadAll/Reload.
 func (l *InstanceLoader) SetPendingCompactionConfig(cfg *config.PendingCompactionConfig) {
 	l.pendingCompactCfg = cfg
+}
+
+func (l *InstanceLoader) SetUsageCapService(s *usagecaps.Service) {
+	l.usageCaps = s
 }
 
 // RegisterFactory registers a factory for a channel type (e.g., "telegram", "discord").
@@ -149,6 +155,37 @@ func (l *InstanceLoader) Reload(ctx context.Context) {
 	}
 
 	slog.Info("channel instances reloaded", "count", registered)
+}
+
+// LoadInstanceByID loads or refreshes one enabled channel instance without
+// stopping unrelated channels. Used by create-time cache invalidation and QR
+// auth flows that need the just-created channel to become available quickly.
+func (l *InstanceLoader) LoadInstanceByID(ctx context.Context, id uuid.UUID) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	inst, err := l.store.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+
+	if _, ok := l.loaded[inst.Name]; ok {
+		if _, exists := l.manager.GetChannel(inst.Name); exists {
+			return nil
+		}
+		delete(l.loaded, inst.Name)
+	}
+
+	if !inst.Enabled {
+		return nil
+	}
+
+	if err := l.loadInstance(ctx, *inst, true); err != nil {
+		return err
+	}
+
+	slog.Info("channel instance loaded by id", "id", id, "name", inst.Name, "type", inst.ChannelType)
+	return nil
 }
 
 // Stop stops all managed channels.
@@ -306,8 +343,9 @@ func (l *InstanceLoader) loadInstance(ctx context.Context, inst store.ChannelIns
 
 		if p != nil && model != "" {
 			cc := &CompactionConfig{
-				Provider: p,
-				Model:    model,
+				Provider:  p,
+				Model:     model,
+				UsageCaps: l.usageCaps,
 			}
 			if l.pendingCompactCfg != nil {
 				cc.Threshold = l.pendingCompactCfg.Threshold

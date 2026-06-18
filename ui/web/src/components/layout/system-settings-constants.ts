@@ -31,8 +31,6 @@ export interface InitState {
   embModel: string;
   embMaxChunkLen: string;
   embChunkOverlap: string;
-  toolStatus: boolean;
-  blockReply: boolean;
   intentClassify: boolean;
   compProvider: string;
   compModel: string;
@@ -44,16 +42,26 @@ export interface InitState {
   kgMinConfidence: string;
   bgProvider: string;
   bgModel: string;
+  skillUploadMaxSize: string;
+  skillSlashEnabled: boolean;
+  skillSlashSuggest: boolean;
+  skillSlashPartial: boolean;
+  skillSlashPrefix: string;
 }
 
 export const DEFAULTS: InitState = {
   embProvider: "", embModel: "",
   embMaxChunkLen: "", embChunkOverlap: "",
-  toolStatus: true, blockReply: false, intentClassify: true,
+  intentClassify: true,
   compProvider: "", compModel: "",
   compThreshold: "", compKeepRecent: "", compMaxTokens: "",
   kgProvider: "", kgModel: "", kgMinConfidence: "0.75",
   bgProvider: "", bgModel: "",
+  skillUploadMaxSize: "20",
+  skillSlashEnabled: true,
+  skillSlashSuggest: true,
+  skillSlashPartial: false,
+  skillSlashPrefix: "/",
 };
 
 export function parseBool(v: string | undefined, fallback: boolean): boolean {

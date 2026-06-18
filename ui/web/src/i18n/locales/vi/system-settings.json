@@ -30,12 +30,6 @@
   "ux": {
     "title": "Hành vi UX",
     "description": "Điều khiển cách gateway hiển thị hoạt động của agent cho người dùng.",
-    "toolStatus": "Hiện tên công cụ khi thực thi",
-    "toolStatusHint": "Hiển thị tên công cụ đang chạy khi agent hoạt động.",
-    "toolStatusInfo": "Tên công cụ được hiện khi agent đang chạy.",
-    "blockReply": "Hiện văn bản trung gian khi gọi công cụ",
-    "blockReplyHint": "Gửi nội dung phụ trợ khi công cụ đang được gọi.",
-    "blockReplyInfo": "Văn bản trung gian được gửi cho người dùng khi thực thi công cụ.",
     "intentClassify": "Phân loại ý định",
     "intentClassifyHint": "Phân loại ý định người dùng trước khi chuyển tới agent.",
     "intentClassifyInfo": "Tin nhắn được phân loại để tối ưu định tuyến agent."
@@ -63,6 +57,20 @@
     "providerPlaceholder": "(agent default)",
     "modelPlaceholder": "(mặc định)",
     "info": "Dùng cho vault enrichment (tóm tắt tài liệu), consolidation (tóm tắt phiên) và dreaming. Để trống sẽ fallback về agent default provider."
+  },
+  "skills": {
+    "title": "Skills",
+    "description": "Cài đặt gói skill và slash command theo tenant.",
+    "maxUploadSize": "Dung lượng tải lên tối đa",
+    "maxUploadSizeHint": "Giới hạn ZIP theo từng tệp, tính bằng MB. Khoảng cho phép: 1-500.",
+    "slashEnabled": "Bật slash command",
+    "slashEnabledHint": "Nhận diện /skill-name và /use skill-name ở đầu prompt.",
+    "slashSuggest": "Gợi ý skill gần đúng",
+    "slashSuggestHint": "Hiển thị các skill gần giống khi không tìm thấy skill được gọi.",
+    "slashPartial": "Cho phép khớp một phần",
+    "slashPartialHint": "Cho phép prefix duy nhất như /frontend kích hoạt skill tương ứng.",
+    "slashPrefix": "Prefix command",
+    "slashPrefixHint": "Một ký tự dùng trước skill command."
   },
   "compaction": {
     "title": "Nén tin nhắn chờ",

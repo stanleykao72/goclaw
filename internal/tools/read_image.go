@@ -10,6 +10,8 @@ import (
 	"strings"
 
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
+	"github.com/nextlevelbuilder/goclaw/internal/security"
+	usagecaps "github.com/nextlevelbuilder/goclaw/internal/usage/caps"
 )
 
 // --- Context helpers for media images ---
@@ -46,17 +48,22 @@ var visionModelDefaults = map[string]string{
 
 // ReadImageTool uses a vision-capable provider to describe images attached to the current message.
 type ReadImageTool struct {
-	registry *providers.Registry
+	registry  *providers.Registry
+	usageCaps *usagecaps.Service
 }
 
 func NewReadImageTool(registry *providers.Registry) *ReadImageTool {
 	return &ReadImageTool{registry: registry}
 }
 
+func (t *ReadImageTool) SetUsageCapService(svc *usagecaps.Service) {
+	t.usageCaps = svc
+}
+
 func (t *ReadImageTool) Name() string { return "read_image" }
 
 func (t *ReadImageTool) Description() string {
-	return "Analyze images using vision AI. Works with: (1) images sent by the user (<media:image> tags), (2) workspace/generated image files (pass a file path)."
+	return "Analyze images using vision AI. Works with images sent by the user, workspace/generated image files, or public HTTP/HTTPS image URLs."
 }
 
 func (t *ReadImageTool) Parameters() map[string]any {
@@ -70,6 +77,10 @@ func (t *ReadImageTool) Parameters() map[string]any {
 			"path": map[string]any{
 				"type":        "string",
 				"description": "Optional file path to an image in the workspace. Use this for generated images or attachments. If omitted, analyzes images from the conversation.",
+			},
+			"url": map[string]any{
+				"type":        "string",
+				"description": "Optional URL to an image. Use this to analyze images hosted online.",
 			},
 		},
 		"required": []string{"prompt"},
@@ -85,18 +96,32 @@ func (t *ReadImageTool) Execute(ctx context.Context, args map[string]any) *Resul
 		prompt = "Describe this image in detail."
 	}
 
+	imgPath, _ := args["path"].(string)
+	imgURL, _ := args["url"].(string)
+
+	if imgPath != "" && imgURL != "" {
+		return ErrorResult("Both 'path' and 'url' parameters cannot be specified. Choose only one.")
+	}
+
 	// If path is provided, load image from workspace file
 	images := MediaImagesFromCtx(ctx)
-	if imgPath, _ := args["path"].(string); imgPath != "" {
+	if imgPath != "" {
 		fileImages, err := t.loadImageFromPath(ctx, imgPath)
 		if err != nil {
 			return ErrorResult(err.Error())
 		}
 		images = fileImages
+	} else if imgURL != "" {
+		if _, _, err := security.Validate(imgURL); err != nil {
+			return ErrorResult(fmt.Sprintf("Invalid image URL: %v", err))
+		}
+		images = []providers.ImageContent{{
+			URL: imgURL,
+		}}
 	}
 
 	if len(images) == 0 {
-		return ErrorResult("No images available. Either send an image in the chat or provide a file path with the 'path' parameter.")
+		return ErrorResult("No images available. Either send an image in the chat, provide a file path with 'path', or provide an image URL with 'url'.")
 	}
 
 	chain := ResolveMediaProviderChain(ctx, "read_image", "", "",
@@ -132,6 +157,24 @@ func (t *ReadImageTool) callProvider(ctx context.Context, cp credentialProvider,
 	prompt := GetParamString(params, "prompt", "Describe this image in detail.")
 	images, _ := params["images"].([]providers.ImageContent)
 
+	for _, img := range images {
+		if img.URL == "" {
+			continue
+		}
+		if _, _, err := security.Validate(img.URL); err != nil {
+			return nil, nil, fmt.Errorf("invalid image URL: %w", err)
+		}
+	}
+
+	// Anthropic Claude does not support URL references and requires base64-encoded image data.
+	if providerName == "anthropic" || providerName == "claude-cli" {
+		for _, img := range images {
+			if img.URL != "" && img.Data == "" {
+				return nil, nil, fmt.Errorf("provider %q does not support analyzing images directly from a URL", providerName)
+			}
+		}
+	}
+
 	// Get the full provider for Chat() access
 	p, err := t.registry.Get(ctx, providerName)
 	if err != nil {
@@ -152,7 +195,7 @@ func (t *ReadImageTool) callProvider(ctx context.Context, cp credentialProvider,
 		opts["disable_tools"] = true
 	}
 
-	resp, err := p.Chat(ctx, providers.ChatRequest{
+	chatReq := providers.ChatRequest{
 		Messages: []providers.Message{
 			{
 				Role:    "user",
@@ -162,7 +205,15 @@ func (t *ReadImageTool) callProvider(ctx context.Context, cp credentialProvider,
 		},
 		Model:   model,
 		Options: opts,
-	})
+	}
+	reservation, reserveErr := reserveToolLLMUsage(ctx, t.usageCaps, t.Name(), providerName, model, chatReq)
+	if reserveErr != nil {
+		return nil, nil, reserveErr
+	}
+	resp, err := p.Chat(ctx, chatReq)
+	if reservation != nil {
+		reservation.Reconcile(ctx, resp, err)
+	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("vision provider error: %w", err)
 	}

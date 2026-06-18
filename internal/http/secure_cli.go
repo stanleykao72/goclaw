@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"os/exec"
 	"regexp"
-	"sort"
 	"strings"
 
 	"github.com/google/uuid"
@@ -27,13 +26,22 @@ var safeBinaryNameRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$`)
 
 // SecureCLIHandler handles secure CLI binary credential CRUD endpoints.
 type SecureCLIHandler struct {
-	store  store.SecureCLIStore
-	msgBus *bus.MessageBus
+	store      store.SecureCLIStore
+	agentCreds store.SecureCLIAgentCredentialStore
+	tenants    store.TenantStore
+	msgBus     *bus.MessageBus
 }
 
 // NewSecureCLIHandler creates a handler for secure CLI credential management.
-func NewSecureCLIHandler(s store.SecureCLIStore, msgBus *bus.MessageBus) *SecureCLIHandler {
-	return &SecureCLIHandler{store: s, msgBus: msgBus}
+func NewSecureCLIHandler(s store.SecureCLIStore, msgBus *bus.MessageBus, tenants ...store.TenantStore) *SecureCLIHandler {
+	h := &SecureCLIHandler{store: s, msgBus: msgBus}
+	if len(tenants) > 0 {
+		h.tenants = tenants[0]
+	}
+	if agentCreds, ok := s.(store.SecureCLIAgentCredentialStore); ok {
+		h.agentCreds = agentCreds
+	}
+	return h
 }
 
 // RegisterRoutes registers all secure CLI routes on the given mux.
@@ -52,6 +60,13 @@ func (h *SecureCLIHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/cli-credentials/{id}/user-credentials/{userId}", h.auth(h.handleGetUserCredentials))
 	mux.HandleFunc("PUT /v1/cli-credentials/{id}/user-credentials/{userId}", h.auth(h.handleSetUserCredentials))
 	mux.HandleFunc("DELETE /v1/cli-credentials/{id}/user-credentials/{userId}", h.auth(h.handleDeleteUserCredentials))
+
+	// Per-agent credential management. Credentials do not grant binary access;
+	// non-global binaries still require agent-grants.
+	mux.HandleFunc("GET /v1/cli-credentials/{id}/agent-credentials", h.auth(h.handleListAgentCredentials))
+	mux.HandleFunc("GET /v1/cli-credentials/{id}/agent-credentials/{agentId}", h.auth(h.handleGetAgentCredentials))
+	mux.HandleFunc("PUT /v1/cli-credentials/{id}/agent-credentials/{agentId}", h.auth(h.handleSetAgentCredentials))
+	mux.HandleFunc("DELETE /v1/cli-credentials/{id}/agent-credentials/{agentId}", h.auth(h.handleDeleteAgentCredentials))
 }
 
 func (h *SecureCLIHandler) auth(next http.HandlerFunc) http.HandlerFunc {
@@ -70,68 +85,13 @@ func (h *SecureCLIHandler) emitCacheInvalidate(key string) {
 
 // envKeysFromDecryptedJSON returns sorted env variable names from plaintext env JSON (decrypted blob).
 func envKeysFromDecryptedJSON(env []byte) []string {
-	empty := []string{}
-	if len(env) == 0 {
-		return empty
-	}
-	var m map[string]any
-	if err := json.Unmarshal(env, &m); err != nil {
-		return empty
-	}
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
+	return store.SecureCLIEnvKeys(env)
 }
 
-// mergeSecureCLIEnv merges incoming env from the UI with existing stored env.
-// Incoming defines the full set of keys shown in the form: keys omitted were removed.
-// Empty string means "keep existing value" for that key when it already exists.
-func mergeSecureCLIEnv(existingJSON []byte, incoming map[string]any) (map[string]string, error) {
-	existing := map[string]string{}
-	if len(existingJSON) > 0 {
-		if err := json.Unmarshal(existingJSON, &existing); err != nil {
-			return nil, fmt.Errorf("parse existing env: %w", err)
-		}
-	}
-	out := make(map[string]string)
-	for k, v := range incoming {
-		if k == "" {
-			continue
-		}
-		sv, err := envValueAsString(v)
-		if err != nil {
-			return nil, fmt.Errorf("invalid environment variable value")
-		}
-		if sv != "" {
-			out[k] = sv
-			continue
-		}
-		if ev, ok := existing[k]; ok {
-			out[k] = ev
-		}
-	}
-	return out, nil
-}
-
-func envValueAsString(v any) (string, error) {
-	switch t := v.(type) {
-	case string:
-		return t, nil
-	case float64:
-		return fmt.Sprint(t), nil
-	case bool:
-		if t {
-			return "true", nil
-		}
-		return "false", nil
-	case nil:
-		return "", nil
-	default:
-		return "", fmt.Errorf("value must be a string")
-	}
+func populateBinaryEnvResponse(b *store.SecureCLIBinary) {
+	b.EnvKeys = store.SecureCLIEnvKeys(b.EncryptedEnv)
+	b.Env = store.SanitizeSecureCLIEnvJSON(b.EncryptedEnv)
+	b.EncryptedEnv = nil
 }
 
 func (h *SecureCLIHandler) handleList(w http.ResponseWriter, r *http.Request) {
@@ -142,27 +102,26 @@ func (h *SecureCLIHandler) handleList(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": i18n.T(locale, i18n.MsgFailedToList, "CLI credentials")})
 		return
 	}
-	// Never send env values; only variable names for editing.
+	// Sensitive env values stay masked; value-kind entries are returned for editing.
 	for i := range result {
-		result[i].EnvKeys = envKeysFromDecryptedJSON(result[i].EncryptedEnv)
-		result[i].EncryptedEnv = nil
+		populateBinaryEnvResponse(&result[i])
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": result})
 }
 
 // secureCLICreateRequest supports both preset-based and custom creation.
 type secureCLICreateRequest struct {
-	Preset         string            `json:"preset,omitempty"` // auto-fill from preset
-	BinaryName     string            `json:"binary_name"`
-	BinaryPath     *string           `json:"binary_path,omitempty"`
-	Description    string            `json:"description"`
-	Env            map[string]string `json:"env"` // plaintext env vars (encrypted by store)
-	DenyArgs       json.RawMessage   `json:"deny_args,omitempty"`
-	DenyVerbose    json.RawMessage   `json:"deny_verbose,omitempty"`
-	TimeoutSeconds int               `json:"timeout_seconds,omitempty"`
-	Tips           string            `json:"tips,omitempty"`
-	IsGlobal       *bool             `json:"is_global,omitempty"`
-	Enabled        bool              `json:"enabled"`
+	Preset         string          `json:"preset,omitempty"` // auto-fill from preset
+	BinaryName     string          `json:"binary_name"`
+	BinaryPath     *string         `json:"binary_path,omitempty"`
+	Description    string          `json:"description"`
+	Env            json.RawMessage `json:"env"` // plaintext env vars or env entry objects (encrypted by store)
+	DenyArgs       json.RawMessage `json:"deny_args,omitempty"`
+	DenyVerbose    json.RawMessage `json:"deny_verbose,omitempty"`
+	TimeoutSeconds int             `json:"timeout_seconds,omitempty"`
+	Tips           string          `json:"tips,omitempty"`
+	IsGlobal       *bool           `json:"is_global,omitempty"`
+	Enabled        bool            `json:"enabled"`
 }
 
 func (h *SecureCLIHandler) handleCreate(w http.ResponseWriter, r *http.Request) {
@@ -173,9 +132,10 @@ func (h *SecureCLIHandler) handleCreate(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	var preset *tools.CLIPreset
 	// Apply preset defaults if specified
 	if req.Preset != "" {
-		preset := tools.GetPreset(req.Preset)
+		preset = tools.GetPreset(req.Preset)
 		if preset == nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unknown preset: " + req.Preset})
 			return
@@ -204,18 +164,31 @@ func (h *SecureCLIHandler) handleCreate(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgRequired, "binary_name")})
 		return
 	}
-	if len(req.Env) == 0 {
+	adapterManagedPreset := preset != nil && strings.TrimSpace(preset.AdapterName) != "" && len(preset.EnvVars) == 0
+	if len(req.Env) == 0 && !adapterManagedPreset {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgRequired, "env")})
 		return
 	}
 
-	// Serialize env as JSON bytes (store layer encrypts)
-	envJSON, err := json.Marshal(req.Env)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid env"})
-		return
+	envJSON := []byte("{}")
+	if len(req.Env) > 0 {
+		envEntries, err := store.ParseSecureCLIEnv(req.Env)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgGrantEnvValueInvalid, err.Error())})
+			return
+		}
+		envJSON, err = store.SerializeSecureCLIEnv(envEntries)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgGrantEnvValueInvalid, err.Error())})
+			return
+		}
 	}
 
+	var adapterName *string
+	if preset != nil && strings.TrimSpace(preset.AdapterName) != "" {
+		name := strings.TrimSpace(preset.AdapterName)
+		adapterName = &name
+	}
 	b := &store.SecureCLIBinary{
 		BinaryName:     req.BinaryName,
 		BinaryPath:     req.BinaryPath,
@@ -228,6 +201,7 @@ func (h *SecureCLIHandler) handleCreate(w http.ResponseWriter, r *http.Request) 
 		IsGlobal:       req.IsGlobal == nil || *req.IsGlobal, // default true
 		Enabled:        req.Enabled,
 		CreatedBy:      store.UserIDFromContext(r.Context()),
+		AdapterName:    adapterName,
 	}
 	if b.TimeoutSeconds <= 0 {
 		b.TimeoutSeconds = 30
@@ -240,7 +214,7 @@ func (h *SecureCLIHandler) handleCreate(w http.ResponseWriter, r *http.Request) 
 	}
 
 	tools.ResetCredentialScrubValues() // clear stale scrub values
-	b.EncryptedEnv = nil               // don't return credentials
+	populateBinaryEnvResponse(b)
 	emitAudit(h.msgBus, r, "secure_cli.created", "secure_cli", b.ID.String())
 	h.emitCacheInvalidate(b.ID.String())
 	writeJSON(w, http.StatusCreated, b)
@@ -260,8 +234,7 @@ func (h *SecureCLIHandler) handleGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	b.EnvKeys = envKeysFromDecryptedJSON(b.EncryptedEnv)
-	b.EncryptedEnv = nil // don't expose credential values
+	populateBinaryEnvResponse(b)
 	writeJSON(w, http.StatusOK, b)
 }
 
@@ -293,25 +266,23 @@ func (h *SecureCLIHandler) handleUpdate(w http.ResponseWriter, r *http.Request) 
 
 	// If env is updated, merge with stored env so empty values mean "keep existing secret".
 	if envVal, ok := updates["env"]; ok {
-		if envMap, isMap := envVal.(map[string]any); isMap {
-			cur, err := h.store.Get(r.Context(), id)
-			if err != nil {
-				writeJSON(w, http.StatusNotFound, map[string]string{"error": i18n.T(locale, i18n.MsgNotFound, "credential", id.String())})
-				return
-			}
-			merged, err := mergeSecureCLIEnv(cur.EncryptedEnv, envMap)
-			if err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-				return
-			}
-			envJSON, err := json.Marshal(merged)
-			if err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid env"})
-				return
-			}
-			updates["encrypted_env"] = string(envJSON)
-			delete(updates, "env")
+		envJSON, err := json.Marshal(envVal)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgGrantEnvValueInvalid, err.Error())})
+			return
 		}
+		cur, err := h.store.Get(r.Context(), id)
+		if err != nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": i18n.T(locale, i18n.MsgNotFound, "credential", id.String())})
+			return
+		}
+		merged, err := store.MergeSecureCLIEnv(cur.EncryptedEnv, envJSON)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgGrantEnvValueInvalid, err.Error())})
+			return
+		}
+		updates["encrypted_env"] = string(merged)
+		delete(updates, "env")
 	}
 
 	if err := h.store.Update(r.Context(), id, updates); err != nil {
@@ -346,8 +317,48 @@ func (h *SecureCLIHandler) handleDelete(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
+type cliPresetResponse struct {
+	BinaryName  string            `json:"binary_name"`
+	Description string            `json:"description"`
+	EnvVars     []tools.EnvVarDef `json:"env_vars"`
+	DenyArgs    []string          `json:"deny_args"`
+	DenyVerbose []string          `json:"deny_verbose"`
+	Timeout     int               `json:"timeout"`
+	Tips        string            `json:"tips"`
+	AdapterName string            `json:"adapter_name,omitempty"`
+}
+
+func normalizedCLIPresets() map[string]cliPresetResponse {
+	out := make(map[string]cliPresetResponse, len(tools.CLIPresets))
+	for key, preset := range tools.CLIPresets {
+		envVars := preset.EnvVars
+		if envVars == nil {
+			envVars = []tools.EnvVarDef{}
+		}
+		denyArgs := preset.DenyArgs
+		if denyArgs == nil {
+			denyArgs = []string{}
+		}
+		denyVerbose := preset.DenyVerbose
+		if denyVerbose == nil {
+			denyVerbose = []string{}
+		}
+		out[key] = cliPresetResponse{
+			BinaryName:  preset.BinaryName,
+			Description: preset.Description,
+			EnvVars:     envVars,
+			DenyArgs:    denyArgs,
+			DenyVerbose: denyVerbose,
+			Timeout:     preset.Timeout,
+			Tips:        preset.Tips,
+			AdapterName: preset.AdapterName,
+		}
+	}
+	return out
+}
+
 func (h *SecureCLIHandler) handlePresets(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"presets": tools.CLIPresets})
+	writeJSON(w, http.StatusOK, map[string]any{"presets": normalizedCLIPresets()})
 }
 
 // handleCheckBinary resolves a binary name to its absolute path via exec.LookPath.
