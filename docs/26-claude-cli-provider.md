@@ -561,3 +561,53 @@ The fs/exec tools (`Bash,Edit,Read,Write,Glob,Grep`) stay disabled in BOTH cases
 
 - Assert the written CLI args contain `Agent` and `Task` in `--disallowedTools` (both sites).
 - A real DM weather query (Option A) completes with NO `Agent`/`Task` tool_use in the session `.jsonl` and in materially less wall-clock time; (Option B) the agent answers without web and does not spawn a sub-agent.
+
+
+## 13. Implementation wave plan (parallelization DAG)
+
+> Source: parallelization workflow — **16 units / 4 waves**, each unit cut FROM `esmith/main` as an independent branch, PR-merged back. This is the EXECUTION ORDER; §4 (K/J/I), §5 (F/M/C), §11 (consolidated Fix-I) are the WHAT. The I-slice decision gate **i-2 = Option A** is RESOLVED (see §10/§11). For the I-slice, §11 is the authoritative spec; the I pieces (i-1 → i-3a → i-3b) build in wave order but the enforcement-critical force-route lands per §11 (i-3a+i-3b+fix-J coordinated — never a half-routed window).
+
+### Wave 0 — substrate + conflict-free leaves (no deps; up to 5 concurrent)
+
+| Unit | Name | Scope | Files | Iso | Effort | Status |
+|------|------|-------|-------|-----|--------|--------|
+| **fu-j-1** | J SenderID substrate | `OptSenderID` const (claude_cli.go) + `BridgeContext.SenderID` (claude_cli_mcp.go:86-95) + `X-Sender-ID` header (~:158) + SenderID as **TRAILING-EXTRA** in `SignBridgeContext` (:267) & `VerifyBridgeContext` (:284, new backward-compat level) | claude_cli.go, claude_cli_mcp.go, claude_cli_session.go | worktree | high | TODO |
+| **k-1** | K extract (full history) | `extractFromMessages` returns full ordered `[]Message` (sig change + callers assign `priorTurns`, discard `_` → byte-identical behavior) | claude_cli_session.go:127, claude_cli_chat.go:19,:83 | worktree | medium | TODO |
+| **i-2** | I decision gate | Option A vs B written decision (blast radius) | docs/26 | shared | high | ✅ DONE (Option A) |
+| **fu-1** | F cache/cost tokens | `cache_creation_input_tokens`/`cache_read_input_tokens` → `cliUsage` → `Usage` in `parseJSONArray`/`parseSingleJSONResult` + stream result event (claude_cli_chat.go:214-220) + NEW `claude_cli_parse_test.go` | claude_cli_types.go, claude_cli_parse.go, claude_cli_chat.go, claude_cli_parse_test.go | shared | medium | TODO |
+| **fu-3** | C use_skill bridge | add `"use_skill": true` to `BridgeToolNames` (bridge_server.go:33) | bridge_server.go | shared | low | TODO |
+
+**Wave-0 merge order**: `fu-j-1` first (HMAC field-order contract — SenderID MUST append as trailing extra after sessionKey; reorder = fail-closed) → `k-1` (shares claude_cli_session.go disjoint region :127 vs :171, and claude_cli_chat.go disjoint from fu-1's :214-220) → `fu-1`/`fu-3` independent. `i-2` already resolved.
+
+### Wave 1 — first-order consumers (deps: 0)
+
+| Unit | Name | Scope | Files | Effort |
+|------|------|-------|-------|--------|
+| **fu-j-2+3** | J inject | read `X-Sender-ID` in `bridgeContextMiddleware` (HMAC-gated, server.go:259-312) + `store.WithSenderID`; populate `Options[OptSenderID]` from `req.SenderID` (loop_pipeline_callbacks.go) | server.go, loop_pipeline_callbacks.go | high |
+| **i-1** | I lookup plumbing | widen `MCPServerLookup`→3-arg (claude_cli_mcp.go:32), `ToolAllow/ToolDeny` on `MCPServerEntry` (:20-28), real `userID` into `ListAccessible` (gateway_providers.go:218), fix 2nd caller (gateway_http_handlers.go:95) — **`go build ./...` gate** | gateway_providers.go, claude_cli_mcp.go, gateway_http_handlers.go | high |
+| **k-2** | K seed | cold-spawn stream-json transcript seeding (`sessionFileExists==false` gate), extend `buildStreamJSONInput` (claude_cli_session.go:228) + Chat/ChatStream gates | claude_cli_session.go, claude_cli_chat.go | high |
+| **fu-2** | M observability | PostToolUse hook-matcher approach (claude_cli_hooks.go:52, §5) — **NOT** the event-emitter (avoids NewBridgeServer sig change) | claude_cli_hooks.go | medium |
+
+### Wave 2 — J gate + K tests + (Option A) i-3a substrate (deps: 0,1)
+
+| Unit | Name | Scope | Files | Effort |
+|------|------|-------|-------|--------|
+| **fu-j-4** | J per-sender gate | `bridge_tool.go:188-202` actor-resolution `SenderIDFromContext` + UserID fallback at grant-recheck + audit sites; test extensions | bridge_tool.go, *_test.go | high |
+| **k-3** | K tests | hermetic table-driven extract + transcript + cold-gate (`t.Setenv HOME`, NEVER exec real claude binary) | claude_cli_session_test.go | medium |
+| **i-3a** | I bridge dynamic-proxy substrate (Option A) | teach goclaw-bridge to discover/connect/proxy non-builtin per-agent external MCP tools — **§11 authoritative spec**; XL, [ESC:arch] registry-mutation concurrency | bridge_server.go, manager.go | xhigh |
+
+### Wave 3 — Option A force-route wiring + I verification (deps: 0,1,2)
+
+| Unit | Name | Scope | Files | Effort |
+|------|------|-------|-------|--------|
+| **i-3b** | I force-route wiring | stop `buildMCPServerLookup` emitting direct external entries + wire force-route through proxy bridge — **§11 B2 atomic merge** | gateway_providers.go, bridge_server.go, server.go, claude_cli_session.go, manager.go, claude_cli_mcp.go | high |
+| **i-5** | I tests + verification | `claude_cli_mcp_test.go` (userID-forwarding + ToolAllow/Deny) + `claude_cli_session_test.go` + `bridge_context_test.go` (per-agent tool isolation) + `go build ./...` + manual mcp-config verify | *_test.go | medium |
+
+### Critical path & key gates
+
+- **Critical path**: i-2 (✅) → i-1 (go-build gate) → i-3a (XL, schedule driver) → i-3b → i-5.
+- **J-before-I (mandatory)**: entire J slice (fu-j-1..4) ships before I, so i-3b rebases onto a SenderID-aware `bridge_tool.go` + `claude_cli_mcp.go` (actor identity + grant recheck **compose**, not overwrite).
+- **HMAC field-order**: `fu-j-1` SenderID-as-trailing-extra is a hard contract; `fu-j-1` Verify MUST merge before `fu-j-2` middleware reads `X-Sender-ID` (else every bridge req fail-closed HMAC-rejects).
+- **go build gate after i-1**: 3-arg `MCPServerLookup` widen + 2nd caller must compile before any consumer wave.
+- **claude_cli_mcp.go 3-way merge hotspot**: J (fu-j-1) + I-plumbing (i-1) + i-impl all touch it — serialize merges.
+- **fu-2/M scope**: confirm PostToolUse-hook approach before coding (avoids reintroducing bridge_server.go contention).
