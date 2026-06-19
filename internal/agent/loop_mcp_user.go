@@ -3,27 +3,10 @@ package agent
 import (
 	"context"
 	"log/slog"
-	"maps"
-	"strings"
-	"time"
 
 	mcpbridge "github.com/nextlevelbuilder/goclaw/internal/mcp"
 	"github.com/nextlevelbuilder/goclaw/internal/tools"
 )
-
-func isUnauthorized401(err error) bool {
-	if err == nil {
-		return false
-	}
-	return strings.Contains(strings.ToLower(err.Error()), "unauthorized (401)")
-}
-
-func hasNonEmpty(m map[string]string, key string) bool {
-	if m == nil {
-		return false
-	}
-	return strings.TrimSpace(m[key]) != ""
-}
 
 // resolveActorUserID picks the user identifier used for per-user resource
 // lookups (MCP credentials, RBAC grants, audit attribution) given the routing
@@ -55,8 +38,8 @@ func hasNonEmpty(m map[string]string, key string) bool {
 //     the rewritten container — otherwise every action in a group or after
 //     contact-merge looks identical to the policy engine.
 //
-// For Bitrix24 channel, where the provisioner always keys by SenderID
-// regardless of DM/group/merge state, we MUST always prefer SenderID.
+// For channel provisioners that always key by SenderID regardless of
+// DM/group/merge state (Bitrix24, LINE WORKS), we MUST always prefer SenderID.
 // Without the channelType discriminator, DMs with merged contacts hit the
 // "return userID" branch and silently lose MCP creds.
 //
@@ -68,20 +51,12 @@ func hasNonEmpty(m map[string]string, key string) bool {
 // Synthetic ticker / notification senders carry empty SenderID. They do
 // not own per-user credentials, so the function falls back to UserID and
 // the lookup returns nil safely either way.
+//
+// The implementation lives in internal/mcp (mcpbridge.ResolveActorUserID) so
+// the native agent loop and the bridge force-route path share one definition
+// and cannot drift (docs/26 §11 §2.6, §11.S step 0). This is a thin wrapper.
 func resolveActorUserID(userID, senderID, peerKind, channelType string) string {
-	// Bitrix24: provisioner always keys MCP credentials by SenderID
-	// (raw Bitrix user id). Group rewrite AND DM merged-contact rewrite
-	// both override UserID — SenderID is the only stable lookup key.
-	if channelType == "bitrix24" && senderID != "" {
-		return senderID
-	}
-	// Other channels: original group-rewrite recovery only. DMs without
-	// channel-specific handling retain UserID semantics (assumed to equal
-	// SenderID where it matters).
-	if peerKind != "group" || senderID == "" {
-		return userID
-	}
-	return senderID
+	return mcpbridge.ResolveActorUserID(userID, senderID, peerKind, channelType)
 }
 
 // getUserMCPTools returns per-user MCP tools for servers requiring user credentials.
@@ -124,100 +99,13 @@ func (l *Loop) getUserMCPTools(ctx context.Context, userID string) []tools.Tool 
 			continue
 		}
 
-		// Resolve connection params: server defaults merged with user overrides
-		args := mcpbridge.ParseJSONBytesToStringSlice(srv.Args)
-		env := mcpbridge.ParseJSONBytesToStringMap(srv.Env)
-		if env == nil {
-			env = make(map[string]string)
-		}
-		headers := mcpbridge.ParseJSONBytesToStringMap(srv.Headers)
-		if headers == nil {
-			headers = make(map[string]string)
-		}
-
-		// Inject server-level API key into headers if present
-		if srv.APIKey != "" && headers["Authorization"] == "" {
-			headers["Authorization"] = "Bearer " + srv.APIKey
-		}
-
-		// Merge user credentials (user overrides server defaults)
-		if uc.APIKey != "" {
-			headers["Authorization"] = "Bearer " + uc.APIKey
-		}
-		maps.Copy(headers, uc.Headers)
-		maps.Copy(env, uc.Env)
-
-		// Acquire user-keyed pool connection
-		entry, err := l.mcpPool.AcquireUser(ctx, l.tenantID, srv.Name, userID,
-			srv.Transport, srv.Command, args, env, srv.URL, headers, srv.TimeoutSec)
-		if err != nil {
-			if isUnauthorized401(err) {
-				expiresAt := strings.TrimSpace(uc.Env["BITRIX_EXPIRES_AT"])
-				expired := false
-				if expiresAt != "" {
-					if t, parseErr := time.Parse(time.RFC3339, expiresAt); parseErr == nil {
-						expired = time.Now().UTC().After(t)
-					}
-				}
-				slog.Warn("mcp.user_401_diagnostics",
-					"server", srv.Name,
-					"user", userID,
-					"has_bitrix_domain", hasNonEmpty(uc.Env, "BITRIX_DOMAIN"),
-					"has_access_token", hasNonEmpty(uc.Env, "BITRIX_ACCESS_TOKEN"),
-					"has_refresh_token", hasNonEmpty(uc.Env, "BITRIX_REFRESH_TOKEN"),
-					"bitrix_expires_at", expiresAt,
-					"bitrix_expired", expired,
-				)
-				_ = l.mcpStore.DeleteUserCredentials(ctx, srv.ID, userID)
-				slog.Warn("mcp.user_credentials_purged", "server", srv.Name, "user", userID, "reason", "unauthorized_401")
-			}
-			slog.Warn("mcp.user_pool_acquire_failed", "server", srv.Name, "user", userID, "error", err)
-			continue
-		}
-
-		// Release immediately — BridgeTools hold client pointer directly.
-		// This allows pool idle eviction to work (refCount=0 + lastUsed for TTL).
-		// When pool evicts the connection, BridgeTool.Execute detects connected=false.
-		l.mcpPool.ReleaseUser(mcpbridge.UserPoolKey(l.tenantID, srv.Name, userID))
-
-		// Create BridgeTools pointing to user's connection. Per-user tools are
-		// cached in mcpUserTools sync.Map (line below) and resolved at execute
-		// time by executeToolForActor — they intentionally do NOT register
-		// into the shared tool registry because doing so causes a cross-user
-		// identity leak: the first user wins and subsequent users get the first
-		// user's BridgeTool (with first user's MCP api_key + pool connection).
-		// The shared registry holds only shared/non-MCP tools (memory, web,
-		// exec, …).
-		//
-		// Filter tools upfront by the agent's grant (info.ToolAllow / ToolDeny)
-		// so the LLM never sees tools it cannot call. Without this, every
-		// per-user MCP server exposes its full tool set and the LLM repeatedly
-		// triggers the runtime "grant revoked" path (visible in the original
-		// agent_brain_external screenshot).
-		hints := mcpbridge.ParseToolHints(srv.Settings)
-		var filteredOut []string
-		for _, mcpTool := range entry.MCPTools() {
-			if !mcpbridge.IsToolAllowed(mcpTool.Name, info.ToolAllow, info.ToolDeny) {
-				filteredOut = append(filteredOut, mcpTool.Name)
-				continue
-			}
-			bt := mcpbridge.NewBridgeTool(srv.Name, mcpTool, entry.ClientPtr(), srv.ToolPrefix, srv.TimeoutSec, entry.Connected(), srv.ID, l.mcpGrantChecker).
-				WithHints(hints.Global, hints.HintFor(mcpTool.Name)).
-				WithForceReconnect(entry.RequestForceReconnect())
-			userTools = append(userTools, bt)
-		}
-		if len(filteredOut) > 0 {
-			slog.Info("mcp.tools.filtered_at_register",
-				"server", srv.Name,
-				"server_id", srv.ID,
-				"user", userID,
-				"path", "user_cred",
-				"filtered_count", len(filteredOut),
-				"filtered_tools", filteredOut,
-				"allow_size", len(info.ToolAllow),
-				"deny_size", len(info.ToolDeny),
-			)
-		}
+		// Resolve the per-user BridgeTools via the shared helper (docs/26
+		// §11 §2.6, §11.S step 8). The cred merge, AcquireUser, release-before-
+		// build, 401-purge self-heal and grant filtering live in
+		// mcpbridge.BuildUserCredServerTools so the native loop and the bridge
+		// force-route path share ONE definition and cannot drift.
+		userTools = append(userTools,
+			mcpbridge.BuildUserCredServerTools(ctx, l.mcpStore, l.mcpPool, l.mcpGrantChecker, l.tenantID, info, userID, uc)...)
 	}
 
 	if len(userTools) > 0 {
