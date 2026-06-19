@@ -83,6 +83,33 @@ func TestCredHasNonEmpty(t *testing.T) {
 	}
 }
 
+// TestIsUnauthorizedErr_AllForms locks the 401-predicate widening documented in
+// docs/26 §11 C1. BuildUserCredServerTools (and, via delegation,
+// getUserMCPTools) key the credential-purge self-heal on isUnauthorizedErr, so
+// the native loop now purges on all four transport phrasings — strictly broader
+// than the former narrow isUnauthorized401 ("unauthorized (401)" only).
+func TestIsUnauthorizedErr_AllForms(t *testing.T) {
+	for _, msg := range []string{
+		"unauthorized (401)",
+		"got 401 unauthorized from server",
+		"request failed with status code 401",
+		"HTTP 401 returned",
+		"Unauthorized (401)", // case-insensitive
+	} {
+		if !isUnauthorizedErr(errors.New(msg)) {
+			t.Fatalf("expected 401 detection for %q", msg)
+		}
+	}
+	for _, msg := range []string{"", "403 forbidden", "500 internal", "timeout"} {
+		if isUnauthorizedErr(errors.New(msg)) {
+			t.Fatalf("did not expect 401 detection for %q", msg)
+		}
+	}
+	if isUnauthorizedErr(nil) {
+		t.Fatal("nil error must not be 401")
+	}
+}
+
 // fakeBridgeStore embeds the package's mockMCPStore (full interface stubs) and
 // overrides the few methods ResolveExternalBridgeTools exercises.
 type fakeBridgeStore struct {
