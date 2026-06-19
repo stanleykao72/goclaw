@@ -119,22 +119,28 @@ func BuildUserCredServerTools(ctx context.Context, st store.MCPServerStore, pool
 		srv.Transport, srv.Command, args, env, srv.URL, headers, srv.TimeoutSec)
 	if err != nil {
 		if isUnauthorizedErr(err) {
-			expiresAt := strings.TrimSpace(uc.Env["BITRIX_EXPIRES_AT"])
-			expired := false
-			if expiresAt != "" {
-				if t, parseErr := time.Parse(time.RFC3339, expiresAt); parseErr == nil {
-					expired = time.Now().UTC().After(t)
+			// Bitrix-specific OAuth diagnostics — only meaningful for a Bitrix24
+			// cred row. Gated so a non-bitrix actor (e.g. lineworks/odoo-prod)
+			// does not emit a misleading all-false BITRIX_* line. The purge below
+			// is UNCONDITIONAL — it self-heals any expired user-cred row.
+			if credHasNonEmpty(uc.Env, "BITRIX_DOMAIN") {
+				expiresAt := strings.TrimSpace(uc.Env["BITRIX_EXPIRES_AT"])
+				expired := false
+				if expiresAt != "" {
+					if t, parseErr := time.Parse(time.RFC3339, expiresAt); parseErr == nil {
+						expired = time.Now().UTC().After(t)
+					}
 				}
+				slog.Warn("mcp.user_401_diagnostics",
+					"server", srv.Name,
+					"user", userID,
+					"has_bitrix_domain", true,
+					"has_access_token", credHasNonEmpty(uc.Env, "BITRIX_ACCESS_TOKEN"),
+					"has_refresh_token", credHasNonEmpty(uc.Env, "BITRIX_REFRESH_TOKEN"),
+					"bitrix_expires_at", expiresAt,
+					"bitrix_expired", expired,
+				)
 			}
-			slog.Warn("mcp.user_401_diagnostics",
-				"server", srv.Name,
-				"user", userID,
-				"has_bitrix_domain", credHasNonEmpty(uc.Env, "BITRIX_DOMAIN"),
-				"has_access_token", credHasNonEmpty(uc.Env, "BITRIX_ACCESS_TOKEN"),
-				"has_refresh_token", credHasNonEmpty(uc.Env, "BITRIX_REFRESH_TOKEN"),
-				"bitrix_expires_at", expiresAt,
-				"bitrix_expired", expired,
-			)
 			_ = st.DeleteUserCredentials(ctx, srv.ID, userID)
 			slog.Warn("mcp.user_credentials_purged", "server", srv.Name, "user", userID, "reason", "unauthorized_401")
 		}

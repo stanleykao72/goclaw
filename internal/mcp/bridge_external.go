@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 
 	"github.com/google/uuid"
@@ -43,6 +44,9 @@ func makeSeedExternalTools(st store.MCPServerStore, pool *Pool, gc GrantChecker,
 		if agentID == uuid.Nil || tenantID == uuid.Nil {
 			return ctx
 		}
+		// NOTE: this ctx UserID is the middleware-set (pre-actor) header value —
+		// it feeds ResolveActorUserID ONLY. Any cred/pool lookup must use the
+		// resolved actorID returned below, never this ctx UserID directly.
 		userID := store.UserIDFromContext(ctx)
 		senderID := store.SenderIDFromContext(ctx)
 		channelType := tools.ToolChannelTypeFromCtx(ctx)
@@ -64,6 +68,10 @@ func makeSeedExternalTools(st store.MCPServerStore, pool *Pool, gc GrantChecker,
 		for _, t := range extTools {
 			bt, ok := t.(*BridgeTool)
 			if !ok {
+				// ResolveExternalBridgeTools only ever returns *BridgeTool today;
+				// log if that ever changes so a tool the LLM expects isn't
+				// silently dropped from the session.
+				slog.Warn("mcp.bridge: skipping non-BridgeTool external tool", "type", t.Name())
 				continue
 			}
 			serverTools[bt.Name()] = mcpserver.ServerTool{
@@ -157,6 +165,9 @@ func (c *sessionToolCleanup) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// delete (streamable_http.go:1360), so the store entry is reclaimed.
 	del, err := http.NewRequestWithContext(context.Background(), http.MethodDelete, r.URL.Path, nil)
 	if err != nil {
+		// Entry not reclaimed for this request (bounded: one session id). Surface
+		// it so an operator can detect unbounded sessionToolsStore growth.
+		slog.Warn("mcp.bridge: session-tool cleanup request build failed", "session", sid, "err", err)
 		return
 	}
 	del.Header.Set("Mcp-Session-Id", sid)
