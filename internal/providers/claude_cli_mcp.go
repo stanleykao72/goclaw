@@ -27,17 +27,17 @@ type MCPServerEntry struct {
 	Env       map[string]string
 }
 
-// MCPServerLookup returns accessible MCP servers for a given agent ID.
-// Used to inject per-agent DB-backed MCP servers into CLI MCP config.
-type MCPServerLookup func(ctx context.Context, agentID string) []MCPServerEntry
-
 // MCPConfigData holds the base MCP server entries built at startup.
 // Per-session configs are written via WriteMCPConfig with agent context injected.
+//
+// Per-agent DB-backed external MCP servers are NO LONGER injected here (docs/26
+// §11 i-3b): they are force-routed through the goclaw-bridge so every external
+// tool call traverses grant recheck + per-user credential resolution. Only
+// static config-file servers (Servers) plus the goclaw-bridge entry are written.
 type MCPConfigData struct {
-	Servers        map[string]any // external MCP server entries (stdio/sse/http)
-	GatewayAddr    string
-	GatewayToken   string
-	AgentMCPLookup MCPServerLookup // optional: resolves per-agent MCP servers from DB
+	Servers      map[string]any // static config-file MCP server entries (stdio/sse/http)
+	GatewayAddr  string
+	GatewayToken string
 }
 
 // BuildCLIMCPConfigData builds the base MCP server map from config.
@@ -111,27 +111,18 @@ func (d *MCPConfigData) WriteMCPConfig(ctx context.Context, sessionKey string, b
 }
 
 func (d *MCPConfigData) writeMCPConfigInternal(ctx context.Context, sessionKey, agentID, userID, channel, chatID, peerKind, workspace, tenantID, localKey, senderID, channelType string) string {
-	if d == nil || (len(d.Servers) == 0 && d.GatewayAddr == "" && d.AgentMCPLookup == nil) {
+	if d == nil || (len(d.Servers) == 0 && d.GatewayAddr == "") {
 		return ""
 	}
 
 	// Shallow-copy the outer map so we can add the bridge entry without mutating the shared base.
 	// Inner server entries are not modified, so shallow copy is sufficient.
+	// Per-agent DB external servers are intentionally NOT injected here (docs/26
+	// §11 i-3b) — they reach the CLI ONLY via the goclaw-bridge entry below,
+	// which enforces grant recheck + per-user creds. The only keys written are
+	// the static config-file servers plus goclaw-bridge.
 	servers := make(map[string]any, len(d.Servers)+1)
 	maps.Copy(servers, d.Servers)
-
-	// Inject per-agent MCP servers from DB (if lookup is configured and agentID is set)
-	if d.AgentMCPLookup != nil && agentID != "" {
-		for _, srv := range d.AgentMCPLookup(ctx, agentID) {
-			if _, exists := servers[srv.Name]; exists {
-				continue // don't override static/bridge entries
-			}
-			entry := mcpServerEntryToConfig(srv)
-			if len(entry) > 0 {
-				servers[srv.Name] = entry
-			}
-		}
-	}
 
 	// Build bridge entry with per-session agent context headers
 	if d.GatewayAddr != "" {

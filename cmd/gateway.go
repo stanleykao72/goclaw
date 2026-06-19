@@ -362,6 +362,14 @@ func runGateway() {
 		defer mcpPool.Stop()
 	}
 
+	// Wire MCP bridge force-route deps (docs/26 §11 i-3a): the bridge resolves
+	// per-agent external MCP tools per request through the pool + grant checker
+	// instead of the (deleted) CLI --mcp-config direct-inject. Grant checker is
+	// constructed fresh here from the same store + bus the agent resolver uses.
+	if pgStores.MCP != nil && mcpPool != nil {
+		server.SetMCPBridgeDeps(pgStores.MCP, mcpPool, mcpbridge.NewStoreGrantChecker(pgStores.MCP, msgBus))
+	}
+
 	// Populate shared deps struct used by extracted helper methods.
 	deps := &gatewayDeps{
 		cfg:              cfg,

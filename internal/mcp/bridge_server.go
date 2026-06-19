@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"mime"
+	"net/http"
 	"path/filepath"
 	"strings"
 
@@ -12,6 +13,7 @@ import (
 	mcpserver "github.com/mark3labs/mcp-go/server"
 
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
+	"github.com/nextlevelbuilder/goclaw/internal/store"
 	"github.com/nextlevelbuilder/goclaw/internal/tools"
 )
 
@@ -56,12 +58,13 @@ var BridgeToolNames = map[string]bool{
 // over streamable-http transport (stateless mode).
 // msgBus is optional; when non-nil, tools that produce media (deliver:true) will
 // publish file attachments directly to the outbound bus.
-func NewBridgeServer(reg *tools.Registry, version string, msgBus *bus.MessageBus) *mcpserver.StreamableHTTPServer {
+func NewBridgeServer(reg *tools.Registry, version string, msgBus *bus.MessageBus, mcpStore store.MCPServerStore, pool *Pool, grantChecker GrantChecker) http.Handler {
 	srv := mcpserver.NewMCPServer("goclaw-bridge", version,
 		mcpserver.WithToolCapabilities(false),
 	)
 
-	// Register each safe tool from the GoClaw registry
+	// Register each safe tool from the GoClaw registry. These are SHARED builtins
+	// (no per-user state) and live in the process-global tool set — unchanged.
 	var registered int
 	for name := range BridgeToolNames {
 		t, ok := reg.Get(name)
@@ -77,6 +80,25 @@ func NewBridgeServer(reg *tools.Registry, version string, msgBus *bus.MessageBus
 
 	slog.Info("mcp.bridge: tools registered", "count", registered)
 
+	// Force-route per-agent external MCP servers through the bridge (docs/26
+	// §11 i-3a). Only when the MCP store + pool are wired: each request resolves
+	// the agent's external tools for the verified actor and seeds them onto the
+	// ephemeral session (makeSeedExternalTools). This REQUIRES a per-request
+	// unique session id so the per-actor tool sets never collide — use
+	// StatelessGeneratingSessionIdManager (fresh UUID per session), NOT
+	// WithStateLess(true) (whose StatelessSessionIdManager generates "" and would
+	// collapse every concurrent request onto one shared key).
+	if mcpStore != nil && pool != nil {
+		streamable := mcpserver.NewStreamableHTTPServer(srv,
+			mcpserver.WithSessionIdManager(&mcpserver.StatelessGeneratingSessionIdManager{}),
+			mcpserver.WithHTTPContextFunc(makeSeedExternalTools(mcpStore, pool, grantChecker, msgBus)),
+		)
+		// Wrap so each request's seeded session-tool entry is reclaimed (the
+		// one-shot CLI never sends DELETE → unbounded growth otherwise).
+		return &sessionToolCleanup{bridge: streamable}
+	}
+
+	// Builtin-only bridge (no external force-route): unchanged stateless mode.
 	return mcpserver.NewStreamableHTTPServer(srv,
 		mcpserver.WithStateLess(true),
 	)

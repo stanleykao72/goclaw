@@ -91,9 +91,6 @@ func wireHTTP(stores *store.Stores, defaultWorkspace, dataDir, bundledSkillsDir 
 		if stores.SystemConfigs != nil {
 			providersH.SetSystemConfigStore(stores.SystemConfigs)
 		}
-		if stores.MCP != nil {
-			providersH.SetMCPServerLookup(buildMCPServerLookup(stores.MCP))
-		}
 		if stores.Tracing != nil {
 			providersH.SetTracingStore(stores.Tracing)
 		}

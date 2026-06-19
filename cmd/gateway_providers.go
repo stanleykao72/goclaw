@@ -11,8 +11,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/nextlevelbuilder/goclaw/internal/config"
 	"github.com/nextlevelbuilder/goclaw/internal/oauth"
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
@@ -204,66 +202,10 @@ func registerProviders(registry *providers.Registry, cfg *config.Config, modelRe
 	}
 }
 
-// buildMCPServerLookup creates an MCPServerLookup from an MCPServerStore.
-// Returns nil if mcpStore is nil.
-func buildMCPServerLookup(mcpStore store.MCPServerStore) providers.MCPServerLookup {
-	if mcpStore == nil {
-		return nil
-	}
-	return func(ctx context.Context, agentID string) []providers.MCPServerEntry {
-		aid, err := uuid.Parse(agentID)
-		if err != nil {
-			return nil
-		}
-		accessible, err := mcpStore.ListAccessible(ctx, aid, "")
-		if err != nil {
-			slog.Warn("claude-cli: failed to list agent MCP servers", "agent_id", agentID, "error", err)
-			return nil
-		}
-		var entries []providers.MCPServerEntry
-		for _, info := range accessible {
-			srv := info.Server
-			if !srv.Enabled {
-				continue
-			}
-			entry := providers.MCPServerEntry{
-				Name:      srv.Name,
-				Transport: srv.Transport,
-				Command:   srv.Command,
-				URL:       srv.URL,
-				Args:      jsonToStringSlice(srv.Args),
-				Headers:   jsonToStringMap(srv.Headers),
-				Env:       jsonToStringMap(srv.Env),
-			}
-			entries = append(entries, entry)
-		}
-		return entries
-	}
-}
-
-// jsonToStringSlice converts a json.RawMessage to []string.
-func jsonToStringSlice(data json.RawMessage) []string {
-	if len(data) == 0 {
-		return nil
-	}
-	var result []string
-	if err := json.Unmarshal(data, &result); err != nil {
-		return nil
-	}
-	return result
-}
-
-// jsonToStringMap converts a json.RawMessage to map[string]string.
-func jsonToStringMap(data json.RawMessage) map[string]string {
-	if len(data) == 0 {
-		return nil
-	}
-	var result map[string]string
-	if err := json.Unmarshal(data, &result); err != nil {
-		return nil
-	}
-	return result
-}
+// NOTE: per-agent DB MCP servers are NO LONGER injected into the CLI config
+// (docs/26 §11 i-3b). buildMCPServerLookup / jsonToStringSlice / jsonToStringMap
+// were removed — external servers force-route through the goclaw-bridge, which
+// resolves them per request via ListAccessible + grant recheck + per-user creds.
 
 // registerProvidersFromDB loads providers from Postgres and registers them.
 // DB providers are registered after config providers, so they take precedence (overwrite).
@@ -467,8 +409,9 @@ func registerClaudeCLIFromDB(registry *providers.Registry, p store.LLMProviderDa
 	cliOpts = append(cliOpts, providers.WithClaudeCLIName(p.Name))
 	cliOpts = append(cliOpts, providers.WithClaudeCLISecurityHooks("", true, configuredShellDenyPatterns(cfg)))
 	if gatewayAddr != "" {
+		// External per-agent MCP servers are force-routed through the goclaw-bridge
+		// (docs/26 §11 i-3b); only static config + the bridge entry are written.
 		mcpData := providers.BuildCLIMCPConfigData(nil, gatewayAddr, gatewayToken)
-		mcpData.AgentMCPLookup = buildMCPServerLookup(mcpStore)
 		cliOpts = append(cliOpts, providers.WithClaudeCLIMCPConfigData(mcpData))
 	}
 	registry.RegisterForTenant(p.TenantID, providers.NewClaudeCLIProvider(cliPath, cliOpts...))

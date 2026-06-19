@@ -69,6 +69,13 @@ type Server struct {
 	agentStore     store.AgentStore  // for context injection in tools_invoke
 	msgBus         *bus.MessageBus   // for MCP bridge media delivery
 
+	// MCP bridge force-route deps (docs/26 §11 i-3a). When all non-nil, the
+	// bridge resolves + force-routes per-agent external MCP tools per request
+	// instead of relying on the (now-deleted) CLI --mcp-config direct-inject.
+	mcpStore        store.MCPServerStore
+	mcpPool         *mcpbridge.Pool
+	mcpGrantChecker mcpbridge.GrantChecker
+
 	upgrader    websocket.Upgrader
 	rateLimiter *RateLimiter
 	clients     map[string]*Client
@@ -216,7 +223,7 @@ func (s *Server) BuildMux() *http.ServeMux {
 	// prevent unauthenticated tool invocations if port is exposed.
 	if s.tools != nil {
 		if s.cfg.Gateway.Token != "" {
-			bridgeHandler := mcpbridge.NewBridgeServer(s.tools, "1.0.0", s.msgBus)
+			bridgeHandler := mcpbridge.NewBridgeServer(s.tools, "1.0.0", s.msgBus, s.mcpStore, s.mcpPool, s.mcpGrantChecker)
 			handler := tokenAuthMiddleware(s.cfg.Gateway.Token,
 				bridgeContextMiddleware(s.cfg.Gateway.Token, s.agentStore, bridgeHandler))
 			mux.Handle("/mcp/bridge", handler)
@@ -702,6 +709,15 @@ func (s *Server) SetAgentStore(as store.AgentStore) { s.agentStore = as }
 
 // SetMessageBus sets the message bus for MCP bridge media delivery.
 func (s *Server) SetMessageBus(mb *bus.MessageBus) { s.msgBus = mb }
+
+// SetMCPBridgeDeps wires the MCP store, connection pool and grant checker the
+// bridge needs to force-route per-agent external MCP tools (docs/26 §11 i-3a).
+// When any is nil the bridge serves builtins only (no external force-route).
+func (s *Server) SetMCPBridgeDeps(st store.MCPServerStore, pool *mcpbridge.Pool, gc mcpbridge.GrantChecker) {
+	s.mcpStore = st
+	s.mcpPool = pool
+	s.mcpGrantChecker = gc
+}
 
 // SetWorkstationsHandler sets the workstations CRUD handler (Standard edition only).
 func (s *Server) SetWorkstationsHandler(h *httpapi.WorkstationsHandler) {

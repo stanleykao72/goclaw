@@ -36,7 +36,6 @@ type ProvidersHandler struct {
 	secretStore     store.ConfigSecretsStore
 	providerReg     *providers.Registry
 	gatewayAddr     string                           // for injecting MCP bridge into Claude CLI providers
-	mcpLookup       providers.MCPServerLookup        // optional: resolves per-agent MCP servers
 	shellDenyGroups func() map[string]bool           // optional: current global shell deny-group overrides
 	apiBaseFallback func(providerType string) string // optional: config/env fallback for api_base
 	cliMu           sync.Mutex                       // serializes Claude CLI provider create to prevent duplicates
@@ -62,12 +61,6 @@ func (h *ProvidersHandler) SetMessageBus(msgBus *bus.MessageBus) {
 // SetSystemConfigStore sets the system config store for embedding status checks.
 func (h *ProvidersHandler) SetSystemConfigStore(s store.SystemConfigStore) {
 	h.sysConfigStore = s
-}
-
-// SetMCPServerLookup sets the per-agent MCP server lookup for Claude CLI providers.
-// Must be called before serving requests (not thread-safe).
-func (h *ProvidersHandler) SetMCPServerLookup(lookup providers.MCPServerLookup) {
-	h.mcpLookup = lookup
 }
 
 // SetShellDenyGroupsSource sets the current global shell deny-group source for
@@ -238,8 +231,9 @@ func (h *ProvidersHandler) registerInMemory(p *store.LLMProviderData) providerRu
 			providers.WithClaudeCLISecurityHooks("", true, h.currentShellDenyPatterns()),
 		}
 		if h.gatewayAddr != "" {
+			// External per-agent MCP servers force-route through the goclaw-bridge
+			// (docs/26 §11 i-3b); only static config + the bridge entry are written.
 			mcpData := providers.BuildCLIMCPConfigData(nil, h.gatewayAddr, pkgGatewayToken)
-			mcpData.AgentMCPLookup = h.mcpLookup
 			cliOpts = append(cliOpts, providers.WithClaudeCLIMCPConfigData(mcpData))
 		}
 		h.providerReg.RegisterForTenant(p.TenantID, providers.NewClaudeCLIProvider(cliPath, cliOpts...))
