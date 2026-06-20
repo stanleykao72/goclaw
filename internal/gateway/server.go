@@ -263,16 +263,21 @@ func (s *Server) BuildMux() *http.ServeMux {
 func bridgeContextMiddleware(gatewayToken string, agentStore store.AgentStore, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
-		agentIDStr := r.Header.Get("X-Agent-ID")
-		userID := r.Header.Get("X-User-ID")
-		channel := r.Header.Get("X-Channel")
-		chatID := r.Header.Get("X-Chat-ID")
-		peerKind := r.Header.Get("X-Peer-Kind")
-		workspace := r.Header.Get("X-Workspace")
-		localKey := r.Header.Get("X-Local-Key")
-		sessionKey := r.Header.Get("X-Session-Key")
-		channelType := r.Header.Get("X-Channel-Type")
-		senderID := r.Header.Get("X-Sender-ID")
+		// Bridge context header values are transport-encoded (base64url behind a
+		// sentinel) when they contain non-ASCII content — see
+		// providers.EncodeBridgeHeaderValue. Decode back to the RAW value before
+		// HMAC verification + ctx injection so signing stays over raw values and
+		// non-ASCII (e.g. CJK group names) survives the latin-1 header transport.
+		agentIDStr := providers.DecodeBridgeHeaderValue(r.Header.Get("X-Agent-ID"))
+		userID := providers.DecodeBridgeHeaderValue(r.Header.Get("X-User-ID"))
+		channel := providers.DecodeBridgeHeaderValue(r.Header.Get("X-Channel"))
+		chatID := providers.DecodeBridgeHeaderValue(r.Header.Get("X-Chat-ID"))
+		peerKind := providers.DecodeBridgeHeaderValue(r.Header.Get("X-Peer-Kind"))
+		workspace := providers.DecodeBridgeHeaderValue(r.Header.Get("X-Workspace"))
+		localKey := providers.DecodeBridgeHeaderValue(r.Header.Get("X-Local-Key"))
+		sessionKey := providers.DecodeBridgeHeaderValue(r.Header.Get("X-Session-Key"))
+		channelType := providers.DecodeBridgeHeaderValue(r.Header.Get("X-Channel-Type"))
+		senderID := providers.DecodeBridgeHeaderValue(r.Header.Get("X-Sender-ID"))
 
 		if agentIDStr != "" || userID != "" {
 			// Reject context headers when no gateway token — prevents unauthenticated impersonation.
@@ -283,8 +288,11 @@ func bridgeContextMiddleware(gatewayToken string, agentStore store.AgentStore, n
 				return
 			}
 
-			// Verify HMAC signature over all context fields.
-			tenantIDStr := r.Header.Get("X-Tenant-ID")
+			// Verify HMAC signature over all context fields. Tenant id is decoded
+			// like the other context headers (no-op for an ASCII UUID, but keeps
+			// the verify input consistent with the signed raw value). The sig
+			// itself is hex (ASCII) and is never encoded.
+			tenantIDStr := providers.DecodeBridgeHeaderValue(r.Header.Get("X-Tenant-ID"))
 			sig := r.Header.Get("X-Bridge-Sig")
 			ok, tenantVerified, senderVerified := providers.VerifyBridgeContext(gatewayToken, agentIDStr, userID, channel, chatID, peerKind, workspace, tenantIDStr, sig, localKey, sessionKey, channelType, senderID)
 			if !ok {

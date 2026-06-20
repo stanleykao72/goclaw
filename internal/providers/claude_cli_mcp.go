@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -15,6 +16,58 @@ import (
 
 	"github.com/nextlevelbuilder/goclaw/internal/config"
 )
+
+// bridgeHeaderEncPrefix marks a base64url-encoded bridge context header value.
+//
+// HTTP header field-values must be ISO-8859-1 (latin-1). The Node-based `claude`
+// CLI's MCP HTTP client REJECTS non-latin-1 header bytes, so when a bridge
+// context header carries non-ASCII content — e.g. `X-Channel`, `X-Session-Key`
+// or `X-Workspace` derived from a CJK group name like "主管群" — the CLI fails
+// to connect to goclaw-bridge entirely (mcp_servers status "failed"), making
+// ALL bridge tools (builtins AND force-routed external MCP tools) unavailable
+// for that session. The old CRLF-only guard did not catch this.
+//
+// EncodeBridgeHeaderValue keeps pure printable-ASCII values verbatim (no
+// behavior change, no HMAC impact) and base64url-encodes anything else behind
+// this sentinel. DecodeBridgeHeaderValue (called by the gateway middleware)
+// reverses it. The HMAC is always computed and verified over the RAW (decoded)
+// value, so signing/verification is unaffected by transport encoding.
+const bridgeHeaderEncPrefix = "=?b64?"
+
+// EncodeBridgeHeaderValue returns an ASCII-safe transport encoding of a bridge
+// context header value. See bridgeHeaderEncPrefix.
+func EncodeBridgeHeaderValue(v string) string {
+	if isPrintableASCII(v) {
+		return v
+	}
+	return bridgeHeaderEncPrefix + base64.RawURLEncoding.EncodeToString([]byte(v))
+}
+
+// DecodeBridgeHeaderValue reverses EncodeBridgeHeaderValue. A value without the
+// sentinel (legacy ASCII headers, or any non-encoded value) is returned as-is.
+// A malformed encoded value is returned verbatim so HMAC verification then
+// fail-closes rather than trusting a corrupted value.
+func DecodeBridgeHeaderValue(v string) string {
+	if !strings.HasPrefix(v, bridgeHeaderEncPrefix) {
+		return v
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(v, bridgeHeaderEncPrefix))
+	if err != nil {
+		return v
+	}
+	return string(raw)
+}
+
+// isPrintableASCII reports whether s contains only printable ASCII (0x20-0x7E),
+// i.e. it is safe to emit verbatim as an HTTP header value.
+func isPrintableASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c < 0x20 || c > 0x7e {
+			return false
+		}
+	}
+	return true
+}
 
 // MCPServerEntry represents a single MCP server config for CLI injection.
 type MCPServerEntry struct {
@@ -130,38 +183,44 @@ func (d *MCPConfigData) writeMCPConfigInternal(ctx context.Context, sessionKey, 
 		if d.GatewayToken != "" {
 			headers["Authorization"] = "Bearer " + d.GatewayToken
 		}
-		if agentID != "" && !strings.ContainsAny(agentID, "\r\n\x00") {
-			headers["X-Agent-ID"] = agentID
+		// Context header values are emitted via EncodeBridgeHeaderValue so that
+		// non-ASCII content (e.g. a CJK group name in channel/workspace/session
+		// key) is base64url-encoded and stays latin-1-safe — otherwise the
+		// Node-based claude CLI rejects the header and the whole goclaw-bridge
+		// connection fails. Pure-ASCII values pass through verbatim. The HMAC
+		// below is computed over the RAW values, so signing is unaffected.
+		if agentID != "" {
+			headers["X-Agent-ID"] = EncodeBridgeHeaderValue(agentID)
 		}
-		if userID != "" && !strings.ContainsAny(userID, "\r\n\x00") {
-			headers["X-User-ID"] = userID
+		if userID != "" {
+			headers["X-User-ID"] = EncodeBridgeHeaderValue(userID)
 		}
-		if channel != "" && !strings.ContainsAny(channel, "\r\n\x00") {
-			headers["X-Channel"] = channel
+		if channel != "" {
+			headers["X-Channel"] = EncodeBridgeHeaderValue(channel)
 		}
-		if chatID != "" && !strings.ContainsAny(chatID, "\r\n\x00") {
-			headers["X-Chat-ID"] = chatID
+		if chatID != "" {
+			headers["X-Chat-ID"] = EncodeBridgeHeaderValue(chatID)
 		}
-		if peerKind != "" && !strings.ContainsAny(peerKind, "\r\n\x00") {
-			headers["X-Peer-Kind"] = peerKind
+		if peerKind != "" {
+			headers["X-Peer-Kind"] = EncodeBridgeHeaderValue(peerKind)
 		}
-		if workspace != "" && !strings.ContainsAny(workspace, "\r\n\x00") {
-			headers["X-Workspace"] = workspace
+		if workspace != "" {
+			headers["X-Workspace"] = EncodeBridgeHeaderValue(workspace)
 		}
-		if tenantID != "" && !strings.ContainsAny(tenantID, "\r\n\x00") {
-			headers["X-Tenant-ID"] = tenantID
+		if tenantID != "" {
+			headers["X-Tenant-ID"] = EncodeBridgeHeaderValue(tenantID)
 		}
-		if localKey != "" && !strings.ContainsAny(localKey, "\r\n\x00") {
-			headers["X-Local-Key"] = localKey
+		if localKey != "" {
+			headers["X-Local-Key"] = EncodeBridgeHeaderValue(localKey)
 		}
-		if senderID != "" && !strings.ContainsAny(senderID, "\r\n\x00") {
-			headers["X-Sender-ID"] = senderID
+		if senderID != "" {
+			headers["X-Sender-ID"] = EncodeBridgeHeaderValue(senderID)
 		}
-		if channelType != "" && !strings.ContainsAny(channelType, "\r\n\x00") {
-			headers["X-Channel-Type"] = channelType
+		if channelType != "" {
+			headers["X-Channel-Type"] = EncodeBridgeHeaderValue(channelType)
 		}
-		if sessionKey != "" && !strings.ContainsAny(sessionKey, "\r\n\x00") {
-			headers["X-Session-Key"] = sessionKey
+		if sessionKey != "" {
+			headers["X-Session-Key"] = EncodeBridgeHeaderValue(sessionKey)
 		}
 		// HMAC signature over all context fields to prevent header forgery.
 		// channelType + senderID are appended as the 3rd/4th TRAILING extras
