@@ -74,8 +74,11 @@ func (c *Channel) handleBotCommand(ctx context.Context, ev callbackEvent) bool {
 				if lerr != nil {
 					slog.Warn("LINEWORKS: reset writer list failed (fail-open)", "err", lerr, "sender", ev.Source.UserID)
 				} else if len(existing) > 0 {
-					// Writers configured → enforce.
-					isWriter, perr := c.configPermStore.CheckPermission(ctx, agentID, groupID, store.ConfigTypeFileWriter, ev.Source.UserID)
+					// Writers configured → enforce. Check against the canonical
+					// senderPrefix-qualified id (matches the /addwriter grant
+					// format + the file-write ACL); the bare user id would never
+					// match a correctly-stored writer grant.
+					isWriter, perr := c.configPermStore.CheckPermission(ctx, agentID, groupID, store.ConfigTypeFileWriter, senderPrefix+ev.Source.UserID)
 					if perr != nil {
 						slog.Warn("LINEWORKS: reset writer check failed (fail-open)", "err", perr, "sender", ev.Source.UserID)
 					} else if !isWriter {

@@ -103,7 +103,7 @@ func TestGate_GroupReset_WriterGated(t *testing.T) {
 	c.SetAgentID("agent-key-1")
 	c.SetTenantID(uuid.New())
 	c.SetAgentStore(fakeAgentStore{id: uuid.New()})
-	c.SetConfigPermStore(&recordingPermStore{writers: []store.ConfigPermission{{UserID: "boss"}}})
+	c.SetConfigPermStore(&recordingPermStore{writers: []store.ConfigPermission{{UserID: "lineworks:boss"}}})
 
 	// Non-writer → denied, nothing published.
 	c.handleMessageEvent(groupEvent("grp1", "userA", "/reset"))
@@ -146,8 +146,26 @@ func TestWriterCommand_PolicyBranches(t *testing.T) {
 		if !c.handleBotCommand(context.Background(), groupEvent("grp1", "userA", "/addwriter userX")) {
 			t.Fatal("expected /addwriter handled")
 		}
-		if len(ps.granted) != 1 || ps.granted[0].UserID != "userX" {
-			t.Fatalf("expected Grant for userX, got %+v", ps.granted)
+		// An explicit arg is canonicalised to the senderPrefix-qualified id so
+		// it matches the file-write ACL key.
+		if len(ps.granted) != 1 || ps.granted[0].UserID != "lineworks:userX" {
+			t.Fatalf("expected Grant for lineworks:userX, got %+v", ps.granted)
+		}
+		if !strings.Contains(cc.all(), "Added") {
+			t.Fatalf("expected success reply, got %q", cc.all())
+		}
+	})
+
+	t.Run("bare addwriter self-adds (bootstrap)", func(t *testing.T) {
+		ps := &recordingPermStore{} // empty → first caller bootstraps via self-add
+		c, cc := newWriterChan(t, ps)
+		if !c.handleBotCommand(context.Background(), groupEvent("grp1", "userA", "/addwriter")) {
+			t.Fatal("expected bare /addwriter handled")
+		}
+		// Bare /addwriter must self-add the sender in the canonical format the
+		// file-write ACL checks (senderPrefix+userId) — the core bug fix.
+		if len(ps.granted) != 1 || ps.granted[0].UserID != "lineworks:userA" {
+			t.Fatalf("expected self-add Grant for lineworks:userA, got %+v", ps.granted)
 		}
 		if !strings.Contains(cc.all(), "Added") {
 			t.Fatalf("expected success reply, got %q", cc.all())
@@ -155,7 +173,7 @@ func TestWriterCommand_PolicyBranches(t *testing.T) {
 	})
 
 	t.Run("non-writer add rejected", func(t *testing.T) {
-		ps := &recordingPermStore{writers: []store.ConfigPermission{{UserID: "userA"}}}
+		ps := &recordingPermStore{writers: []store.ConfigPermission{{UserID: "lineworks:userA"}}}
 		c, cc := newWriterChan(t, ps)
 		if !c.handleBotCommand(context.Background(), groupEvent("grp1", "userB", "/addwriter userY")) {
 			t.Fatal("expected /addwriter handled")
@@ -183,7 +201,7 @@ func TestWriterCommand_PolicyBranches(t *testing.T) {
 	})
 
 	t.Run("cannot remove last writer", func(t *testing.T) {
-		ps := &recordingPermStore{writers: []store.ConfigPermission{{UserID: "userA"}}}
+		ps := &recordingPermStore{writers: []store.ConfigPermission{{UserID: "lineworks:userA"}}}
 		c, cc := newWriterChan(t, ps)
 		if !c.handleBotCommand(context.Background(), groupEvent("grp1", "userA", "/removewriter userZ")) {
 			t.Fatal("expected /removewriter handled")
@@ -196,11 +214,14 @@ func TestWriterCommand_PolicyBranches(t *testing.T) {
 		}
 	})
 
-	t.Run("missing arg usage", func(t *testing.T) {
-		ps := &recordingPermStore{writers: []store.ConfigPermission{{UserID: "userA"}}}
+	t.Run("removewriter missing arg usage", func(t *testing.T) {
+		// /removewriter still requires an explicit target (bare /addwriter now
+		// self-adds rather than showing usage). Sender must be a writer to pass
+		// the auth gate and reach the usage check.
+		ps := &recordingPermStore{writers: []store.ConfigPermission{{UserID: "lineworks:userA"}}}
 		c, cc := newWriterChan(t, ps)
-		if !c.handleBotCommand(context.Background(), groupEvent("grp1", "userA", "/addwriter")) {
-			t.Fatal("expected /addwriter handled")
+		if !c.handleBotCommand(context.Background(), groupEvent("grp1", "userA", "/removewriter")) {
+			t.Fatal("expected /removewriter handled")
 		}
 		if !strings.Contains(cc.all(), "Usage:") {
 			t.Fatalf("expected usage reply, got %q", cc.all())

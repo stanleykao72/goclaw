@@ -81,17 +81,25 @@ func (c *Channel) handleWriterCommand(ctx context.Context, ev callbackEvent, tex
 	}
 
 	groupID := fmt.Sprintf("group:%s:%s", c.Name(), ev.Source.ChannelID)
-	senderID := ev.Source.UserID
+	// Canonical writer id. It MUST equal the id the file-write ACL checks
+	// (store.CheckFilePermission keys on SenderIDFromContext, which for LINE
+	// WORKS is senderPrefix+<user id>). The allowlist grant, this auth gate, and
+	// the /reset gate must all use this same format — otherwise a grant never
+	// matches the write-time check and writes stay denied even after a
+	// "successful" /addwriter. (Before: the grant stored the raw command
+	// argument and the gate compared the bare user id — three mismatched
+	// formats, so file writes were never actually authorized.)
+	selfID := senderPrefix + ev.Source.UserID
 
 	existingWriters, _ := c.configPermStore.ListFileWriters(ctx, agentID, groupID)
 
 	// Authorization gate: only existing writers manage the allowlist. An empty
-	// list lets the first /addwriter caller bootstrap it; /removewriter on an
-	// empty list is rejected.
+	// list lets the first /addwriter caller bootstrap it (self-add);
+	// /removewriter on an empty list is rejected.
 	if len(existingWriters) > 0 {
 		isWriter := false
 		for _, w := range existingWriters {
-			if w.UserID == senderID {
+			if w.UserID == selfID {
 				isWriter = true
 				break
 			}
@@ -105,19 +113,32 @@ func (c *Channel) handleWriterCommand(ctx context.Context, ev callbackEvent, tex
 		return
 	}
 
-	targetID := writerCommandArg(text)
-	if targetID == "" {
-		verb := "add"
-		if action == "remove" {
-			verb = "remove"
-		}
-		c.replyCommand(ctx, ev, localize(lang, keyWriterUsage, verb))
+	// Resolve the target in the canonical (senderPrefix-qualified) format.
+	// Bare "/addwriter" self-adds the sender — the common "give me write access"
+	// flow and the only form guaranteed to match the file-write ACL. An explicit
+	// argument is treated as a LINE WORKS user id and prefixed if it is not
+	// already. /removewriter still requires an explicit target.
+	arg := writerCommandArg(text)
+	var targetID, displayName string
+	switch {
+	case arg == "" && action == "add":
+		targetID = selfID
+		displayName = ev.Source.UserID
+	case arg == "":
+		c.replyCommand(ctx, ev, localize(lang, keyWriterUsage, "remove"))
 		return
+	default:
+		displayName = arg
+		if strings.HasPrefix(arg, senderPrefix) {
+			targetID = arg
+		} else {
+			targetID = senderPrefix + arg
+		}
 	}
 
 	switch action {
 	case "add":
-		meta, _ := json.Marshal(map[string]string{"displayName": targetID})
+		meta, _ := json.Marshal(map[string]string{"displayName": displayName})
 		if err := c.configPermStore.Grant(ctx, &store.ConfigPermission{
 			AgentID:    agentID,
 			Scope:      groupID,
@@ -130,7 +151,7 @@ func (c *Channel) handleWriterCommand(ctx context.Context, ev callbackEvent, tex
 			c.replyCommand(ctx, ev, localize(lang, keyWriterAddFailed))
 			return
 		}
-		c.replyCommand(ctx, ev, localize(lang, keyWriterAdded, targetID))
+		c.replyCommand(ctx, ev, localize(lang, keyWriterAdded, displayName))
 
 	case "remove":
 		if len(existingWriters) <= 1 {
@@ -142,7 +163,7 @@ func (c *Channel) handleWriterCommand(ctx context.Context, ev callbackEvent, tex
 			c.replyCommand(ctx, ev, localize(lang, keyWriterRemoveFailed))
 			return
 		}
-		c.replyCommand(ctx, ev, localize(lang, keyWriterRemoved, targetID))
+		c.replyCommand(ctx, ev, localize(lang, keyWriterRemoved, displayName))
 	}
 }
 
