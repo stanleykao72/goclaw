@@ -1,0 +1,14 @@
+[36m╭──────────────── Tool ────────────────╮[0m
+│ read_file(path="main.go")            │
+╰──────────────────────────────────────╯
+⏺ read_file
+✓ read_file (0.3s)
+[32mRunning[0m
+  45%
+[===>      ] 60%
+
+Here is the analysis.
+
+First, a bug on line 10.
+
+In summary, fix both.
