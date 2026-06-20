@@ -316,6 +316,18 @@ func bridgeContextMiddleware(gatewayToken string, agentStore store.AgentStore, n
 							// bridge otherwise injects only the agent UUID, leaving the key empty
 							// -> session tools fail with "agent context required".
 							ctx = tools.WithToolAgentKey(ctx, ag.AgentKey)
+							// Propagate the per-agent memory backend ("db" | "vault")
+							// so bridge memory tools (write_file/read_file/list_files/
+							// memory_search/memory_get on MEMORY.md & the vault layout)
+							// route to the SAME backend as the native agent loop. Without
+							// this the bridge ctx carries no backend, MemoryBackendFromCtx
+							// defaults to "db", and a vault-mode agent's memory writes
+							// silently land in Postgres+KG instead of the Obsidian vault
+							// file the per-turn auto-injector recalls from — so the saved
+							// memory is never recalled. Mirrors resolver.go's RunContext
+							// (ag.ParseMemoryBackend()); defaults to "db" so non-vault
+							// agents are bit-for-bit unchanged.
+							ctx = store.WithMemoryBackend(ctx, ag.ParseMemoryBackend())
 							groups := ag.ParseShellDenyGroups()
 							if groups != nil {
 								ctx = store.WithShellDenyGroups(ctx, groups)

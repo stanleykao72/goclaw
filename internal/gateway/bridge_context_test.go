@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -59,6 +60,49 @@ func TestBridgeContextMiddleware_InjectsAgentKey(t *testing.T) {
 	}
 	if gotKey != wantKey {
 		t.Errorf("ToolAgentKeyFromCtx = %q, want %q", gotKey, wantKey)
+	}
+}
+
+// TestBridgeContextMiddleware_InjectsMemoryBackend guards the MCP bridge memory
+// routing path: a vault-mode agent's per-agent backend must reach the tool ctx
+// (store.MemoryBackendFromCtx) so bridge memory writes route to the Obsidian
+// vault file the auto-injector recalls from — not Postgres+KG. The regression it
+// pins: a bare bridge ctx defaults to "db", so a vault agent's saved memory
+// silently lands in the wrong backend and is never recalled.
+func TestBridgeContextMiddleware_InjectsMemoryBackend(t *testing.T) {
+	const gatewayToken = "test-gateway-token"
+
+	cases := []struct {
+		name        string
+		otherConfig json.RawMessage
+		want        string
+	}{
+		{"vault agent", json.RawMessage(`{"memory_backend":"vault"}`), "vault"},
+		{"db default (no config)", nil, "db"},
+		{"db default (other keys)", json.RawMessage(`{"prompt_mode":"full"}`), "db"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			agentID := uuid.New()
+			agentStore := &stubAgentKeyStore{ag: &store.AgentData{AgentKey: "k", OtherConfig: tc.otherConfig}}
+
+			var got string
+			next := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+				got = store.MemoryBackendFromCtx(r.Context())
+			})
+			mw := bridgeContextMiddleware(gatewayToken, agentStore, next)
+
+			sig := providers.SignBridgeContext(gatewayToken, agentID.String(), "", "", "", "", "", "", "", "")
+			req := httptest.NewRequest(http.MethodPost, "/mcp/bridge", nil)
+			req.Header.Set("X-Agent-ID", agentID.String())
+			req.Header.Set("X-Bridge-Sig", sig)
+
+			mw.ServeHTTP(httptest.NewRecorder(), req)
+
+			if got != tc.want {
+				t.Errorf("MemoryBackendFromCtx = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 
