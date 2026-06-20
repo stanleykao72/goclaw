@@ -1,0 +1,12 @@
+[36m╭─────────────── Tool ───────────────╮[0m
+│ read_file(path="main.go")            │
+╰────────────────────────────────────╯
+⏺ read_file
+✓ read_file (0.3s)
+● running analysis…
+[32mRunning…[0m
+  45%
+[===>      ] 60%
+
+The function reads the file and returns its contents as a string.
+It returns an error if the path does not exist.
