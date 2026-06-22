@@ -205,6 +205,109 @@ func TestReadFile_MemberNoMemory_NoLeader_Empty(t *testing.T) {
 	}
 }
 
+// --- memory_mode gate tests ---
+
+func TestInterceptor_NotebookMode_WriteFallsThrough(t *testing.T) {
+	ms := newMockMemoryStore()
+	mi := NewMemoryInterceptor(ms, "/workspace", "")
+	agentID := uuid.New()
+
+	// notebook mode: a memory-path write must NOT be intercepted (Handled=false),
+	// so write_file falls through to a normal host write. Nothing is persisted to
+	// the memory store.
+	ctx := store.WithMemoryMode(memCtx(agentID, "user1", ""), store.MemoryModeNotebook)
+	result, err := mi.WriteFile(ctx, "MEMORY.md", "new content", false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Handled {
+		t.Fatal("notebook mode: expected Handled=false (write falls through)")
+	}
+	if _, ok := ms.docs[docKey(agentID.String(), "user1", "MEMORY.md")]; ok {
+		t.Error("notebook mode: memory store must not be written")
+	}
+}
+
+func TestInterceptor_NotebookMode_ReadFallsThrough(t *testing.T) {
+	ms := newMockMemoryStore()
+	mi := NewMemoryInterceptor(ms, "/workspace", "")
+	agentID := uuid.New()
+	ms.docs[docKey(agentID.String(), "user1", "MEMORY.md")] = "my notes"
+
+	ctx := store.WithMemoryMode(memCtx(agentID, "user1", ""), store.MemoryModeNotebook)
+	_, handled, err := mi.ReadFile(ctx, "MEMORY.md")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if handled {
+		t.Error("notebook mode: expected handled=false (read falls through)")
+	}
+}
+
+func TestInterceptor_NotebookMode_ListFallsThrough(t *testing.T) {
+	ms := newMockMemoryStore()
+	mi := NewMemoryInterceptor(ms, "/workspace", "")
+	agentID := uuid.New()
+
+	ctx := store.WithMemoryMode(memCtx(agentID, "user1", ""), store.MemoryModeNotebook)
+	_, handled, err := mi.ListFiles(ctx, "memory")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if handled {
+		t.Error("notebook mode: expected handled=false (list falls through)")
+	}
+}
+
+func TestInterceptor_NotebookMode_WouldRouteVaultFalse(t *testing.T) {
+	ms := newMockMemoryStore()
+	mi := NewMemoryInterceptor(ms, "/vault", "/vault") // vault dir configured
+	agentID := uuid.New()
+
+	// Even with backend=vault, notebook mode must NOT exempt the ACL — the write
+	// is not intercepted into the vault, so the file-writer permission applies.
+	ctx := store.WithMemoryBackend(memCtx(agentID, "user1", ""), "vault")
+	ctx = store.WithMemoryMode(ctx, store.MemoryModeNotebook)
+	if mi.WouldRouteVault(ctx, "MEMORY.md") {
+		t.Error("notebook mode: WouldRouteVault must be false")
+	}
+}
+
+func TestInterceptor_BothMode_StillIndexes(t *testing.T) {
+	ms := newMockMemoryStore()
+	mi := NewMemoryInterceptor(ms, "/workspace", "")
+	agentID := uuid.New()
+
+	// both mode (default) → memory write is intercepted + persisted, unchanged.
+	ctx := store.WithMemoryMode(memCtx(agentID, "user1", ""), store.MemoryModeBoth)
+	result, err := mi.WriteFile(ctx, "MEMORY.md", "kept", false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.Handled {
+		t.Fatal("both mode: expected Handled=true (intercepted)")
+	}
+	if got := ms.docs[docKey(agentID.String(), "user1", "MEMORY.md")]; got != "kept" {
+		t.Errorf("both mode: expected persisted 'kept', got %q", got)
+	}
+}
+
+func TestInterceptor_UnsetMode_DefaultsToBoth(t *testing.T) {
+	ms := newMockMemoryStore()
+	mi := NewMemoryInterceptor(ms, "/workspace", "")
+	agentID := uuid.New()
+
+	// No memory_mode injected → default "both" → interception unchanged.
+	ctx := memCtx(agentID, "user1", "")
+	result, err := mi.WriteFile(ctx, "MEMORY.md", "kept", false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.Handled {
+		t.Fatal("unset mode: expected Handled=true (defaults to both)")
+	}
+}
+
 // --- WriteFile tests ---
 
 func TestWriteFile_NoLeader_AllowWrite(t *testing.T) {
@@ -323,6 +426,84 @@ func TestMemorySearch_LeaderFallback(t *testing.T) {
 	}
 	if !strings.Contains(result.ForLLM, "No memory results found") {
 		t.Errorf("expected no results message, got: %s", result.ForLLM)
+	}
+}
+
+// --- vault read-tool memory_mode gate tests ---
+
+func TestMemorySearch_NotebookMode_NoOp(t *testing.T) {
+	ms := newMockMemoryStore()
+	tool := NewMemorySearchTool()
+	tool.SetMemoryStore(ms)
+
+	// notebook mode → empty (non-error) result without touching the store.
+	ctx := store.WithMemoryMode(memCtx(uuid.New(), "user1", ""), store.MemoryModeNotebook)
+	result := tool.Execute(ctx, map[string]any{"query": "anything"})
+	if result.IsError {
+		t.Fatalf("notebook mode must no-op, not error: %s", result.ForLLM)
+	}
+	if !strings.Contains(result.ForLLM, "No memory results found") {
+		t.Errorf("expected empty-results message, got: %s", result.ForLLM)
+	}
+}
+
+func TestMemorySearch_NotebookMode_NoStore_StillNoOp(t *testing.T) {
+	// Even with NO memory store wired, notebook mode returns the empty result
+	// (gate fires before the "memory system not available" error path).
+	tool := NewMemorySearchTool()
+	ctx := store.WithMemoryMode(memCtx(uuid.New(), "user1", ""), store.MemoryModeNotebook)
+	result := tool.Execute(ctx, map[string]any{"query": "anything"})
+	if result.IsError {
+		t.Fatalf("notebook mode must no-op even without a store: %s", result.ForLLM)
+	}
+}
+
+func TestMemoryGet_NotebookMode_NoOp(t *testing.T) {
+	ms := newMockMemoryStore()
+	tool := NewMemoryGetTool()
+	tool.SetMemoryStore(ms)
+	agentID := uuid.New()
+	ms.docs[docKey(agentID.String(), "user1", "MEMORY.md")] = "secret notes"
+
+	ctx := store.WithMemoryMode(memCtx(agentID, "user1", ""), store.MemoryModeNotebook)
+	result := tool.Execute(ctx, map[string]any{"path": "MEMORY.md"})
+	if result.IsError {
+		t.Fatalf("notebook mode must no-op, not error: %s", result.ForLLM)
+	}
+	if strings.Contains(result.ForLLM, "secret notes") {
+		t.Errorf("notebook mode must NOT return vault content, got: %s", result.ForLLM)
+	}
+}
+
+func TestMemoryExpand_NotebookMode_NoOp(t *testing.T) {
+	tool := NewMemoryExpandTool()
+	epID := uuid.New()
+	ep := &fakeEpisodicStoreRead{byID: map[string]*store.EpisodicSummary{
+		epID.String(): {ID: epID, Summary: "deep secret"},
+	}}
+	tool.SetEpisodicStore(ep)
+
+	ctx := store.WithMemoryMode(context.Background(), store.MemoryModeNotebook)
+	result := tool.Execute(ctx, map[string]any{"id": epID.String()})
+	if result.IsError {
+		t.Fatalf("notebook mode must no-op, not error: %s", result.ForLLM)
+	}
+	if strings.Contains(result.ForLLM, "deep secret") {
+		t.Errorf("notebook mode must NOT return episodic content, got: %s", result.ForLLM)
+	}
+}
+
+func TestMemorySearch_BothMode_StillSearches(t *testing.T) {
+	ms := newMockMemoryStore()
+	tool := NewMemorySearchTool()
+	tool.SetMemoryStore(ms)
+
+	// both mode (default) → search runs (mock returns nil → "No memory results"),
+	// proving the gate did NOT short-circuit before the real search path.
+	ctx := store.WithMemoryMode(memCtx(uuid.New(), "user1", ""), store.MemoryModeBoth)
+	result := tool.Execute(ctx, map[string]any{"query": "test"})
+	if result.IsError {
+		t.Fatalf("both mode unexpected error: %s", result.ForLLM)
 	}
 }
 

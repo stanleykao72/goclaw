@@ -212,6 +212,17 @@ func groupMsg(chatID, senderUID, body string, ts time.Time) store.PendingMessage
 	}
 }
 
+// fakeModes returns a fixed memory_mode and records whether ResolveMode ran.
+type fakeModes struct {
+	mode   string
+	called bool
+}
+
+func (f *fakeModes) ResolveMode(context.Context) string {
+	f.called = true
+	return f.mode
+}
+
 func newWorker(p *fakePending, c *fakeCursor, prov *fakeProvisioner, d *fakeDocs, s *fakeSync, n *fakeNames) *Worker {
 	return &Worker{
 		Pending:     p,
@@ -301,6 +312,91 @@ func TestSweep_DMRoutesToUserScope_GroupToGroupScope(t *testing.T) {
 		if call.scopeKind == store.ScopeKindGroup && call.displayName != "Project Room" {
 			t.Errorf("group displayName not forwarded, got %q", call.displayName)
 		}
+	}
+}
+
+// TestSweep_VaultMode_SkipsIngest verifies that a "vault"-mode deployment agent
+// disables NotebookLM ingest entirely: no pending reads, no provision, no append,
+// no sync, no cursor change.
+func TestSweep_VaultMode_SkipsIngest(t *testing.T) {
+	t0 := time.Date(2026, 6, 22, 10, 0, 0, 0, time.UTC)
+	p := &fakePending{
+		groups: []store.PendingMessageGroup{
+			{ChannelName: channelName, HistoryKey: "userA"},
+		},
+		byKey: map[string][]store.PendingMessage{
+			"userA": {dmMsg("userA", "hello", t0)},
+		},
+	}
+	c := newFakeCursor()
+	prov := &fakeProvisioner{}
+	docs := &fakeDocs{}
+	sync := &fakeSync{}
+	w := newWorker(p, c, prov, docs, sync, &fakeNames{})
+	modes := &fakeModes{mode: store.MemoryModeVault}
+	w.Modes = modes
+
+	w.sweep(context.Background())
+
+	if !modes.called {
+		t.Fatal("ResolveMode should have been consulted")
+	}
+	if len(prov.calls) != 0 || len(docs.appends) != 0 || len(sync.synced) != 0 {
+		t.Fatalf("vault mode must skip ingest entirely, got prov=%d append=%d sync=%d",
+			len(prov.calls), len(docs.appends), len(sync.synced))
+	}
+}
+
+// TestSweep_BothMode_StillIngests verifies that a "both"-mode resolver does NOT
+// disable ingest (the gate only fires for vault).
+func TestSweep_BothMode_StillIngests(t *testing.T) {
+	t0 := time.Date(2026, 6, 22, 10, 0, 0, 0, time.UTC)
+	p := &fakePending{
+		groups: []store.PendingMessageGroup{
+			{ChannelName: channelName, HistoryKey: "userA"},
+		},
+		byKey: map[string][]store.PendingMessage{
+			"userA": {dmMsg("userA", "hello", t0)},
+		},
+	}
+	c := newFakeCursor()
+	prov := &fakeProvisioner{}
+	docs := &fakeDocs{}
+	sync := &fakeSync{}
+	w := newWorker(p, c, prov, docs, sync, &fakeNames{})
+	w.Modes = &fakeModes{mode: store.MemoryModeBoth}
+
+	w.sweep(context.Background())
+
+	if len(prov.calls) != 1 || len(docs.appends) != 1 || len(sync.synced) != 1 {
+		t.Fatalf("both mode must ingest, got prov=%d append=%d sync=%d",
+			len(prov.calls), len(docs.appends), len(sync.synced))
+	}
+}
+
+// TestSweep_NilModeResolver_StillIngests verifies the worker keeps ingesting when
+// no mode resolver is wired (nil → treated as "both"), preserving current
+// behavior and the existing tests that pass no resolver.
+func TestSweep_NilModeResolver_StillIngests(t *testing.T) {
+	t0 := time.Date(2026, 6, 22, 10, 0, 0, 0, time.UTC)
+	p := &fakePending{
+		groups: []store.PendingMessageGroup{
+			{ChannelName: channelName, HistoryKey: "userA"},
+		},
+		byKey: map[string][]store.PendingMessage{
+			"userA": {dmMsg("userA", "hello", t0)},
+		},
+	}
+	c := newFakeCursor()
+	prov := &fakeProvisioner{}
+	docs := &fakeDocs{}
+	sync := &fakeSync{}
+	w := newWorker(p, c, prov, docs, sync, &fakeNames{}) // Modes left nil
+
+	w.sweep(context.Background())
+
+	if len(prov.calls) != 1 {
+		t.Fatalf("nil resolver must default to active ingest, got prov=%d", len(prov.calls))
 	}
 }
 

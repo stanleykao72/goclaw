@@ -147,6 +147,20 @@ type tenantResolver interface {
 	DefaultTenant(ctx context.Context) uuid.UUID
 }
 
+// modeResolver resolves the bound deployment agent's memory_mode
+// ("notebook" | "vault" | "both"). NotebookLM ingest is skipped for a
+// "vault"-mode agent (it does not use NotebookLM). A nil resolver, any miss, or
+// an unknown value yields "both" so ingest stays active by default — preserving
+// current behavior and keeping the worker startable without this dependency.
+//
+// Resolution is deployment-global (the single bound lineworks agent, same
+// assumption directoryClient already makes): PendingMessage carries no agent_id,
+// so per-scope agent binding is not modeled. The worker resolves it ONCE per
+// sweep (memoized) and applies it to every drained scope.
+type modeResolver interface {
+	ResolveMode(ctx context.Context) string
+}
+
 // displayNameResolver best-effort resolves a human title for a scope's Doc on
 // first create (Chinese name for a user, chat title for a group). Returns "" on
 // any miss — the Doc is still created correctly (scope_id is the real key).
@@ -168,6 +182,10 @@ type Worker struct {
 	Sync        sourceSyncer
 	Tenants     tenantResolver
 	Names       displayNameResolver
+	// Modes resolves the bound deployment agent's memory_mode so ingest is
+	// skipped for a "vault"-mode agent. Optional: nil → ingest always active
+	// (treated as "both"), preserving current behavior.
+	Modes modeResolver
 
 	// Interval / MinMessages override the env-resolved defaults when > 0 (tests
 	// set them directly). Zero → resolved from env at Start / per sweep.
@@ -235,6 +253,16 @@ func (w *Worker) sweep(ctx context.Context) {
 		}
 	}
 	ctx = store.WithTenantID(ctx, tenant)
+
+	// Memory mode gate: NotebookLM ingest is skipped entirely for a "vault"-mode
+	// agent (it does not use NotebookLM). Resolved ONCE per sweep — it is
+	// deployment-global. A nil resolver / any miss yields "both" → ingest active,
+	// so behavior is unchanged when the resolver is not wired. The cursor is NOT
+	// advanced (no reads happen), so a later mode change resumes from where it left.
+	if w.Modes != nil && w.Modes.ResolveMode(ctx) == store.MemoryModeVault {
+		slog.Debug("nlm_ingest: sweep skipped — bound agent memory_mode is vault")
+		return
+	}
 
 	groups, err := w.Pending.ListGroups(ctx)
 	if err != nil {

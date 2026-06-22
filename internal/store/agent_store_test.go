@@ -33,6 +33,34 @@ func TestParseMemoryBackend(t *testing.T) {
 	}
 }
 
+func TestParseMemoryMode(t *testing.T) {
+	cases := []struct {
+		name        string
+		otherConfig string
+		want        string
+	}{
+		{"unset defaults to both", "", "both"},
+		{"empty object defaults to both", `{}`, "both"},
+		{"explicit notebook", `{"memory_mode":"notebook"}`, "notebook"},
+		{"explicit vault", `{"memory_mode":"vault"}`, "vault"},
+		{"explicit both", `{"memory_mode":"both"}`, "both"},
+		{"unknown value falls back to both", `{"memory_mode":"nlm"}`, "both"},
+		{"wrong type falls back to both", `{"memory_mode":123}`, "both"},
+		{"malformed json falls back to both", `{not json`, "both"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ag := &AgentData{}
+			if c.otherConfig != "" {
+				ag.OtherConfig = json.RawMessage(c.otherConfig)
+			}
+			if got := ag.ParseMemoryMode(); got != c.want {
+				t.Fatalf("ParseMemoryMode() = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
 func TestParseReasoningConfigDefaultsToOff(t *testing.T) {
 	agent := &AgentData{}
 

@@ -90,6 +90,12 @@ func (t *MemorySearchTool) Execute(ctx context.Context, args map[string]any) *Re
 		return ErrorResult("query parameter is required")
 	}
 
+	// Memory mode gate: a "notebook"-only agent does not use the vault. No-op with
+	// an empty (non-error) result so the turn is unbroken and no FTS/vault read runs.
+	if store.MemoryModeFromCtx(ctx) == store.MemoryModeNotebook {
+		return NewResult("No memory results found for query: " + query)
+	}
+
 	var maxResults int
 	var minScore float64
 	if mr, ok := args["maxResults"].(float64); ok {
@@ -330,6 +336,12 @@ func (t *MemoryGetTool) Execute(ctx context.Context, args map[string]any) *Resul
 	path, _ := args["path"].(string)
 	if path == "" {
 		return ErrorResult("path parameter is required")
+	}
+
+	// Memory mode gate: a "notebook"-only agent does not use the vault. No-op with
+	// a graceful "empty" result (never an error) so the turn is unbroken.
+	if store.MemoryModeFromCtx(ctx) == store.MemoryModeNotebook {
+		return NewResult(fmt.Sprintf("File %s is empty or the specified range has no content.", path))
 	}
 
 	var fromLine, numLines int

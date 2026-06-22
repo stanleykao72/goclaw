@@ -58,6 +58,10 @@ func startNLMIngestWorker(pgStores *store.Stores) func() {
 			channels: pgStores.ChannelInstances,
 			pending:  pgStores.PendingMessages,
 		},
+		Modes: &nlmIngestModeResolver{
+			channels: pgStores.ChannelInstances,
+			agents:   pgStores.Agents,
+		},
 	}
 	cleanup := worker.Start(context.Background())
 	slog.Info("nlm_ingest: ingest worker wired")
@@ -79,6 +83,53 @@ func (r *defaultTenantResolver) DefaultTenant(ctx context.Context) uuid.UUID {
 		return ag.TenantID
 	}
 	return store.MasterTenantID
+}
+
+// nlmIngestModeResolver resolves the bound deployment agent's memory_mode so the
+// ingest worker can skip ingest for a "vault"-mode agent (it does not use
+// NotebookLM). It mirrors directoryClient's single-instance assumption: the agent
+// of the first enabled lineworks channel instance. Resolution is memoized — the
+// deployment binding does not change at runtime — and any miss yields "both" so
+// ingest stays active by default.
+type nlmIngestModeResolver struct {
+	channels store.ChannelInstanceStore
+	agents   store.AgentStore
+
+	once sync.Once
+	mode string
+}
+
+// ResolveMode returns the bound lineworks agent's memory_mode ("notebook" |
+// "vault" | "both"). Falls back to "both" on any miss (no channels store, no
+// enabled lineworks instance, agent lookup failure) so ingest is never disabled
+// by an unresolved binding.
+func (r *nlmIngestModeResolver) ResolveMode(ctx context.Context) string {
+	r.once.Do(func() {
+		r.mode = store.MemoryModeBoth
+		if r.channels == nil || r.agents == nil {
+			return
+		}
+		instances, err := r.channels.ListEnabled(store.WithCrossTenant(ctx))
+		if err != nil {
+			slog.Warn("nlm_ingest: list channel instances failed; ingest mode gate disabled (defaulting to both)", "err", err)
+			return
+		}
+		for _, inst := range instances {
+			if inst.ChannelType != "lineworks" || inst.AgentID == uuid.Nil {
+				continue
+			}
+			ag, aerr := r.agents.GetByIDUnscoped(ctx, inst.AgentID)
+			if aerr != nil || ag == nil {
+				slog.Debug("nlm_ingest: bound agent lookup failed for mode gate (defaulting to both)", "agent_id", inst.AgentID, "err", aerr)
+				return
+			}
+			r.mode = ag.ParseMemoryMode()
+			slog.Info("nlm_ingest: ingest mode gate resolved", "memory_mode", r.mode)
+			return
+		}
+		slog.Info("nlm_ingest: no enabled lineworks instance for mode gate (defaulting to both)")
+	})
+	return r.mode
 }
 
 // nlmIngestNameResolver best-effort resolves Doc titles for new scope notebooks:

@@ -335,6 +335,47 @@ func (a *AgentData) ParseMemoryBackend() string {
 	return backend
 }
 
+// Memory mode constants select which memory subsystem(s) an agent uses.
+// Notebook = NotebookLM (notebook_recall + nlm ingest); Vault = the MEMORY.md
+// vault (memory_search/get/expand + the write_file→memory interceptor); Both =
+// every subsystem active (the default, current behavior).
+const (
+	MemoryModeNotebook = "notebook"
+	MemoryModeVault    = "vault"
+	MemoryModeBoth     = "both"
+)
+
+// validMemoryModes is the set of allowed memory_mode values.
+var validMemoryModes = map[string]bool{
+	MemoryModeNotebook: true, MemoryModeVault: true, MemoryModeBoth: true,
+}
+
+// ParseMemoryMode returns the configured memory mode from OtherConfig JSONB.
+// Returns "both" (every memory subsystem active) when not set, empty, malformed,
+// or not in the whitelist — so any agent without an explicit, valid opt-in keeps
+// the unchanged behavior where notebook + vault are both active.
+func (a *AgentData) ParseMemoryMode() string {
+	if len(a.OtherConfig) == 0 {
+		return MemoryModeBoth
+	}
+	var bag map[string]json.RawMessage
+	if json.Unmarshal(a.OtherConfig, &bag) != nil {
+		return MemoryModeBoth
+	}
+	raw, ok := bag["memory_mode"]
+	if !ok {
+		return MemoryModeBoth
+	}
+	var mode string
+	if json.Unmarshal(raw, &mode) != nil {
+		return MemoryModeBoth
+	}
+	if !validMemoryModes[mode] {
+		return MemoryModeBoth // invalid value → default to both
+	}
+	return mode
+}
+
 // ParsePinnedSkills returns per-agent pinned skill names from OtherConfig JSONB.
 // Max 10 enforced. Returns nil if not set.
 func (a *AgentData) ParsePinnedSkills() []string {

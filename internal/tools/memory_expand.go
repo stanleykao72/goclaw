@@ -23,8 +23,8 @@ func (t *MemoryExpandTool) SetEpisodicStore(es store.EpisodicStore) {
 	t.episodicStore = es
 }
 
-func (t *MemoryExpandTool) Name() string        { return "memory_expand" }
-func (t *MemoryExpandTool) Description() string  {
+func (t *MemoryExpandTool) Name() string { return "memory_expand" }
+func (t *MemoryExpandTool) Description() string {
 	return "Load full content for a memory entry by ID. Returns the complete episodic summary for deep context."
 }
 
@@ -43,11 +43,19 @@ func (t *MemoryExpandTool) Parameters() map[string]any {
 
 // Execute retrieves full episodic summary by ID.
 func (t *MemoryExpandTool) Execute(ctx context.Context, args map[string]any) *Result {
+	id, _ := args["id"].(string)
+
+	// Memory mode gate: a "notebook"-only agent does not use the vault/episodic
+	// store. No-op with a graceful "not found" result (never an error) so the turn
+	// is unbroken — placed BEFORE the episodicStore-nil check so a notebook-mode
+	// agent stays graceful even on a deployment where episodic is not wired.
+	if store.MemoryModeFromCtx(ctx) == store.MemoryModeNotebook {
+		return &Result{ForLLM: "memory entry not found: " + id}
+	}
+
 	if t.episodicStore == nil {
 		return ErrorResult("memory_expand requires v3 episodic memory (not available)")
 	}
-
-	id, _ := args["id"].(string)
 	if id == "" {
 		return ErrorResult("id parameter is required")
 	}

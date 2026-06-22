@@ -200,6 +200,9 @@ type Loop struct {
 	// Memory backend from agent other_config ("db" | "vault"; empty = "db").
 	memoryBackend string
 
+	// Memory mode from agent other_config ("notebook" | "vault" | "both"; empty = "both").
+	memoryMode string
+
 	// Deployment-global vault backend root ("" = vault disabled → db fallback).
 	memoryVaultDir string
 
@@ -411,6 +414,9 @@ type LoopConfig struct {
 	// Memory backend from agent other_config ("db" | "vault"; empty = "db")
 	MemoryBackend string
 
+	// Memory mode from agent other_config ("notebook" | "vault" | "both"; empty = "both")
+	MemoryMode string
+
 	// MemoryVaultDir is the deployment-global vault backend root ("" = disabled).
 	MemoryVaultDir string
 
@@ -585,6 +591,7 @@ func NewLoop(cfg LoopConfig) *Loop {
 		reasoningConfig:        cfg.ReasoningConfig,
 		promptMode:             cfg.PromptMode,
 		memoryBackend:          cfg.MemoryBackend,
+		memoryMode:             cfg.MemoryMode,
 		memoryVaultDir:         cfg.MemoryVaultDir,
 		pinnedSkills:           cfg.PinnedSkills,
 		selfEvolve:             cfg.SelfEvolve,

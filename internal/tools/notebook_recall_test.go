@@ -474,6 +474,41 @@ func TestNotebookRecall_EmptySetNoMemory(t *testing.T) {
 	}
 }
 
+// Vault-mode agent: notebook_recall stays registered but no-ops — it returns the
+// no-memory message WITHOUT querying any notebook, even when scope rows exist.
+func TestNotebookRecall_VaultModeNoOps(t *testing.T) {
+	fr := &fakeRun{stdout: okJSON("should never be returned")}
+	tool := newSetTool(fr, sharedRow("nb-shared"), userRow("user-42", "nb-user"))
+
+	ctx := store.WithMemoryMode(identityCtx(), store.MemoryModeVault)
+	res := tool.Execute(ctx, map[string]any{"question": "q"})
+	if res.IsError {
+		t.Fatalf("vault mode must no-op gracefully, not error: %q", res.ForLLM)
+	}
+	if fr.called() {
+		t.Fatal("vault mode: runner must NOT be called (NotebookLM is inactive)")
+	}
+	if !strings.Contains(res.ForLLM, nlmNoMemoryMessage) {
+		t.Fatalf("expected no-memory message %q, got: %q", nlmNoMemoryMessage, res.ForLLM)
+	}
+}
+
+// Both-mode (and unset → default both) agent: notebook_recall queries normally
+// when rows exist — the gate does NOT disable the active subsystem.
+func TestNotebookRecall_BothModeStillQueries(t *testing.T) {
+	fr := &fakeRun{stdout: okJSON("an answer")}
+	tool := newSetTool(fr, sharedRow("nb-shared"))
+
+	ctx := store.WithMemoryMode(identityCtx(), store.MemoryModeBoth)
+	res := tool.Execute(ctx, map[string]any{"question": "q"})
+	if res.IsError {
+		t.Fatalf("both mode must query, got error: %q", res.ForLLM)
+	}
+	if !fr.called() {
+		t.Fatal("both mode: runner MUST be called (NotebookLM active)")
+	}
+}
+
 // Nil pointer store (zero-value / sqlite stub) degrades to "no memory yet"
 // rather than panicking, and never calls the runner.
 func TestNotebookRecall_NilStoreNoPanic(t *testing.T) {

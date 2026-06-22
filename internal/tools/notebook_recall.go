@@ -192,6 +192,13 @@ func (t *NotebookRecallTool) Execute(ctx context.Context, args map[string]any) *
 		return ErrorResult("question is required")
 	}
 
+	// Memory mode gate: a "vault"-only agent does not use NotebookLM. The tool
+	// stays registered for every agent, but no-ops here (graceful "no memory yet"
+	// result, never an error) so the turn is unbroken and no NotebookLM query runs.
+	if store.MemoryModeFromCtx(ctx) == store.MemoryModeVault {
+		return t.noMemory()
+	}
+
 	// Resolve the caller's ORDERED scope set PURELY from the injected identity.
 	// The LLM's args (including any smuggled "notebook"/"scope" field) play no
 	// role here — they are never read past "question" above.
