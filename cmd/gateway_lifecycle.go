@@ -254,6 +254,17 @@ func (d *gatewayDeps) runLifecycle(
 	// Compiled via build tags: `go build -tags tsnet` to enable.
 	mux := d.server.BuildMux()
 
+	// Mount the single shared LINE WORKS webhook dispatcher ONCE. Multiple
+	// LINE WORKS bots share one path (/webhook/lineworks) demuxed by HMAC, and
+	// the dispatcher queries the live channel registry per request so bots
+	// hot-loaded later are served without a remount. WebhookHandlers() below
+	// deliberately skips lineworks, so this is the only mount of that path —
+	// avoiding a duplicate-registration panic on the stdlib ServeMux.
+	if path, handler, ok := d.channelMgr.LineWorksWebhookDispatcher(); ok {
+		mux.Handle(path, handler)
+		slog.Info("webhook route mounted on gateway (shared lineworks dispatcher)", "path", path)
+	}
+
 	// Mount channel webhook handlers on the main mux (e.g. Feishu /feishu/events).
 	// This allows webhook-based channels to share the main server port.
 	for _, route := range d.channelMgr.WebhookHandlers() {

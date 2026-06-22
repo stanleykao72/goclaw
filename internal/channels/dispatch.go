@@ -3,6 +3,7 @@ package channels
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -124,14 +125,43 @@ func (m *Manager) dispatchOutbound(ctx context.Context) {
 	}
 }
 
+// lineWorksWebhookChannel is the subset of a LINE WORKS channel the shared
+// webhook dispatcher needs. It is type-asserted from the live channel registry
+// at request time so newly hot-loaded bots participate without a remount.
+//
+// The interface is defined HERE (package channels), not by importing the
+// concrete internal/channels/lineworks package, precisely to avoid an import
+// cycle: lineworks already imports channels, so channels must NOT import
+// lineworks. Any channel exposing VerifyAndHandle (today only
+// *lineworks.Channel) is treated as a LINE WORKS webhook bot.
+type lineWorksWebhookChannel interface {
+	Channel
+	// VerifyAndHandle reports whether this bot's secret verifies sig over
+	// rawBody; on a match it dispatches the callback asynchronously and returns
+	// true. On a non-match it returns false with no side effects.
+	VerifyAndHandle(rawBody []byte, sig string) bool
+}
+
 // WebhookHandlers returns all webhook handlers from channels that implement WebhookChannel.
 // Used to mount webhook routes on the main gateway mux.
+//
+// LINE WORKS channels are intentionally EXCLUDED here: their callback payload
+// carries no bot id, so multiple bots must share a single path demuxed by HMAC.
+// The gateway mounts that one shared handler via LineWorksWebhookDispatcher
+// instead; emitting a per-instance route here would register the same path
+// (/webhook/lineworks) more than once and PANIC the stdlib ServeMux. Every
+// other webhook channel type (Feishu, Facebook, pancake, bitrix24, …) keeps its
+// own distinct path and flows through this loop unchanged.
 func (m *Manager) WebhookHandlers() []WebhookRoute {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	var routes []WebhookRoute
 	for _, ch := range m.channels {
+		// Skip LINE WORKS bots — handled by the dedicated shared dispatcher.
+		if _, isLW := ch.(lineWorksWebhookChannel); isLW {
+			continue
+		}
 		if wh, ok := ch.(WebhookChannel); ok {
 			if path, handler := wh.WebhookHandler(); path != "" && handler != nil {
 				routes = append(routes, WebhookRoute{Path: path, Handler: handler})
@@ -139,6 +169,81 @@ func (m *Manager) WebhookHandlers() []WebhookRoute {
 		}
 	}
 	return routes
+}
+
+// LineWorksWebhookDispatcher returns the single shared webhook handler for ALL
+// LINE WORKS bots in this process, to be mounted ONCE on the gateway mux at
+// "/webhook/lineworks". ok is false when no LINE WORKS channel is registered
+// (so the caller mounts nothing).
+//
+// Demux-by-HMAC: the LINE WORKS callback body has no bot id, so the dispatcher
+// identifies the target bot as "the first registered LINE WORKS channel whose
+// bot secret verifies the X-WORKS-Signature over the raw body". The candidate
+// set is collected from the live registry under RLock ON EACH REQUEST, so a bot
+// hot-loaded after startup is seen immediately — the path is mounted exactly
+// once, never remounted, which is what keeps the stdlib ServeMux from panicking
+// regardless of how many bots exist.
+//
+// Security: the raw body is verified (constant-time HMAC, via VerifyAndHandle →
+// lineworks.VerifySignature) BEFORE any bot parses or trusts it; a body that no
+// secret verifies is never dispatched. The handler always replies 200 on the
+// success path before heavy work (the dispatch is async inside VerifyAndHandle),
+// preserving LINE WORKS retry-storm avoidance; 401 when no candidate matches.
+// Secrets and raw bodies are never logged.
+func (m *Manager) LineWorksWebhookDispatcher() (path string, handler http.Handler, ok bool) {
+	// Presence check only — the candidate set is re-collected per request so
+	// hot-loaded bots are picked up without a remount.
+	m.mu.RLock()
+	hasAny := false
+	for _, ch := range m.channels {
+		if _, isLW := ch.(lineWorksWebhookChannel); isLW {
+			hasAny = true
+			break
+		}
+	}
+	m.mu.RUnlock()
+	if !hasAny {
+		return "", nil, false
+	}
+
+	const lwWebhookPath = "/webhook/lineworks"
+	const lwSignatureHeader = "X-WORKS-Signature"
+
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rawBody, err := io.ReadAll(r.Body)
+		if err != nil {
+			slog.Error("LINEWORKS webhook: read body failed", "err", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		sig := r.Header.Get(lwSignatureHeader)
+
+		// Collect the LIVE set of LINE WORKS bots at REQUEST time so hot-loaded
+		// bots participate without remounting the path.
+		m.mu.RLock()
+		candidates := make([]lineWorksWebhookChannel, 0, 4)
+		for _, ch := range m.channels {
+			if lwch, isLW := ch.(lineWorksWebhookChannel); isLW {
+				candidates = append(candidates, lwch)
+			}
+		}
+		m.mu.RUnlock()
+
+		// First bot whose secret verifies the HMAC owns this callback. On a
+		// match VerifyAndHandle dispatches asynchronously; reply 200 immediately.
+		for _, lwch := range candidates {
+			if lwch.VerifyAndHandle(rawBody, sig) {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+		}
+
+		slog.Warn("LINEWORKS webhook: invalid signature: no matching lineworks bot",
+			"candidates", len(candidates))
+		w.WriteHeader(http.StatusUnauthorized)
+	})
+
+	return lwWebhookPath, h, true
 }
 
 // SendToChannel delivers a message to a specific channel by name.
