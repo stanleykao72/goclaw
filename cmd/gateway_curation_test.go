@@ -59,6 +59,10 @@ func (f *fakePendingStore) ListByKey(ctx context.Context, channel, historyKey st
 	return f.byKey[keyOf(channel, historyKey)], nil
 }
 
+func (f *fakePendingStore) ListSince(ctx context.Context, channel, historyKey string, afterCreatedAt time.Time, afterID uuid.UUID, limit int) ([]store.PendingMessage, error) {
+	return nil, nil
+}
+
 func (f *fakePendingStore) DeleteByKey(ctx context.Context, channel, historyKey string) error {
 	return nil
 }

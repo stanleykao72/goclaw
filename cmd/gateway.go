@@ -267,6 +267,12 @@ func runGateway() {
 		slog.Info("channel memory extraction worker registered")
 	}
 
+	// NotebookLM ingest worker (sub-phase 2.3): drains buffered LINE WORKS
+	// conversation (group + DM) into per-scope NotebookLM Docs. Opt-in via
+	// GOCLAW_NLM_INGEST_ENABLED (default false) — a true no-op when off.
+	cleanupNLMIngest := startNLMIngestWorker(pgStores)
+	defer cleanupNLMIngest()
+
 	// V3: Wire vault enrichment worker (async summary + embedding + auto-linking).
 	// Provider is resolved per-tenant at runtime — no static provider needed.
 	var enrichProgress *vault.EnrichProgress

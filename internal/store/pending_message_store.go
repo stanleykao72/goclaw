@@ -40,6 +40,15 @@ type PendingMessageStore interface {
 	// ListByKey returns all pending messages for a channel+historyKey, ordered by created_at ASC.
 	ListByKey(ctx context.Context, channelName, historyKey string) ([]PendingMessage, error)
 
+	// ListSince returns pending messages for a channel+historyKey strictly after
+	// the composite high-water (afterCreatedAt, afterID), ordered by
+	// (created_at ASC, id ASC) and capped at limit (limit <= 0 means no cap). It
+	// is the READ-ONLY window read for the NotebookLM ingest worker: it never
+	// deletes and excludes is_summary rows (the worker ingests raw conversation
+	// only, never channelmemory compaction artifacts). The composite cursor is
+	// collision-safe because AppendBatch stamps one created_at per batch.
+	ListSince(ctx context.Context, channelName, historyKey string, afterCreatedAt time.Time, afterID uuid.UUID, limit int) ([]PendingMessage, error)
+
 	// DeleteByKey removes all pending messages for a channel+historyKey.
 	DeleteByKey(ctx context.Context, channelName, historyKey string) error
 

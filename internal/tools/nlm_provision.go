@@ -42,6 +42,10 @@ type NLMNotebookRunner interface {
 	AddDriveSource(ctx context.Context, notebookID, driveDocID string) error
 	// DeleteNotebook removes a notebook (used to clean up a lost race).
 	DeleteNotebook(ctx context.Context, notebookID string) error
+	// SourceSync refreshes a notebook from its (just-updated) Drive source(s).
+	// The ingest worker (sub-phase 2.3) calls this after appending a drained
+	// window to the scope's Doc, so the notebook re-reads the new content.
+	SourceSync(ctx context.Context, notebookID string) error
 }
 
 // execNLMNotebookRunner shells out to the nlm CLI. The binary is resolved the
@@ -92,6 +96,14 @@ func (r *execNLMNotebookRunner) DeleteNotebook(ctx context.Context, notebookID s
 	_, err := r.run(ctx, r.resolveBinary(), []string{"notebook", "delete", notebookID, "--force"})
 	if err != nil {
 		return fmt.Errorf("nlm notebook delete: %w", err)
+	}
+	return nil
+}
+
+func (r *execNLMNotebookRunner) SourceSync(ctx context.Context, notebookID string) error {
+	_, err := r.run(ctx, r.resolveBinary(), []string{"source", "sync", notebookID})
+	if err != nil {
+		return fmt.Errorf("nlm source sync: %w", err)
 	}
 	return nil
 }

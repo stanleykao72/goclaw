@@ -235,6 +235,17 @@ func (c *Channel) handleMessageEvent(ev callbackEvent) {
 		metaChannelID: ev.Source.ChannelID,
 	}
 
+	// NotebookLM DM ingest capture (sub-phase 2.3). A 1:1 message is buffered
+	// into channel_pending_messages keyed by the user's id so the background
+	// ingest worker lands it in the user-<userId> Doc ONLY (privacy: raw DM text
+	// never auto-flows into agent/shared scopes). Group messages are already
+	// captured above via GroupHistory.Record — this path is DM-only. Fire-and-
+	// forget (the enqueue runs on this goroutine but only buffers; no Drive/nlm),
+	// gated by GOCLAW_NLM_INGEST_ENABLED so OFF accumulates no DM rows.
+	if peerKind == peerDirect {
+		c.recordDirectMessageForIngest(chatID, senderID, senderLabel, text)
+	}
+
 	// Arm a delayed "processing" ack: if the agent's reply is slow (e.g. an Odoo
 	// MCP query), the user gets a one-off acknowledgement instead of silence.
 	// A reply within defaultAckDelay clears it before it fires.

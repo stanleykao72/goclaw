@@ -73,6 +73,7 @@ func NewPGStores(cfg store.StoreConfig) (*store.Stores, error) {
 		WorkstationActivity:    NewPGWorkstationActivityStore(db),
 		UsageCaps:              NewPGUsageCapStore(db),
 		NotebookPointers:       NewPGNotebookPointerStore(db),
+		IngestCursors:          NewPGIngestCursorStore(db),
 	}
 	// Wire permStore into WorkstationStore so Create seeds allowlist atomically (H5 fix).
 	// Must happen after both stores are constructed.
