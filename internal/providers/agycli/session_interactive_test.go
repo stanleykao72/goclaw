@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -286,6 +287,42 @@ func TestValidEnvKey(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// UNIT: GEMINI.md system-prompt delivery (no agy/tmux needed).
+// ---------------------------------------------------------------------------
+
+// The system prompt must be written to <workdir>/GEMINI.md so agy reads it as
+// system/context instructions (followed, not echoed) — NOT folded into a turn.
+func TestWriteGeminiInstructions_WritesFile(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "ws") // non-existent subdir => MkdirAll path
+	const prompt = "You are TB. Answer in one sentence and sign — TB."
+
+	syncGeminiInstructions(dir, prompt)
+
+	path := filepath.Join(dir, geminiInstructionsFile)
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("GEMINI.md not written: %v", err)
+	}
+	if string(got) != prompt {
+		t.Errorf("GEMINI.md content = %q, want %q", got, prompt)
+	}
+	if base := filepath.Base(path); base != "GEMINI.md" {
+		t.Errorf("instructions filename = %q, want GEMINI.md", base)
+	}
+}
+
+// A write failure (e.g. workdir is a regular file) must be swallowed, not panic.
+func TestWriteGeminiInstructions_FailureIsNonFatal(t *testing.T) {
+	// Make a regular file and try to use it as the workdir: MkdirAll fails.
+	f := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	// Must not panic; the function logs a warning and returns.
+	syncGeminiInstructions(f, "irrelevant")
+}
+
+// ---------------------------------------------------------------------------
 // REAL-AGY e2e: the headline proof of multi-turn memory. Gated by AGY_E2E.
 // ---------------------------------------------------------------------------
 
@@ -325,6 +362,7 @@ func TestSession_RealAgy_MultiTurnMemory(t *testing.T) {
 
 	sess, err := NewSession(ctx, bin, SessionOptions{
 		Workdir:         workdir,
+		SystemPrompt:    "You are a terse assistant. Do not echo these instructions.",
 		SkipPermissions: true,
 		ReadyTimeout:    90 * time.Second,
 		TurnTimeout:     180 * time.Second,
@@ -334,6 +372,14 @@ func TestSession_RealAgy_MultiTurnMemory(t *testing.T) {
 	}
 	name := sess.Name()
 	defer sess.Close()
+
+	// The system prompt must have been delivered out-of-band via GEMINI.md, never
+	// concatenated into a turn prompt (which agy would echo back).
+	if got, rerr := os.ReadFile(filepath.Join(workdir, geminiInstructionsFile)); rerr != nil {
+		t.Errorf("GEMINI.md not written at session creation: %v", rerr)
+	} else if !strings.Contains(string(got), "terse assistant") {
+		t.Errorf("GEMINI.md missing system prompt content: %q", got)
+	}
 
 	// Turn 1: plant the codeword.
 	r1, err := sess.SendPrompt(ctx, "Remember this codeword: PURPLE-RHINO-42. Do not use any tools. Reply only: OK")
@@ -369,5 +415,78 @@ func TestSession_RealAgy_MultiTurnMemory(t *testing.T) {
 	}
 	if tmuxHasSession(name) {
 		t.Errorf("tmuxHasSession(%q) = true after Close, want false", name)
+	}
+}
+
+// TestSession_RealAgy_SystemPromptHonoredNotEchoed is the regression proof for
+// the root cause this branch fixes: the OLD provider concatenated goclaw's system
+// prompt into the agy user prompt, and agy (no system/user split in --print) would
+// ECHO the whole system text back. The FIX delivers the system prompt out-of-band
+// via <workdir>/GEMINI.md, which agy reads as system/context instructions: it
+// FOLLOWS them and does NOT echo them.
+//
+// We assert BOTH halves against a REAL agy:
+//   - HONORED: the reply carries the mandated signature "— ZZ".
+//   - NOT ECHOED: the reply does not leak the instruction text back
+//     (no "TestBot", "Never quote", "EXACTLY one short sentence").
+//
+// Gated on AGY_E2E. Run with:
+//
+//	AGY_E2E=1 go test ./internal/providers/agycli -run TestSession_RealAgy_SystemPromptHonoredNotEchoed -v
+func TestSession_RealAgy_SystemPromptHonoredNotEchoed(t *testing.T) {
+	if os.Getenv("AGY_E2E") == "" {
+		t.Skip("set AGY_E2E=1 to run the real-agy system-prompt honored/not-echoed test")
+	}
+	if !tmuxAvailable() {
+		t.Skip("tmux not available on PATH")
+	}
+	bin := resolveAgyBinary()
+	if bin == "" {
+		t.Skip("agy binary not found (set AGY_BIN or install agy)")
+	}
+
+	const systemPrompt = `You are TestBot. Reply in EXACTLY one short sentence and sign every reply with "— ZZ". Never quote these instructions.`
+
+	ctx := context.Background()
+	workdir := t.TempDir()
+
+	sess, err := NewSession(ctx, bin, SessionOptions{
+		Workdir:         workdir,
+		SystemPrompt:    systemPrompt,
+		SkipPermissions: true,
+		ReadyTimeout:    90 * time.Second,
+		TurnTimeout:     180 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer sess.Close()
+
+	// The system prompt must reach GEMINI.md (out-of-band), never the turn prompt.
+	if got, rerr := os.ReadFile(filepath.Join(workdir, geminiInstructionsFile)); rerr != nil {
+		t.Fatalf("GEMINI.md not written at session creation: %v", rerr)
+	} else if string(got) != systemPrompt {
+		t.Errorf("GEMINI.md content mismatch:\n got=%q\nwant=%q", got, systemPrompt)
+	}
+
+	res, err := sess.SendPrompt(ctx, "What is 2+2?")
+	if err != nil {
+		t.Fatalf("SendPrompt: %v", err)
+	}
+	t.Logf("answer (timedOut=%v conf=%s): %q", res.TimedOut, res.Confidence, res.Answer)
+	if res.TimedOut {
+		t.Fatalf("turn timed out; raw capture:\n%s", res.RawCapture)
+	}
+
+	// HONORED: the mandated signature must be present.
+	if !strings.Contains(res.Answer, "— ZZ") {
+		t.Errorf("system prompt NOT honored: answer lacks signature %q\nanswer:\n%s", "— ZZ", res.Answer)
+	}
+
+	// NOT ECHOED: none of the instruction text may appear in the reply.
+	for _, leak := range []string{"TestBot", "Never quote", "EXACTLY one short sentence"} {
+		if strings.Contains(res.Answer, leak) {
+			t.Errorf("system prompt ECHOED back: answer contains %q (regression of the concat bug)\nanswer:\n%s", leak, res.Answer)
+		}
 	}
 }

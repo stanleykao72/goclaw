@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -56,10 +59,17 @@ const (
 	sessionPollInterval = 600 * time.Millisecond
 )
 
+// geminiInstructionsFile is the per-workspace context file agy (Gemini CLI
+// lineage) auto-reads as system/context instructions. agy FOLLOWS its contents
+// and does NOT echo them back, unlike text folded into the --print prompt. We
+// write the system prompt here before launch so it acts as a true system prompt.
+const geminiInstructionsFile = "GEMINI.md"
+
 // SessionOptions configures a persistent interactive agy session.
 type SessionOptions struct {
 	Workdir         string        // cwd for the agy process (agy needs an active workspace)
 	Model           string        // optional; passed as --model at launch when set
+	SystemPrompt    string        // written to <Workdir>/GEMINI.md before launch so agy reads it as system/context instructions; NOT sent as a turn
 	SkipPermissions bool          // --dangerously-skip-permissions at launch
 	Sandbox         bool          // --sandbox at launch
 	PaneWidth       int           // tmux pane width; default defaultPaneWidth (200)
@@ -102,6 +112,17 @@ func NewSession(ctx context.Context, binary string, opts SessionOptions) (*Sessi
 
 	opts = applySessionDefaults(opts)
 
+	// Sync <Workdir>/GEMINI.md BEFORE launch so agy reads the system prompt as
+	// system/context instructions (it follows them and does NOT echo them, the
+	// way folding the system prompt into the --print/turn prompt would). The
+	// workdir is stable per session_key and reused across restarts, so we must
+	// ALSO clear a stale GEMINI.md when this session has no system prompt —
+	// otherwise a previous run's instructions would silently survive. A failure
+	// here is logged but non-fatal: the session can still run without it.
+	if opts.Workdir != "" {
+		syncGeminiInstructions(opts.Workdir, opts.SystemPrompt)
+	}
+
 	name := uniqueSessionName()
 	if err := newTmuxSession(name, opts.PaneWidth, opts.PaneHeight, opts.Workdir); err != nil {
 		return nil, err
@@ -143,6 +164,30 @@ func applySessionDefaults(o SessionOptions) SessionOptions {
 		o.TurnTimeout = DefaultRunTimeout
 	}
 	return o
+}
+
+// writeGeminiInstructions writes the system prompt to <workdir>/GEMINI.md so agy
+// reads it as system/context instructions on launch. The workdir is created if
+// needed (0700) and the file is written 0644 — it is agent instructions that agy
+// must be able to read. Any failure is logged as a warning and swallowed: a
+// missing context file degrades the session but must not abort it.
+func syncGeminiInstructions(workdir, systemPrompt string) {
+	path := filepath.Join(workdir, geminiInstructionsFile)
+	// Empty system prompt: ensure no stale GEMINI.md from a previous run on this
+	// (stable, reused) workdir lingers and silently re-applies old instructions.
+	if systemPrompt == "" {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			slog.Warn("agycli: failed to remove stale GEMINI.md", "path", path, "error", err)
+		}
+		return
+	}
+	if err := os.MkdirAll(workdir, 0o700); err != nil {
+		slog.Warn("agycli: failed to create workdir for GEMINI.md", "dir", workdir, "error", err)
+		return
+	}
+	if err := os.WriteFile(path, []byte(systemPrompt), 0o644); err != nil {
+		slog.Warn("agycli: failed to write GEMINI.md system prompt", "path", path, "error", err)
+	}
 }
 
 // buildInteractiveLaunch assembles the shell line that starts interactive agy in
