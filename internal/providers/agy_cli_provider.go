@@ -22,11 +22,15 @@ import (
 // driven over tmux) and feed every subsequent turn into the SAME process.
 //
 // Therefore this provider keeps a map of live sessions keyed by the goclaw
-// session_key (OptSessionKey). The first turn of a session may carry a system
-// prompt (prepended to the user message, since agy has no separate system-prompt
-// channel); every later turn sends only the user message because the live agy
-// process already remembers the earlier turns. An empty session_key yields a
-// per-call ephemeral session that is Closed at the end of that call.
+// session_key (OptSessionKey). The system prompt is delivered out-of-band: it is
+// written to <workdir>/GEMINI.md at session creation (see
+// agycli.SessionOptions.SystemPrompt), which agy auto-reads as system/context
+// instructions and FOLLOWS without echoing. It is NOT concatenated into any turn
+// prompt — agy's --print path has no system/user separation and would otherwise
+// echo the whole system prompt back as user content. Every turn therefore sends
+// only the user message; the live agy process remembers earlier turns. An empty
+// session_key yields a per-call ephemeral session that is Closed at the end of
+// that call.
 //
 // agy is NOT a token-streaming engine — it renders a TUI and we salvage the
 // final answer once the turn reaches the ready footer. ChatStream therefore
@@ -61,13 +65,12 @@ type agySession interface {
 
 // sessionEntry holds one live agy session plus its bookkeeping. mu serializes
 // concurrent turns on the SAME session (overlapping send-keys would interleave);
-// lastUsed drives idle eviction; firstTurnDone gates the one-time system-prompt
-// prepend.
+// lastUsed drives idle eviction. The system prompt is delivered via GEMINI.md at
+// session creation (not per turn), so no first-turn bookkeeping is needed here.
 type sessionEntry struct {
-	sess          agySession
-	mu            sync.Mutex
-	lastUsed      time.Time
-	firstTurnDone bool
+	sess     agySession
+	mu       sync.Mutex
+	lastUsed time.Time
 }
 
 // AgyCLIProvider implements Provider by driving persistent interactive agy
@@ -235,43 +238,41 @@ func (p *AgyCLIProvider) runTurn(ctx context.Context, req ChatRequest, _ func(St
 		model = p.defaultModel
 	}
 
-	// Empty session_key => ephemeral session: create, use once, close at end.
+	// Empty session_key => ephemeral session: create, use once, close at end. The
+	// system prompt from THIS call is written to the session's GEMINI.md at creation.
 	if sessionKey == "" {
-		entry, err := p.createEntry(ctx, sessionKey, model)
+		entry, err := p.createEntry(ctx, sessionKey, model, systemPrompt)
 		if err != nil {
 			return nil, err
 		}
 		defer entry.sess.Close()
-		return p.turnOnEntry(ctx, entry, systemPrompt, userMsg)
+		return p.turnOnEntry(ctx, entry, userMsg)
 	}
 
-	entry, err := p.getOrCreateEntry(ctx, sessionKey, model)
+	// Sessions are created lazily on first Chat: the systemPrompt captured here is
+	// the one that reaches GEMINI.md at creation. Subsequent turns reuse the live
+	// session (GEMINI.md already written) and only send the user message.
+	entry, err := p.getOrCreateEntry(ctx, sessionKey, model, systemPrompt)
 	if err != nil {
 		return nil, err
 	}
-	return p.turnOnEntry(ctx, entry, systemPrompt, userMsg)
+	return p.turnOnEntry(ctx, entry, userMsg)
 }
 
-// turnOnEntry serializes the turn on the session, prepends the system prompt on
-// the first turn only, sends the prompt, and maps the TurnResult to a ChatResponse.
-func (p *AgyCLIProvider) turnOnEntry(ctx context.Context, entry *sessionEntry, systemPrompt, userMsg string) (*ChatResponse, error) {
+// turnOnEntry serializes the turn on the session, sends ONLY the user message,
+// and maps the TurnResult to a ChatResponse. The system prompt is never folded
+// into the prompt — it was written to the session's GEMINI.md at creation so agy
+// reads it as system/context instructions (see the file header).
+func (p *AgyCLIProvider) turnOnEntry(ctx context.Context, entry *sessionEntry, userMsg string) (*ChatResponse, error) {
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
 
-	prompt := userMsg
-	if !entry.firstTurnDone && systemPrompt != "" {
-		// agy has no separate system-prompt channel; fold it into the first turn.
-		prompt = systemPrompt + "\n\n" + userMsg
-	}
-
-	turn, err := entry.sess.SendPrompt(ctx, prompt)
+	turn, err := entry.sess.SendPrompt(ctx, userMsg)
 	if err != nil {
 		return nil, fmt.Errorf("agy-cli: send prompt: %w", err)
 	}
 
-	// Mark the session as having taken its first turn (so the system prompt is
-	// never prepended again) and refresh idle bookkeeping.
-	entry.firstTurnDone = true
+	// Refresh idle bookkeeping.
 	entry.lastUsed = time.Now()
 
 	if turn.Confidence == agycli.ConfidenceLow {
@@ -290,8 +291,10 @@ func (p *AgyCLIProvider) turnOnEntry(ctx context.Context, entry *sessionEntry, s
 
 // getOrCreateEntry returns the live session for sessionKey, creating it under the
 // provider lock if absent. Concurrent turns on the same key then serialize on the
-// entry's own mutex (mirrors claude-cli's per-session locking).
-func (p *AgyCLIProvider) getOrCreateEntry(ctx context.Context, sessionKey, model string) (*sessionEntry, error) {
+// entry's own mutex (mirrors claude-cli's per-session locking). systemPrompt is
+// used ONLY when the session is created here (written to GEMINI.md); once a
+// session exists it is reused unchanged and systemPrompt is ignored.
+func (p *AgyCLIProvider) getOrCreateEntry(ctx context.Context, sessionKey, model, systemPrompt string) (*sessionEntry, error) {
 	p.mu.Lock()
 	if entry, ok := p.sessions[sessionKey]; ok {
 		p.mu.Unlock()
@@ -301,7 +304,7 @@ func (p *AgyCLIProvider) getOrCreateEntry(ctx context.Context, sessionKey, model
 
 	// Create outside the provider lock (NewSession can block on tmux/ready), then
 	// re-check under the lock so a racing creator wins-once.
-	entry, err := p.createEntry(ctx, sessionKey, model)
+	entry, err := p.createEntry(ctx, sessionKey, model, systemPrompt)
 	if err != nil {
 		return nil, err
 	}
@@ -325,11 +328,14 @@ func (p *AgyCLIProvider) getOrCreateEntry(ctx context.Context, sessionKey, model
 }
 
 // createEntry builds a fresh live session for sessionKey (no map registration).
-func (p *AgyCLIProvider) createEntry(ctx context.Context, sessionKey, model string) (*sessionEntry, error) {
+// systemPrompt is passed to SessionOptions.SystemPrompt so NewSession writes it to
+// <workDir>/GEMINI.md before launch (agy reads it as system/context instructions).
+func (p *AgyCLIProvider) createEntry(ctx context.Context, sessionKey, model, systemPrompt string) (*sessionEntry, error) {
 	workDir := p.ensureWorkDir(sessionKey)
 	sess, err := p.newSession(ctx, agycli.SessionOptions{
 		Workdir:         workDir,
 		Model:           model,
+		SystemPrompt:    systemPrompt,
 		SkipPermissions: p.skipPermissions,
 		Sandbox:         p.sandbox,
 	})

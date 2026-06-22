@@ -148,9 +148,10 @@ func TestAgyCLI_Options(t *testing.T) {
 	}
 }
 
-// First turn with a system prompt prepends it; subsequent turns on the same
-// session send only the user message (live session remembers prior turns).
-func TestAgyCLI_FirstTurnSystemPromptPrepend(t *testing.T) {
+// The system prompt is delivered to the session via SessionOptions.SystemPrompt
+// (written to GEMINI.md at creation), NOT concatenated into any turn. Every turn
+// — including the first — sends ONLY the user message.
+func TestAgyCLI_SystemPromptViaSessionOptionsNotConcatenated(t *testing.T) {
 	ff := &fakeFactory{answer: "answer1"}
 	p := newTestProvider(t, ff)
 	ctx := context.Background()
@@ -174,13 +175,24 @@ func TestAgyCLI_FirstTurnSystemPromptPrepend(t *testing.T) {
 	if ff.count() != 1 {
 		t.Fatalf("expected exactly 1 session created, got %d (session reuse broken)", ff.count())
 	}
+
+	// The system prompt from the FIRST Chat must reach the factory as
+	// SessionOptions.SystemPrompt (it becomes GEMINI.md at session creation).
+	ff.mu.Lock()
+	gotSystem := ff.optsSeen[0].SystemPrompt
+	ff.mu.Unlock()
+	if gotSystem != "You are helpful." {
+		t.Errorf("SessionOptions.SystemPrompt = %q, want %q", gotSystem, "You are helpful.")
+	}
+
+	// SendPrompt must receive ONLY the user message on every turn — never the
+	// system prompt folded in.
 	prompts := ff.at(0).snapshotPrompts()
 	if len(prompts) != 2 {
 		t.Fatalf("expected 2 prompts on the one session, got %d: %v", len(prompts), prompts)
 	}
-	want1 := "You are helpful.\n\nHello"
-	if prompts[0] != want1 {
-		t.Errorf("turn1 prompt = %q, want %q", prompts[0], want1)
+	if prompts[0] != "Hello" {
+		t.Errorf("turn1 prompt = %q, want user-only %q", prompts[0], "Hello")
 	}
 	if prompts[1] != "Second question" {
 		t.Errorf("turn2 prompt = %q, want user-only %q", prompts[1], "Second question")
@@ -246,9 +258,16 @@ func TestAgyCLI_EphemeralSessionClosed(t *testing.T) {
 	if c := ff.at(0).closes(); c != 1 {
 		t.Errorf("ephemeral session not closed: closes=%d", c)
 	}
-	// First (and only) prompt of an ephemeral session still prepends the system prompt.
-	if got := ff.at(0).snapshotPrompts(); len(got) != 1 || got[0] != "sys\n\nq1" {
-		t.Errorf("ephemeral prompt = %v, want [sys\\n\\nq1]", got)
+	// The system prompt reaches the ephemeral session via SessionOptions (GEMINI.md),
+	// and SendPrompt gets only the user message.
+	ff.mu.Lock()
+	gotSystem := ff.optsSeen[0].SystemPrompt
+	ff.mu.Unlock()
+	if gotSystem != "sys" {
+		t.Errorf("ephemeral SessionOptions.SystemPrompt = %q, want %q", gotSystem, "sys")
+	}
+	if got := ff.at(0).snapshotPrompts(); len(got) != 1 || got[0] != "q1" {
+		t.Errorf("ephemeral prompt = %v, want user-only [q1]", got)
 	}
 
 	if _, err := p.Chat(ctx, chatReq("", "", "q2")); err != nil {
