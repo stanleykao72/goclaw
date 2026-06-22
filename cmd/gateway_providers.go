@@ -196,6 +196,8 @@ func registerProviders(registry *providers.Registry, cfg *config.Config, modelRe
 
 	registerClaudeCLIFromConfig(registry, cfg)
 
+	registerAgyCLIFromConfig(registry, cfg)
+
 	// ACP provider (config-based) — orchestrates any ACP-compatible agent binary
 	if cfg.Providers.ACP.Binary != "" {
 		registerACPFromConfig(registry, cfg.Providers.ACP, configuredShellDenyGroups(cfg))
@@ -389,6 +391,29 @@ func registerClaudeCLIFromConfig(registry *providers.Registry, cfg *config.Confi
 		cfg.Providers.ClaudeCLI.BaseWorkDir, true, configuredShellDenyPatterns(cfg)))
 	registry.Register(providers.NewClaudeCLIProvider(cliPath, opts...))
 	slog.Info("registered provider", "name", "claude-cli")
+}
+
+func registerAgyCLIFromConfig(registry *providers.Registry, cfg *config.Config) {
+	if cfg == nil || cfg.Providers.AgyCLI.CLIPath == "" {
+		return
+	}
+	cliPath := cfg.Providers.AgyCLI.CLIPath
+	var opts []providers.AgyCLIOption
+	if cfg.Providers.AgyCLI.Model != "" {
+		opts = append(opts, providers.WithAgyCLIModel(cfg.Providers.AgyCLI.Model))
+	}
+	if cfg.Providers.AgyCLI.BaseWorkDir != "" {
+		opts = append(opts, providers.WithAgyCLIWorkDir(cfg.Providers.AgyCLI.BaseWorkDir))
+	}
+	if cfg.Providers.AgyCLI.Sandbox {
+		opts = append(opts, providers.WithAgyCLISandbox(true))
+	}
+	if cfg.Providers.AgyCLI.SkipPermissions {
+		opts = append(opts, providers.WithAgyCLISkipPermissions(true))
+	}
+	// MCP bridge / security-hooks are claude-specific — agy uses ~/.gemini/config MCP.
+	registry.Register(providers.NewAgyCLIProvider(cliPath, opts...))
+	slog.Info("registered provider", "name", "agy-cli")
 }
 
 func registerClaudeCLIFromDB(registry *providers.Registry, p store.LLMProviderData, gatewayAddr, gatewayToken string, mcpStore store.MCPServerStore, cfg *config.Config) bool {
