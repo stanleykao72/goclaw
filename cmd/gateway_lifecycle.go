@@ -254,6 +254,13 @@ func (d *gatewayDeps) runLifecycle(
 	// Compiled via build tags: `go build -tags tsnet` to enable.
 	mux := d.server.BuildMux()
 
+	// Wire the per-session goclaw MCP bridge into the agy CLI provider now that
+	// BuildMux has constructed the BridgeSessionListeners (nil before BuildMux,
+	// and only non-nil when a gateway token + tools registry are configured). The
+	// agy provider was registered earlier without the bridge; SetBridge supplies
+	// it at runtime. No-op when there is no agy provider or no bridge manager.
+	wireAgyBridge(d.providerRegistry, d.server.BridgeSessionListeners(), d.cfg.Gateway.Token)
+
 	// Mount the single shared LINE WORKS webhook dispatcher ONCE. Multiple
 	// LINE WORKS bots share one path (/webhook/lineworks) demuxed by HMAC, and
 	// the dispatcher queries the live channel registry per request so bots

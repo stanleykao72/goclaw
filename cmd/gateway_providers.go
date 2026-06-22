@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/nextlevelbuilder/goclaw/internal/config"
+	"github.com/nextlevelbuilder/goclaw/internal/gateway"
 	"github.com/nextlevelbuilder/goclaw/internal/oauth"
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
@@ -411,9 +412,42 @@ func registerAgyCLIFromConfig(registry *providers.Registry, cfg *config.Config) 
 	if cfg.Providers.AgyCLI.SkipPermissions {
 		opts = append(opts, providers.WithAgyCLISkipPermissions(true))
 	}
-	// MCP bridge / security-hooks are claude-specific — agy uses ~/.gemini/config MCP.
+	// The per-session goclaw MCP bridge is NOT wired here: the gateway's
+	// BridgeSessionListeners is built later in BuildMux. cmd/gateway calls
+	// wireAgyBridge after BuildMux to supply it via SetBridge. (The claude path's
+	// static --mcp-config injection happens at registration because it does not
+	// need a runtime listener manager.)
 	registry.Register(providers.NewAgyCLIProvider(cliPath, opts...))
 	slog.Info("registered provider", "name", "agy-cli")
+}
+
+// wireAgyBridge wires the per-session goclaw MCP bridge into the already-registered
+// agy CLI provider once BuildMux has constructed the BridgeSessionListeners. It is
+// a no-op when:
+//   - no listeners manager exists (no gateway token / no tools registry), or
+//   - no agy provider is registered (agy not configured), or
+//   - the registered "agy-cli" provider isn't the concrete type (defensive).
+//
+// Each agy session then mints a per-session loopback bridge listener bound to its
+// identity and writes the matching entry into agy's global MCP config at launch
+// (variant 2). gatewayToken is the shared bearer written into that config entry.
+func wireAgyBridge(registry *providers.Registry, listeners *gateway.BridgeSessionListeners, gatewayToken string) {
+	// A typed nil pointer would become a non-nil interface, so guard the pointer
+	// before handing it to SetBridge.
+	if registry == nil || listeners == nil {
+		return
+	}
+	prov, err := registry.Get(context.Background(), providers.AgyCLIProviderName)
+	if err != nil || prov == nil {
+		return // agy not configured — nothing to wire.
+	}
+	agy, ok := prov.(*providers.AgyCLIProvider)
+	if !ok {
+		slog.Warn("agy-cli: registered provider is not *AgyCLIProvider; skipping bridge wiring")
+		return
+	}
+	agy.SetBridge(listeners, gatewayToken)
+	slog.Info("agy-cli: per-session MCP bridge wired")
 }
 
 func registerClaudeCLIFromDB(registry *providers.Registry, p store.LLMProviderData, gatewayAddr, gatewayToken string, mcpStore store.MCPServerStore, cfg *config.Config) bool {

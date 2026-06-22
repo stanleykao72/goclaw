@@ -36,9 +36,15 @@ import (
 // final answer once the turn reaches the ready footer. ChatStream therefore
 // buffers the whole answer and emits it as a single chunk, then a Done chunk.
 
+// AgyCLIProviderName is the default registry name for the agy CLI provider.
+// Exported so cmd/gateway can look the provider up after construction (to wire
+// the per-session bridge once BuildMux has built the listeners) without
+// duplicating the literal.
+const AgyCLIProviderName = "agy-cli"
+
 const (
 	// agyCLIDefaultName is the provider identifier used as the registry key suffix.
-	agyCLIDefaultName = "agy-cli"
+	agyCLIDefaultName = AgyCLIProviderName
 	// agyCLIDefaultModel is the default model passed to agy at session launch.
 	agyCLIDefaultModel = "gemini-3-pro"
 	// agyCLIDefaultIdleTTL is how long a live session may sit unused before the
@@ -63,14 +69,51 @@ type agySession interface {
 	Close() error
 }
 
+// AgyBridgeListeners is the gateway-side per-session loopback bridge manager,
+// reduced to the single method the agy provider needs. It is an interface so the
+// provider depends only on this contract — never on the gateway package — which
+// avoids an import cycle (gateway imports providers). *gateway.BridgeSessionListeners
+// satisfies it structurally via its StartForBridgeContext method.
+//
+// StartForBridgeContext binds a fresh 127.0.0.1 loopback port to the identity in
+// bc (variant 2: port == identity), returning the bridge URL the agy session
+// should connect to plus a closer that tears the port down when the session ends.
+type AgyBridgeListeners interface {
+	StartForBridgeContext(bc BridgeContext, sessionKey string) (url string, closer func() error, err error)
+}
+
 // sessionEntry holds one live agy session plus its bookkeeping. mu serializes
 // concurrent turns on the SAME session (overlapping send-keys would interleave);
 // lastUsed drives idle eviction. The system prompt is delivered via GEMINI.md at
 // session creation (not per turn), so no first-turn bookkeeping is needed here.
+//
+// bridgeCloser, when non-nil, tears down the per-session loopback bridge listener
+// bound to this session's identity. It is invoked exactly once on session
+// Close/reap so the 127.0.0.1 port is reclaimed when the agy process ends.
 type sessionEntry struct {
-	sess     agySession
-	mu       sync.Mutex
-	lastUsed time.Time
+	sess         agySession
+	mu           sync.Mutex
+	lastUsed     time.Time
+	bridgeCloser func() error
+}
+
+// closeEntry closes the live agy session and tears down its per-session bridge
+// listener (if any). Both are attempted regardless of the other's error so a
+// failing session Close never leaks the loopback port. The first non-nil error
+// is returned.
+func closeEntry(entry *sessionEntry) error {
+	var firstErr error
+	if entry.sess != nil {
+		if err := entry.sess.Close(); err != nil {
+			firstErr = err
+		}
+	}
+	if entry.bridgeCloser != nil {
+		if err := entry.bridgeCloser(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // AgyCLIProvider implements Provider by driving persistent interactive agy
@@ -86,6 +129,22 @@ type AgyCLIProvider struct {
 
 	mu       sync.Mutex // protects the sessions map + workdir creation
 	sessions map[string]*sessionEntry
+
+	// bridge, when non-nil, wires per-session goclaw MCP bridge access for each
+	// agy session: createEntry mints a per-session loopback listener bound to the
+	// session's identity and writes the corresponding bridge entry into agy's
+	// global MCP config just before launch. gatewayToken is the shared bearer
+	// written into that (static-shape) config entry. nil bridge => no MCP bridge
+	// (agy uses whatever is already in its global config), preserving the prior
+	// behaviour bit-for-bit.
+	bridge       AgyBridgeListeners
+	gatewayToken string
+
+	// writeBridgeConfig writes the goclaw-bridge entry into agy's global MCP
+	// config and returns the config path. Injectable for tests so unit tests can
+	// assert the written shape against an AGY_CONFIG_DIR temp dir (and never touch
+	// real ~/.gemini). The default calls agycli.MergeAgyMCPConfig.
+	writeBridgeConfig func(servers map[string]any) (string, error)
 
 	// newSession is the session factory, injectable for tests. The default wraps
 	// agycli.NewSession (which takes binary as its 2nd arg) by closing over cliPath.
@@ -149,11 +208,47 @@ func WithAgyCLIIdleTTL(d time.Duration) AgyCLIOption {
 	}
 }
 
+// WithAgyCLIBridge wires per-session goclaw MCP bridge access. listeners is the
+// gateway's per-session loopback bridge manager (variant 2: port == identity);
+// gatewayToken is the shared bearer written into agy's global MCP config entry.
+// When listeners is nil the option is a no-op and the provider behaves exactly as
+// before (no bridge). Threaded in by cmd/gateway after BuildMux constructs the
+// listeners (it is nil until then), so this is applied via a setter at runtime
+// rather than only at construction — see SetBridge.
+func WithAgyCLIBridge(listeners AgyBridgeListeners, gatewayToken string) AgyCLIOption {
+	return func(p *AgyCLIProvider) {
+		p.bridge = listeners
+		p.gatewayToken = gatewayToken
+	}
+}
+
+// SetBridge wires the per-session bridge after construction. The agy provider is
+// registered before the gateway's BridgeSessionListeners exists (it is built in
+// BuildMux), so cmd/gateway calls this once the manager is available. Passing a
+// nil listeners leaves the provider bridge-less.
+func (p *AgyCLIProvider) SetBridge(listeners AgyBridgeListeners, gatewayToken string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.bridge = listeners
+	p.gatewayToken = gatewayToken
+}
+
 // withAgyCLISessionFactory injects a custom session factory (test-only seam).
 func withAgyCLISessionFactory(f func(ctx context.Context, opts agycli.SessionOptions) (agySession, error)) AgyCLIOption {
 	return func(p *AgyCLIProvider) {
 		if f != nil {
 			p.newSession = f
+		}
+	}
+}
+
+// withAgyCLIWriteBridgeConfig injects a custom bridge-config writer (test-only
+// seam) so tests can capture the servers map passed at launch without touching
+// the real agy config dir.
+func withAgyCLIWriteBridgeConfig(f func(servers map[string]any) (string, error)) AgyCLIOption {
+	return func(p *AgyCLIProvider) {
+		if f != nil {
+			p.writeBridgeConfig = f
 		}
 	}
 }
@@ -177,6 +272,10 @@ func NewAgyCLIProvider(cliPath string, opts ...AgyCLIOption) *AgyCLIProvider {
 	p.newSession = func(ctx context.Context, so agycli.SessionOptions) (agySession, error) {
 		return agycli.NewSession(ctx, p.cliPath, so)
 	}
+	// Default bridge-config writer: agy's global ~/.gemini/config/mcp_config.json
+	// (AGY_CONFIG_DIR-overridable). Injectable so tests assert the written shape
+	// against a temp dir without touching real ~/.gemini.
+	p.writeBridgeConfig = agycli.MergeAgyMCPConfig
 	for _, opt := range opts {
 		opt(p)
 	}
@@ -233,6 +332,12 @@ func (p *AgyCLIProvider) runTurn(ctx context.Context, req ChatRequest, _ func(St
 	systemPrompt, userMsg, _, _ := extractFromMessages(req.Messages)
 	sessionKey := extractStringOpt(req.Options, OptSessionKey)
 
+	// Build the bridge identity from the SAME Opt* keys the claude path uses
+	// (agent/user/tenant/channel/chat/peer/workspace/local-key/sender/channel-type).
+	// It is consumed only when a bridge is wired AND the session is created here;
+	// reused sessions keep the identity they were minted with.
+	bc := bridgeContextFromOpts(req.Options)
+
 	model := req.Model
 	if model == "" {
 		model = p.defaultModel
@@ -241,18 +346,19 @@ func (p *AgyCLIProvider) runTurn(ctx context.Context, req ChatRequest, _ func(St
 	// Empty session_key => ephemeral session: create, use once, close at end. The
 	// system prompt from THIS call is written to the session's GEMINI.md at creation.
 	if sessionKey == "" {
-		entry, err := p.createEntry(ctx, sessionKey, model, systemPrompt)
+		entry, err := p.createEntry(ctx, sessionKey, model, systemPrompt, bc)
 		if err != nil {
 			return nil, err
 		}
-		defer entry.sess.Close()
+		// Tear down both the session AND its per-session bridge listener.
+		defer func() { _ = closeEntry(entry) }()
 		return p.turnOnEntry(ctx, entry, userMsg)
 	}
 
 	// Sessions are created lazily on first Chat: the systemPrompt captured here is
 	// the one that reaches GEMINI.md at creation. Subsequent turns reuse the live
 	// session (GEMINI.md already written) and only send the user message.
-	entry, err := p.getOrCreateEntry(ctx, sessionKey, model, systemPrompt)
+	entry, err := p.getOrCreateEntry(ctx, sessionKey, model, systemPrompt, bc)
 	if err != nil {
 		return nil, err
 	}
@@ -294,7 +400,7 @@ func (p *AgyCLIProvider) turnOnEntry(ctx context.Context, entry *sessionEntry, u
 // entry's own mutex (mirrors claude-cli's per-session locking). systemPrompt is
 // used ONLY when the session is created here (written to GEMINI.md); once a
 // session exists it is reused unchanged and systemPrompt is ignored.
-func (p *AgyCLIProvider) getOrCreateEntry(ctx context.Context, sessionKey, model, systemPrompt string) (*sessionEntry, error) {
+func (p *AgyCLIProvider) getOrCreateEntry(ctx context.Context, sessionKey, model, systemPrompt string, bc BridgeContext) (*sessionEntry, error) {
 	p.mu.Lock()
 	if entry, ok := p.sessions[sessionKey]; ok {
 		p.mu.Unlock()
@@ -304,7 +410,7 @@ func (p *AgyCLIProvider) getOrCreateEntry(ctx context.Context, sessionKey, model
 
 	// Create outside the provider lock (NewSession can block on tmux/ready), then
 	// re-check under the lock so a racing creator wins-once.
-	entry, err := p.createEntry(ctx, sessionKey, model, systemPrompt)
+	entry, err := p.createEntry(ctx, sessionKey, model, systemPrompt, bc)
 	if err != nil {
 		return nil, err
 	}
@@ -312,14 +418,15 @@ func (p *AgyCLIProvider) getOrCreateEntry(ctx context.Context, sessionKey, model
 	p.mu.Lock()
 	if existing, ok := p.sessions[sessionKey]; ok {
 		p.mu.Unlock()
-		// Lost the race: discard the one we just built.
-		_ = entry.sess.Close()
+		// Lost the race: discard the one we just built (incl. its bridge listener).
+		_ = closeEntry(entry)
 		return existing, nil
 	}
 	if p.isClosed() {
-		// Provider shut down while we were creating; don't leak the session.
+		// Provider shut down while we were creating; don't leak the session
+		// (or its bridge listener).
 		p.mu.Unlock()
-		_ = entry.sess.Close()
+		_ = closeEntry(entry)
 		return nil, fmt.Errorf("agy-cli: provider is closed")
 	}
 	p.sessions[sessionKey] = entry
@@ -330,7 +437,56 @@ func (p *AgyCLIProvider) getOrCreateEntry(ctx context.Context, sessionKey, model
 // createEntry builds a fresh live session for sessionKey (no map registration).
 // systemPrompt is passed to SessionOptions.SystemPrompt so NewSession writes it to
 // <workDir>/GEMINI.md before launch (agy reads it as system/context instructions).
-func (p *AgyCLIProvider) createEntry(ctx context.Context, sessionKey, model, systemPrompt string) (*sessionEntry, error) {
+//
+// When a bridge is wired, the goclaw MCP bridge is provisioned for this session
+// BEFORE the agy process is launched, in this strict order:
+//  1. Start a per-session 127.0.0.1 loopback listener bound to bc's identity
+//     (variant 2: the port IS the credential).
+//  2. Write the static-shape goclaw-bridge entry (that listener's URL + shared
+//     bearer) into agy's global MCP config. This MUST precede launch because agy
+//     reads the config and connects to the bridge during startup.
+//  3. Launch agy (NewSession).
+//
+// CONCURRENCY (probe 2026-06-22, MEASURED): the config file is SHARED, but agy
+// reads it ONLY at startup and does NOT re-read mid-session, so a concurrent
+// session overwriting the file after THIS agy has launched does not affect it —
+// overlapping sessions are safe. Step 2 must still precede launch so the fresh
+// agy snapshots THIS session's URL. See BridgeSessionListeners.Start and
+// docs/agy-bridge-design.md.
+//
+// If anything fails after the listener is started, the listener is torn down so
+// no loopback port leaks.
+func (p *AgyCLIProvider) createEntry(ctx context.Context, sessionKey, model, systemPrompt string, bc BridgeContext) (*sessionEntry, error) {
+	// Snapshot bridge deps under the lock (SetBridge may run concurrently).
+	p.mu.Lock()
+	bridge := p.bridge
+	gatewayToken := p.gatewayToken
+	writeCfg := p.writeBridgeConfig
+	p.mu.Unlock()
+
+	var bridgeCloser func() error
+	if bridge != nil {
+		// 1. Bind a per-session loopback listener to this session's identity.
+		bridgeURL, closer, err := bridge.StartForBridgeContext(bc, sessionKey)
+		if err != nil {
+			return nil, fmt.Errorf("agy-cli: start bridge listener: %w", err)
+		}
+		bridgeCloser = closer
+
+		// 2. Write the bridge entry into agy's global config BEFORE launch so the
+		// freshly-spawned agy loads THIS session's bridge URL.
+		if writeCfg != nil {
+			servers := agycli.BuildAgyBridgeServers(bridgeURL, gatewayToken)
+			if _, werr := writeCfg(servers); werr != nil {
+				// Could not publish the bridge entry — reclaim the port and fail
+				// rather than launch an agy that can't reach the bridge.
+				_ = bridgeCloser()
+				return nil, fmt.Errorf("agy-cli: write bridge config: %w", werr)
+			}
+		}
+	}
+
+	// 3. Launch agy.
 	workDir := p.ensureWorkDir(sessionKey)
 	sess, err := p.newSession(ctx, agycli.SessionOptions{
 		Workdir:         workDir,
@@ -340,9 +496,12 @@ func (p *AgyCLIProvider) createEntry(ctx context.Context, sessionKey, model, sys
 		Sandbox:         p.sandbox,
 	})
 	if err != nil {
+		if bridgeCloser != nil {
+			_ = bridgeCloser()
+		}
 		return nil, fmt.Errorf("agy-cli: new session: %w", err)
 	}
-	return &sessionEntry{sess: sess, lastUsed: time.Now()}, nil
+	return &sessionEntry{sess: sess, lastUsed: time.Now(), bridgeCloser: bridgeCloser}, nil
 }
 
 // ensureWorkDir returns a stable per-session workdir under baseWorkDir and creates
@@ -367,7 +526,7 @@ func (p *AgyCLIProvider) Close() error {
 		p.sessions = make(map[string]*sessionEntry)
 		p.mu.Unlock()
 		for key, entry := range entries {
-			if err := entry.sess.Close(); err != nil {
+			if err := closeEntry(entry); err != nil {
 				slog.Warn("agy-cli: failed to close session", "session_key", key, "error", err)
 			}
 		}
@@ -414,7 +573,7 @@ func (p *AgyCLIProvider) reapIdle(now time.Time) {
 	p.mu.Unlock()
 
 	for _, entry := range toClose {
-		if err := entry.sess.Close(); err != nil {
+		if err := closeEntry(entry); err != nil {
 			slog.Warn("agy-cli: failed to close idle session", "error", err)
 		}
 	}

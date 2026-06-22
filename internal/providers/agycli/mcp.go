@@ -47,6 +47,41 @@ func AgyMCPConfigPath() string {
 	return filepath.Join(AgyConfigDir(), "mcp_config.json")
 }
 
+// bridgeServerName is the key under "mcpServers" for the goclaw bridge entry in
+// agy's global config. Stable so MergeAgyMCPConfig overwrites the same key each
+// session launch rather than accumulating per-session entries.
+const bridgeServerName = "goclaw-bridge"
+
+// BuildAgyBridgeServers builds the static-shape "goclaw-bridge" server map for
+// agy's global MCP config: a single http-type entry pointing at the per-session
+// loopback bridgeURL with a Bearer Authorization header.
+//
+// Variant 2 (docs/agy-bridge-design.md): the entry carries NO per-user secret
+// and NO X-* identity headers. Identity is bound by the loopback PORT inside
+// bridgeURL (one port == one identity, minted server-side). The only credential
+// on the wire is the SHARED gateway bearer token, which is not a per-user secret.
+// This keeps the shared global config file free of per-user secrets even though
+// the URL itself is per-session.
+//
+// Returns an empty map when bridgeURL is empty (nothing to write); callers
+// should skip the launch-time write in that case. gatewayToken may be empty
+// (then no Authorization header is emitted), matching the bridge-disabled path.
+func BuildAgyBridgeServers(bridgeURL, gatewayToken string) map[string]any {
+	if bridgeURL == "" {
+		return map[string]any{}
+	}
+	entry := map[string]any{
+		"url":  bridgeURL,
+		"type": "http",
+	}
+	if gatewayToken != "" {
+		entry["headers"] = map[string]any{
+			"Authorization": "Bearer " + gatewayToken,
+		}
+	}
+	return map[string]any{bridgeServerName: entry}
+}
+
 // MergeAgyMCPConfig merges servers into agy's global MCP config and atomically
 // writes it back, returning the config path.
 //
