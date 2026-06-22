@@ -76,6 +76,13 @@ type Server struct {
 	mcpPool         *mcpbridge.Pool
 	mcpGrantChecker mcpbridge.GrantChecker
 
+	// bridgeListeners manages per-session loopback MCP bridge listeners for the
+	// agy CLI provider (variant 2: port-as-identity). Constructed in BuildMux
+	// when the bridge handler + gateway token + agent store are available. The
+	// agy provider (next phase) calls Start when launching a session; nothing
+	// calls Start yet.
+	bridgeListeners *BridgeSessionListeners
+
 	upgrader    websocket.Upgrader
 	rateLimiter *RateLimiter
 	clients     map[string]*Client
@@ -227,6 +234,14 @@ func (s *Server) BuildMux() *http.ServeMux {
 			handler := tokenAuthMiddleware(s.cfg.Gateway.Token,
 				bridgeContextMiddleware(s.cfg.Gateway.Token, s.agentStore, bridgeHandler))
 			mux.Handle("/mcp/bridge", handler)
+
+			// Construct the per-session loopback bridge manager for the agy CLI
+			// provider (variant 2). It fronts the SAME bridgeHandler instance
+			// and gateway token; the agy provider (next phase) calls Start to
+			// bind a per-session 127.0.0.1 port whose identity is injected via
+			// the shared injectBridgeIdentity helper. Not started here — only
+			// made reachable on the Server.
+			s.bridgeListeners = NewBridgeSessionListeners(bridgeHandler, s.cfg.Gateway.Token, s.agentStore)
 		} else {
 			slog.Warn("security.mcp_bridge_disabled: no gateway token configured, MCP bridge is disabled")
 			mux.HandleFunc("/mcp/bridge", func(w http.ResponseWriter, _ *http.Request) {
@@ -279,6 +294,21 @@ func bridgeContextMiddleware(gatewayToken string, agentStore store.AgentStore, n
 		channelType := providers.DecodeBridgeHeaderValue(r.Header.Get("X-Channel-Type"))
 		senderID := providers.DecodeBridgeHeaderValue(r.Header.Get("X-Sender-ID"))
 
+		// Build a ResolvedIdentity from the (verified) headers and inject it via
+		// the shared helper so the claude path and the agy per-session-port path
+		// inject identical ctx fields. The header-extraction + token/HMAC gating
+		// below stays identical to the original inline block — only the ctx
+		// injection itself moved into injectBridgeIdentity.
+		id := ResolvedIdentity{
+			UserID:     userID,
+			Channel:    channel,
+			ChatID:     chatID,
+			PeerKind:   peerKind,
+			Workspace:  workspace,
+			LocalKey:   localKey,
+			SessionKey: sessionKey,
+		}
+
 		if agentIDStr != "" || userID != "" {
 			// Reject context headers when no gateway token — prevents unauthenticated impersonation.
 			if gatewayToken == "" {
@@ -302,87 +332,22 @@ func bridgeContextMiddleware(gatewayToken string, agentStore store.AgentStore, n
 				return
 			}
 
+			// AgentID is parsed here (claude path); a parse failure leaves it
+			// uuid.Nil so injectBridgeIdentity skips agent injection — same as
+			// the original guard.
 			if agentIDStr != "" {
-				if id, err := uuid.Parse(agentIDStr); err == nil {
-					ctx = store.WithAgentID(ctx, id)
-
-					// Inject per-agent shell deny group overrides so the exec tool
-					// respects the same policy as the normal agent loop.
-					if agentStore != nil {
-						ag, err := agentStore.GetByIDUnscoped(ctx, id)
-						if err == nil && ag != nil {
-							// Propagate the agent key so bridged session tools (sessions_list/
-							// history/send) can resolve identity via ToolAgentKeyFromCtx. The MCP
-							// bridge otherwise injects only the agent UUID, leaving the key empty
-							// -> session tools fail with "agent context required".
-							ctx = tools.WithToolAgentKey(ctx, ag.AgentKey)
-							// Propagate the per-agent memory backend ("db" | "vault")
-							// so bridge memory tools (write_file/read_file/list_files/
-							// memory_search/memory_get on MEMORY.md & the vault layout)
-							// route to the SAME backend as the native agent loop. Without
-							// this the bridge ctx carries no backend, MemoryBackendFromCtx
-							// defaults to "db", and a vault-mode agent's memory writes
-							// silently land in Postgres+KG instead of the Obsidian vault
-							// file the per-turn auto-injector recalls from — so the saved
-							// memory is never recalled. Mirrors resolver.go's RunContext
-							// (ag.ParseMemoryBackend()); defaults to "db" so non-vault
-							// agents are bit-for-bit unchanged.
-							ctx = store.WithMemoryBackend(ctx, ag.ParseMemoryBackend())
-							groups := ag.ParseShellDenyGroups()
-							if groups != nil {
-								ctx = store.WithShellDenyGroups(ctx, groups)
-							}
-						}
-					}
+				if aid, err := uuid.Parse(agentIDStr); err == nil {
+					id.AgentID = aid
 				}
 			}
-			if userID != "" {
-				ctx = store.WithUserID(ctx, userID)
-			}
-			// Only inject tenant_id when HMAC actually covers it (level 1).
-			// Fallback levels (pre-tenantID sessions) must not trust unsigned tenant headers.
-			if tenantVerified && tenantIDStr != "" {
-				if tid, err := uuid.Parse(tenantIDStr); err == nil {
-					ctx = store.WithTenantID(ctx, tid)
-				}
-			}
-			// Inject sender identity + channel type only when the HMAC covers them
-			// (full tier). Fallback tiers must not trust unsigned X-Sender-ID /
-			// X-Channel-Type headers — forge resistance, mirroring tenantVerified.
-			if senderVerified {
-				if senderID != "" {
-					ctx = store.WithSenderID(ctx, senderID)
-				}
-				if channelType != "" {
-					ctx = tools.WithToolChannelType(ctx, channelType)
-				}
-			}
+			id.TenantID = tenantIDStr
+			id.TenantVerified = tenantVerified
+			id.SenderVerified = senderVerified
+			id.SenderID = senderID
+			id.ChannelType = channelType
 		}
 
-		// Inject channel routing context for tools like message, cron, etc.
-		if channel != "" {
-			ctx = tools.WithToolChannel(ctx, channel)
-		}
-		if chatID != "" {
-			ctx = tools.WithToolChatID(ctx, chatID)
-		}
-		if peerKind != "" {
-			ctx = tools.WithToolPeerKind(ctx, peerKind)
-		}
-		// Inject workspace so bridge tools (read_image, read_file, etc.) can resolve paths.
-		// Only when agent context is present (HMAC-protected) to prevent unauthenticated path injection.
-		if workspace != "" && (agentIDStr != "" || userID != "") {
-			ctx = tools.WithToolWorkspace(ctx, workspace)
-		}
-		// Routing context (localKey, sessionKey) is injected unconditionally like channel/chatID.
-		// These are used for message routing (forum topics), not security-sensitive operations.
-		// Without valid agent context, tool execution will fail anyway.
-		if localKey != "" {
-			ctx = tools.WithToolLocalKey(ctx, localKey)
-		}
-		if sessionKey != "" {
-			ctx = tools.WithToolSessionKey(ctx, sessionKey)
-		}
+		ctx = injectBridgeIdentity(ctx, id, agentStore)
 
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
@@ -428,6 +393,13 @@ func (s *Server) Start(ctx context.Context) error {
 
 	go func() {
 		<-ctx.Done()
+		// Tear down any per-session agy bridge loopback listeners that are still
+		// live (e.g. provider crashed before reaping). Each binds a 127.0.0.1
+		// port to a fixed identity; leaving them up past shutdown would leak
+		// ports. No-op when the bridge manager was never constructed.
+		if s.bridgeListeners != nil {
+			s.bridgeListeners.CloseAll()
+		}
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		s.httpServer.Shutdown(shutdownCtx)
@@ -738,6 +710,12 @@ func (s *Server) SetMCPBridgeDeps(st store.MCPServerStore, pool *mcpbridge.Pool,
 	s.mcpPool = pool
 	s.mcpGrantChecker = gc
 }
+
+// BridgeSessionListeners returns the per-session loopback bridge manager so the
+// agy CLI provider can Start a per-session listener when launching a session.
+// It is constructed in BuildMux and is nil until BuildMux runs with a tools
+// registry and a configured gateway token (s.tools != nil && Gateway.Token != "").
+func (s *Server) BridgeSessionListeners() *BridgeSessionListeners { return s.bridgeListeners }
 
 // SetWorkstationsHandler sets the workstations CRUD handler (Standard edition only).
 func (s *Server) SetWorkstationsHandler(h *httpapi.WorkstationsHandler) {

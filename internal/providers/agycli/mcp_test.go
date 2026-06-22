@@ -37,6 +37,37 @@ func TestAgyMCPConfigPath(t *testing.T) {
 	}
 }
 
+func TestBuildAgyBridgeServers(t *testing.T) {
+	// Full shape: url + type:http + Authorization bearer under "goclaw-bridge".
+	got := BuildAgyBridgeServers("http://127.0.0.1:5555/mcp/bridge", "tok123")
+	entry, ok := got["goclaw-bridge"].(map[string]any)
+	if !ok {
+		t.Fatalf("no goclaw-bridge entry: %v", got)
+	}
+	if entry["url"] != "http://127.0.0.1:5555/mcp/bridge" {
+		t.Errorf("url = %v", entry["url"])
+	}
+	if entry["type"] != "http" {
+		t.Errorf("type = %v, want http", entry["type"])
+	}
+	headers, ok := entry["headers"].(map[string]any)
+	if !ok || headers["Authorization"] != "Bearer tok123" {
+		t.Errorf("headers = %v, want Authorization Bearer tok123", entry["headers"])
+	}
+
+	// Empty token => no headers key (bridge-disabled / no-bearer path).
+	noTok := BuildAgyBridgeServers("http://127.0.0.1:5555/mcp/bridge", "")
+	e2 := noTok["goclaw-bridge"].(map[string]any)
+	if _, present := e2["headers"]; present {
+		t.Errorf("empty token must omit headers, got %v", e2["headers"])
+	}
+
+	// Empty URL => empty map (nothing to write).
+	if m := BuildAgyBridgeServers("", "tok"); len(m) != 0 {
+		t.Errorf("empty url must yield empty map, got %v", m)
+	}
+}
+
 func TestMergeAgyMCPConfig_WriteFresh(t *testing.T) {
 	setTempConfigDir(t)
 	servers := map[string]any{
