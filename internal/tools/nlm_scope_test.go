@@ -215,3 +215,19 @@ func TestResolveNotebookSet_EmptyWhenNoPointers(t *testing.T) {
 		t.Fatalf("got %d, want 0 (no pointers → fail-soft upstream)", len(got))
 	}
 }
+
+// TestNormalizeScopeUserID locks the Phase-2.4 live bug fix: recall user scope_id
+// must be the BARE uid (matching ingest), not the "lineworks:<uid>" raw value.
+func TestNormalizeScopeUserID(t *testing.T) {
+	cases := map[string]string{
+		"lineworks:2e56b7af-f9c5-463b-1cfd-04440ec2d00d": "2e56b7af-f9c5-463b-1cfd-04440ec2d00d",
+		"2e56b7af-f9c5-463b-1cfd-04440ec2d00d":           "2e56b7af-f9c5-463b-1cfd-04440ec2d00d",
+		"line:abc":                                       "abc",
+		"":                                               "",
+	}
+	for in, want := range cases {
+		if got := normalizeScopeUserID(in); got != want {
+			t.Fatalf("normalizeScopeUserID(%q)=%q want %q", in, got, want)
+		}
+	}
+}

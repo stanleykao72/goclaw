@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"strings"
 
 	"github.com/google/uuid"
 
@@ -11,6 +12,16 @@ import (
 // peerKindGroup is the ToolPeerKindFromCtx value indicating a group chat. Only
 // in a group does the group scope apply (and chatId become a valid scope_id).
 const peerKindGroup = "group"
+
+// normalizeScopeUserID strips a leading channel prefix ("lineworks:<uid>" →
+// "<uid>") so the recall scope_id matches the bare uid the ingest worker writes.
+// Ids without a ':' are returned unchanged.
+func normalizeScopeUserID(uid string) string {
+	if i := strings.IndexByte(uid, ':'); i >= 0 {
+		return uid[i+1:]
+	}
+	return uid
+}
 
 // ScopeKey identifies a single memory scope (kind + id). Used by ingest/curate
 // to name the one scope a write targets. ScopeID is "" for shared.
@@ -37,7 +48,12 @@ func scopeKeyForCtx(ctx context.Context, scopeKind string) (ScopeKey, bool) {
 		return ScopeKey{Kind: store.ScopeKindShared, ID: ""}, true
 
 	case store.ScopeKindUser:
-		uid := store.UserIDFromContext(ctx)
+		// CANONICAL scope_id = the BARE user id (channel prefix stripped), so it
+		// matches what the ingest worker writes (it derives scope_id from the
+		// pending row's sender_id with the "lineworks:" prefix removed). Recall
+		// previously used the raw "lineworks:<uid>" → Get missed the ingested
+		// pointer (resolve scopes=0) — the write-scope/recall-scope must agree.
+		uid := normalizeScopeUserID(store.UserIDFromContext(ctx))
 		if uid == "" {
 			return ScopeKey{}, false
 		}
