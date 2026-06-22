@@ -553,6 +553,20 @@ type ToolsConfig struct {
 	ScrubCredentials        *bool                         `json:"scrub_credentials,omitempty"`   // auto-redact API keys/tokens in tool output (default true)
 	McpServers              map[string]*MCPServerConfig   `json:"mcp_servers,omitempty"`         // external MCP server connections
 	DocumentParser          DocumentParserConfig          `json:"document_parser"`               // local-first document text extraction
+	NotebookLM              NotebookLMConfig              `json:"notebooklm"`                    // notebook_recall builtin (nlm CLI shell-out)
+}
+
+// NotebookLMConfig configures the notebook_recall builtin tool. The tool shells
+// out to the nlm CLI (NotebookLM unofficial CLI). Both fields are also
+// overridable via GOCLAW_NLM_BINARY / GOCLAW_NLM_NOTEBOOK env vars (applied in
+// applyEnvOverrides); env wins over file.
+//
+// SECURITY: NotebookID is the SINGLE server-resolved notebook (Phase 1). The
+// LLM never supplies a notebook — notebook_recall's schema is {question} only.
+// Phase 3 replaces the static id with a per-(tenant,agent,scope) resolver.
+type NotebookLMConfig struct {
+	Binary     string `json:"binary,omitempty"`      // nlm binary path/name; empty => "nlm" from PATH
+	NotebookID string `json:"notebook_id,omitempty"` // shared notebook id; empty => env => Phase 1 fallback
 }
 
 // DocumentParserConfig controls local-first document text extraction in the

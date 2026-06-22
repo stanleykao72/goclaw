@@ -91,6 +91,13 @@ func setupToolRegistry(
 	toolsReg.Register(tools.NewKnowledgeGraphSearchTool())
 	slog.Info("memory + knowledge graph tools registered (PG-backed)")
 
+	// notebook_recall — general builtin available to ALL agent types (native
+	// loop, ACP, CLI bridge). Notebook is resolved server-side inside Execute;
+	// the LLM-facing schema is {question} only. Config/env may override the nlm
+	// binary + the shared notebook id.
+	toolsReg.Register(tools.NewNotebookRecallTool(cfg.Tools.NotebookLM.Binary, cfg.Tools.NotebookLM.NotebookID))
+	slog.Info("notebook_recall tool registered (nlm CLI shell-out)")
+
 	// Browser automation tool
 	if cfg.Tools.Browser.Enabled {
 		var opts []browser.Option

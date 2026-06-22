@@ -379,6 +379,10 @@ func (c *Config) applyEnvOverrides() {
 	if c.Tools.Browser.RemoteURL != "" {
 		c.Tools.Browser.Enabled = true
 	}
+
+	// NotebookLM / notebook_recall builtin (nlm CLI shell-out).
+	envStr("GOCLAW_NLM_BINARY", &c.Tools.NotebookLM.Binary)
+	envStr("GOCLAW_NLM_NOTEBOOK", &c.Tools.NotebookLM.NotebookID)
 }
 
 // Save writes the config to a JSON file.

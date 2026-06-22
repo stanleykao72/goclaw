@@ -44,6 +44,7 @@ func inferMetadata(name string) ToolMetadata {
 	case name == "read_file" || name == "list_files" || name == "read_image" ||
 		name == "read_audio" || name == "read_video" || name == "read_document" ||
 		name == "memory_search" || name == "memory_get" || name == "memory_expand" ||
+		name == "notebook_recall" ||
 		name == "skill_search" || name == "knowledge_graph_search" ||
 		name == "sessions_list" || name == "session_status" || name == "sessions_history" ||
 		name == "datetime" || name == "wait" || name == "web_search" || name == "web_fetch":

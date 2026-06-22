@@ -30,10 +30,11 @@ var BridgeToolNames = map[string]bool{
 	"web_search": true,
 	"web_fetch":  true,
 	// Memory & knowledge
-	"memory_search": true,
-	"memory_get":    true,
-	"skill_search":  true,
-	"use_skill":     true,
+	"memory_search":   true,
+	"memory_get":      true,
+	"notebook_recall": true,
+	"skill_search":    true,
+	"use_skill":       true,
 	// Media
 	"read_image":   true,
 	"create_image": true,
