@@ -485,11 +485,40 @@ func (c *Channel) scheduleAck(userID, channelID, chatID string) {
 	}()
 }
 
+// VerifyAndHandle is the per-channel verify+route hook used by the gateway's
+// single LINE WORKS webhook dispatcher (channels.Manager.LineWorksWebhookDispatcher).
+// Because the LINE WORKS callback body carries no bot id, a process hosting
+// multiple LINE WORKS bots demuxes purely by "which bot secret verifies the
+// X-WORKS-Signature HMAC over the raw body". This method answers exactly that
+// for one channel: it returns true iff c.botSecret verifies sig over rawBody,
+// and — only then — kicks off the asynchronous callback dispatch (so the HTTP
+// 200 is not blocked by hook fan-out or agent processing, preserving the
+// existing retry-storm-avoidance behavior). On a non-match it returns false
+// with NO side effects, so the dispatcher can try the next candidate bot.
+//
+// Keeping botSecret private: the dispatcher never sees the secret; it only asks
+// each channel "is this yours?" via this method.
+func (c *Channel) VerifyAndHandle(rawBody []byte, sig string) bool {
+	if !lw.VerifySignature(c.botSecret, rawBody, sig) {
+		return false
+	}
+	// Body is trusted past this point for THIS bot. Dispatch off the request
+	// goroutine so the 200 is not blocked by hook fan-out or agent processing.
+	go c.handleCallback(rawBody)
+	return true
+}
+
 // WebhookHandler returns the HTTP path and handler for LINE WORKS callbacks.
 // The handler verifies the X-WORKS-Signature HMAC over the RAW request body
 // using the bot secret BEFORE parsing, then dispatches asynchronously and
-// always replies 200 so LINE WORKS does not retry-storm. Auto-mounted by the
-// gateway because Channel implements channels.WebhookChannel.
+// always replies 200 so LINE WORKS does not retry-storm.
+//
+// NOTE: As of the multi-bot dispatcher, this per-instance handler is NO LONGER
+// mounted on the gateway mux: channels.Manager.WebhookHandlers() deliberately
+// skips lineworks channels and the gateway mounts ONE shared dispatcher at
+// webhookPath that demuxes across all registered bots via VerifyAndHandle.
+// The method is retained to satisfy the channels.WebhookChannel contract (the
+// compile-time assertion above) and for direct single-bot use in tests.
 func (c *Channel) WebhookHandler() (string, http.Handler) {
 	return webhookPath, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rawBody, err := io.ReadAll(r.Body)
