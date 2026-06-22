@@ -304,35 +304,16 @@ func (a *AgentData) ParsePromptMode() string {
 	return mode
 }
 
-// validMemoryBackends is the set of allowed memory_backend values.
-var validMemoryBackends = map[string]bool{
-	"db": true, "vault": true,
-}
+// Memory backend constants select where memory is persisted.
+// DB = the native Postgres backend; Vault = the Obsidian MEMORY.md vault file.
+const (
+	MemoryBackendDB    = "db"
+	MemoryBackendVault = "vault"
+)
 
-// ParseMemoryBackend returns the configured memory backend from OtherConfig JSONB.
-// Returns "db" (the native Postgres backend) when not set, empty, malformed, or
-// not in the whitelist — so any agent without an explicit, valid opt-in keeps the
-// unchanged DB memory path.
-func (a *AgentData) ParseMemoryBackend() string {
-	if len(a.OtherConfig) == 0 {
-		return "db"
-	}
-	var bag map[string]json.RawMessage
-	if json.Unmarshal(a.OtherConfig, &bag) != nil {
-		return "db"
-	}
-	raw, ok := bag["memory_backend"]
-	if !ok {
-		return "db"
-	}
-	var backend string
-	if json.Unmarshal(raw, &backend) != nil {
-		return "db"
-	}
-	if !validMemoryBackends[backend] {
-		return "db" // invalid value → default to db
-	}
-	return backend
+// validMemoryBackends is the set of allowed legacy memory_backend values.
+var validMemoryBackends = map[string]bool{
+	MemoryBackendDB: true, MemoryBackendVault: true,
 }
 
 // Memory mode constants select which memory subsystem(s) an agent uses.
@@ -345,23 +326,108 @@ const (
 	MemoryModeBoth     = "both"
 )
 
-// validMemoryModes is the set of allowed memory_mode values.
+// validMemoryModes is the set of allowed legacy memory_mode values.
 var validMemoryModes = map[string]bool{
 	MemoryModeNotebook: true, MemoryModeVault: true, MemoryModeBoth: true,
 }
 
-// ParseMemoryMode returns the configured memory mode from OtherConfig JSONB.
-// Returns "both" (every memory subsystem active) when not set, empty, malformed,
-// or not in the whitelist — so any agent without an explicit, valid opt-in keeps
-// the unchanged behavior where notebook + vault are both active.
-func (a *AgentData) ParseMemoryMode() string {
-	if len(a.OtherConfig) == 0 {
-		return MemoryModeBoth
+// Memory* are the public single-field other_config.memory values. Each value
+// decomposes into an internal (mode, backend) pair via ParseMemory — see the
+// decomposition table below. MemoryBothDB is the default (notebook + vault
+// subsystems active with the native Postgres backend == legacy default).
+const (
+	MemoryNotebook  = "notebook"
+	MemoryVault     = "vault"
+	MemoryDB        = "db"
+	MemoryBothVault = "both-vault"
+	MemoryBothDB    = "both-db"
+)
+
+// memoryDecomposition maps each public other_config.memory value to its internal
+// (mode, backend) pair. This is the single source of truth for the public→internal
+// mapping; the migration SQL and docs mirror this table.
+//
+//	notebook    → mode=notebook, backend=db   (backend inert when local off)
+//	vault       → mode=vault,    backend=vault
+//	db          → mode=vault,    backend=db
+//	both-vault  → mode=both,     backend=vault
+//	both-db     → mode=both,     backend=db    (DEFAULT)
+var memoryDecomposition = map[string]MemoryConfigPair{
+	MemoryNotebook:  {Mode: MemoryModeNotebook, Backend: MemoryBackendDB},
+	MemoryVault:     {Mode: MemoryModeVault, Backend: MemoryBackendVault},
+	MemoryDB:        {Mode: MemoryModeVault, Backend: MemoryBackendDB},
+	MemoryBothVault: {Mode: MemoryModeBoth, Backend: MemoryBackendVault},
+	MemoryBothDB:    {Mode: MemoryModeBoth, Backend: MemoryBackendDB},
+}
+
+// MemoryConfigPair is the internal (mode, backend) pair that the gate sites
+// consume. Mode ∈ {notebook, vault, both}; Backend ∈ {db, vault}.
+type MemoryConfigPair struct {
+	Mode    string
+	Backend string
+}
+
+// ParseMemory is the SINGLE SOURCE that resolves an agent's effective memory
+// (mode, backend) pair. Resolution order, lowest-risk-first, never errors:
+//
+//  1. other_config.memory set + in the whitelist → decompose per memoryDecomposition.
+//  2. else FALLBACK to legacy other_config.memory_mode / memory_backend (so
+//     un-migrated rows and anyone still setting the old keys keep working):
+//     mode = legacy memory_mode (default both), backend = legacy memory_backend
+//     (default db).
+//  3. else default mode=both, backend=db (== "both-db").
+//
+// An invalid/garbage/wrong-type memory value falls THROUGH to step 2 (legacy on
+// the SAME bag), never straight to the default — so a row mid-migration that has
+// both the new and old keys never regresses.
+func (a *AgentData) ParseMemory() MemoryConfigPair {
+	def := MemoryConfigPair{Mode: MemoryModeBoth, Backend: MemoryBackendDB}
+	if a == nil || len(a.OtherConfig) == 0 {
+		return def
 	}
 	var bag map[string]json.RawMessage
 	if json.Unmarshal(a.OtherConfig, &bag) != nil {
-		return MemoryModeBoth
+		return def
 	}
+	// 1. Public single field wins when present and valid.
+	if raw, ok := bag["memory"]; ok {
+		var memory string
+		if json.Unmarshal(raw, &memory) == nil {
+			if pair, valid := memoryDecomposition[memory]; valid {
+				return pair
+			}
+		}
+		// invalid/garbage/wrong-type → fall through to legacy on the same bag.
+	}
+	// 2. Legacy single-field fallback on the same bag.
+	return MemoryConfigPair{
+		Mode:    parseLegacyMemoryMode(bag),
+		Backend: parseLegacyMemoryBackend(bag),
+	}
+}
+
+// parseLegacyMemoryBackend reads the legacy memory_backend key from an already
+// unmarshalled other_config bag. Returns "db" when absent, malformed, wrong
+// type, or not in the whitelist.
+func parseLegacyMemoryBackend(bag map[string]json.RawMessage) string {
+	raw, ok := bag["memory_backend"]
+	if !ok {
+		return MemoryBackendDB
+	}
+	var backend string
+	if json.Unmarshal(raw, &backend) != nil {
+		return MemoryBackendDB
+	}
+	if !validMemoryBackends[backend] {
+		return MemoryBackendDB // invalid value → default to db
+	}
+	return backend
+}
+
+// parseLegacyMemoryMode reads the legacy memory_mode key from an already
+// unmarshalled other_config bag. Returns "both" when absent, malformed, wrong
+// type, or not in the whitelist.
+func parseLegacyMemoryMode(bag map[string]json.RawMessage) string {
 	raw, ok := bag["memory_mode"]
 	if !ok {
 		return MemoryModeBoth
@@ -374,6 +440,24 @@ func (a *AgentData) ParseMemoryMode() string {
 		return MemoryModeBoth // invalid value → default to both
 	}
 	return mode
+}
+
+// ParseMemoryBackend returns the effective memory backend ("db" | "vault"),
+// DERIVED from ParseMemory so every caller/injection site is unchanged. Returns
+// "db" (the native Postgres backend) when not set, empty, malformed, or not in
+// the whitelist — so any agent without an explicit, valid opt-in keeps the
+// unchanged DB memory path.
+func (a *AgentData) ParseMemoryBackend() string {
+	return a.ParseMemory().Backend
+}
+
+// ParseMemoryMode returns the effective memory mode ("notebook" | "vault" |
+// "both"), DERIVED from ParseMemory so every caller/injection site is unchanged.
+// Returns "both" (every memory subsystem active) when not set, empty, malformed,
+// or not in the whitelist — so any agent without an explicit, valid opt-in keeps
+// the unchanged behavior where notebook + vault are both active.
+func (a *AgentData) ParseMemoryMode() string {
+	return a.ParseMemory().Mode
 }
 
 // ParsePinnedSkills returns per-agent pinned skill names from OtherConfig JSONB.

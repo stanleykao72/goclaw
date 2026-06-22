@@ -61,6 +61,175 @@ func TestParseMemoryMode(t *testing.T) {
 	}
 }
 
+func TestParseMemory(t *testing.T) {
+	cases := []struct {
+		name        string
+		otherConfig string
+		wantMode    string
+		wantBackend string
+	}{
+		// ── nothing set → default both-db ──────────────────────────────
+		{"unset defaults to both-db", "", "both", "db"},
+		{"empty object defaults to both-db", `{}`, "both", "db"},
+		{"unrelated keys default to both-db", `{"prompt_mode":"full"}`, "both", "db"},
+
+		// ── public single field: all 5 values decompose correctly ──────
+		{"memory notebook", `{"memory":"notebook"}`, "notebook", "db"},
+		{"memory vault", `{"memory":"vault"}`, "vault", "vault"},
+		{"memory db", `{"memory":"db"}`, "vault", "db"},
+		{"memory both-vault", `{"memory":"both-vault"}`, "both", "vault"},
+		{"memory both-db", `{"memory":"both-db"}`, "both", "db"},
+
+		// ── public field wins over legacy keys when present + valid ─────
+		{
+			"memory wins over legacy",
+			`{"memory":"vault","memory_mode":"notebook","memory_backend":"db"}`,
+			"vault", "vault",
+		},
+
+		// ── invalid public field → fall through to legacy on same bag ───
+		{
+			"garbage memory falls back to legacy",
+			`{"memory":"nonsense","memory_mode":"notebook","memory_backend":"db"}`,
+			"notebook", "db",
+		},
+		{
+			"wrong-type memory falls back to legacy",
+			`{"memory":123,"memory_mode":"vault","memory_backend":"vault"}`,
+			"vault", "vault",
+		},
+		{
+			"garbage memory with no legacy → default both-db",
+			`{"memory":"nonsense"}`,
+			"both", "db",
+		},
+
+		// ── legacy fallback: every combo honored when memory unset ─────
+		{"legacy mode notebook only", `{"memory_mode":"notebook"}`, "notebook", "db"},
+		{"legacy mode vault only", `{"memory_mode":"vault"}`, "vault", "db"},
+		{"legacy mode both only", `{"memory_mode":"both"}`, "both", "db"},
+		{"legacy backend vault only (no mode → both)", `{"memory_backend":"vault"}`, "both", "vault"},
+		{"legacy backend db only (no mode → both)", `{"memory_backend":"db"}`, "both", "db"},
+		{
+			"legacy both keys vault+vault",
+			`{"memory_mode":"vault","memory_backend":"vault"}`,
+			"vault", "vault",
+		},
+		{
+			"legacy invalid values default each axis",
+			`{"memory_mode":"nlm","memory_backend":"sqlite"}`,
+			"both", "db",
+		},
+
+		// ── live shapes (PRE-migration legacy keys, read verbatim per axis;
+		//    the notebook→db fold happens at MIGRATION time, not in the legacy
+		//    fallback, so backend=vault is honored here exactly as stored) ─────
+		{
+			"esmith-general PRE-migrate: legacy notebook + vault backend → verbatim",
+			`{"memory_mode":"notebook","memory_backend":"vault"}`,
+			"notebook", "vault",
+		},
+		{
+			"e-smith-hub PRE-migrate: legacy backend vault, no mode → both,vault",
+			`{"memory_backend":"vault"}`,
+			"both", "vault",
+		},
+		// ── live shapes (POST-migration single memory field) ───────────
+		{
+			"esmith-general POST-migrate: memory notebook → notebook,db (backend folds)",
+			`{"memory":"notebook"}`,
+			"notebook", "db",
+		},
+		{
+			"e-smith-hub POST-migrate: memory both-vault → both,vault",
+			`{"memory":"both-vault"}`,
+			"both", "vault",
+		},
+
+		// ── malformed json → default both-db ───────────────────────────
+		{"malformed json defaults to both-db", `{not json`, "both", "db"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ag := &AgentData{}
+			if c.otherConfig != "" {
+				ag.OtherConfig = json.RawMessage(c.otherConfig)
+			}
+			got := ag.ParseMemory()
+			if got.Mode != c.wantMode || got.Backend != c.wantBackend {
+				t.Fatalf("ParseMemory() = {Mode:%q Backend:%q}, want {Mode:%q Backend:%q}",
+					got.Mode, got.Backend, c.wantMode, c.wantBackend)
+			}
+			// Derived methods must agree with the pair (callers depend on this).
+			if m := ag.ParseMemoryMode(); m != c.wantMode {
+				t.Fatalf("ParseMemoryMode() = %q, want %q", m, c.wantMode)
+			}
+			if b := ag.ParseMemoryBackend(); b != c.wantBackend {
+				t.Fatalf("ParseMemoryBackend() = %q, want %q", b, c.wantBackend)
+			}
+		})
+	}
+}
+
+// deriveMemoryFromLegacy mirrors the CASE expression in
+// migrations/000083_merge_memory_config.up.sql. The migration is a pure SQL
+// JSONB data migration that cannot run inside this unit-test package, so this
+// Go mirror pins the (mode, backend) → public-memory mapping and asserts it
+// round-trips through ParseMemory (the migration SQL is verified by mirror).
+func deriveMemoryFromLegacy(mode, backend string) string {
+	switch {
+	case mode == "notebook":
+		return "notebook"
+	case mode == "vault" && backend == "vault":
+		return "vault"
+	case mode == "vault" && backend == "db":
+		return "db"
+	case mode == "both" && backend == "vault":
+		return "both-vault"
+	default: // (both, db) and the ELSE catch-all
+		return "both-db"
+	}
+}
+
+func TestMergeMemoryMigrationMappingMirror(t *testing.T) {
+	// UP CASE mapping (legacy mode/backend coalesced to both/db) → public memory.
+	cases := []struct {
+		mode, backend string
+		want          string
+	}{
+		{"notebook", "db", "notebook"},
+		{"notebook", "vault", "notebook"}, // mode wins
+		{"vault", "vault", "vault"},
+		{"vault", "db", "db"},
+		{"both", "vault", "both-vault"},
+		{"both", "db", "both-db"},
+		// coalesce defaults: missing mode→both, missing backend→db
+		{"both", "db", "both-db"},
+		// live shapes
+		{"notebook", "vault", "notebook"}, // esmith-general
+		{"both", "vault", "both-vault"},   // e-smith-hub (no mode → both)
+	}
+	for _, c := range cases {
+		got := deriveMemoryFromLegacy(c.mode, c.backend)
+		if got != c.want {
+			t.Fatalf("deriveMemoryFromLegacy(%q,%q) = %q, want %q", c.mode, c.backend, got, c.want)
+		}
+		// The derived public value must round-trip back through ParseMemory to
+		// the SAME (mode, backend) pair — EXCEPT for the notebook asymmetry where
+		// any backend folds to db (backend inert when mode=notebook).
+		ag := &AgentData{OtherConfig: json.RawMessage(`{"memory":"` + got + `"}`)}
+		pair := ag.ParseMemory()
+		wantMode, wantBackend := c.mode, c.backend
+		if c.mode == "notebook" {
+			wantBackend = "db" // documented asymmetry
+		}
+		if pair.Mode != wantMode || pair.Backend != wantBackend {
+			t.Fatalf("round-trip memory=%q → {Mode:%q Backend:%q}, want {Mode:%q Backend:%q}",
+				got, pair.Mode, pair.Backend, wantMode, wantBackend)
+		}
+	}
+}
+
 func TestParseReasoningConfigDefaultsToOff(t *testing.T) {
 	agent := &AgentData{}
 
