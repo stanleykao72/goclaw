@@ -11,6 +11,7 @@ import (
 	"net/textproto"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -31,14 +32,19 @@ const (
 	utf8BOM = "\uFEFF"
 
 	// driveMaxRetries bounds the rate-limit backoff. The shared rclone GCP
-	// project throttles bursts with a retriable 403 (reason rateLimitExceeded);
-	// we retry those, not real permission errors.
-	driveMaxRetries = 4
+	// project (202264815644) enforces a per-MINUTE Drive query quota across all
+	// rclone users, so a burst gets a retriable 403 (reason rateLimitExceeded);
+	// the backoff must be long enough to outlast a 60s quota window, hence 6
+	// attempts with a multi-second base (~2+4+8+16+20+20 ≈ 70s).
+	driveMaxRetries = 6
+
+	// driveRetryMaxDelay caps a single backoff step so growth stays bounded.
+	driveRetryMaxDelay = 20 * time.Second
 )
 
 // driveRetryBaseDelay is the base backoff for rate-limit retries. It is a var
 // (not const) so tests can shrink it to keep the suite fast.
-var driveRetryBaseDelay = 500 * time.Millisecond
+var driveRetryBaseDelay = 2 * time.Second
 
 // httpDoer is the minimal HTTP surface the Drive client needs. Injectable so
 // tests assert request shapes against an httptest server (or a pure fake)
@@ -68,6 +74,13 @@ type DocLibrary interface {
 type DriveDocLibrary struct {
 	tokens TokenSource
 	http   httpDoer
+
+	// folderCache memoizes resolved folder ids by their full path key so
+	// EnsureFolder does not re-issue files.list calls on every provision —
+	// those calls were a major contributor to the shared-project per-minute
+	// Drive quota (403 rateLimitExceeded). Folder ids are stable once created.
+	folderMu    sync.Mutex
+	folderCache map[string]string
 }
 
 // NewDriveDocLibrary constructs a Drive-backed DocLibrary. A nil http client
@@ -76,7 +89,7 @@ func NewDriveDocLibrary(tokens TokenSource, client httpDoer) *DriveDocLibrary {
 	if client == nil {
 		client = http.DefaultClient
 	}
-	return &DriveDocLibrary{tokens: tokens, http: client}
+	return &DriveDocLibrary{tokens: tokens, http: client, folderCache: map[string]string{}}
 }
 
 // driveErrorBody is the standard Drive API error envelope.
@@ -204,6 +217,9 @@ func sleepBackoff(ctx context.Context, attempt int) bool {
 		return false
 	}
 	delay := driveRetryBaseDelay * (1 << attempt)
+	if delay > driveRetryMaxDelay {
+		delay = driveRetryMaxDelay
+	}
 	t := time.NewTimer(delay)
 	defer t.Stop()
 	select {
@@ -218,6 +234,14 @@ func sleepBackoff(ctx context.Context, attempt int) bool {
 // chaining parents, and returns the leaf folder id. Idempotent: an existing
 // folder at a level is reused.
 func (l *DriveDocLibrary) EnsureFolder(ctx context.Context, path []string) (string, error) {
+	cacheKey := strings.Join(path, "/")
+	l.folderMu.Lock()
+	if id, ok := l.folderCache[cacheKey]; ok {
+		l.folderMu.Unlock()
+		return id, nil
+	}
+	l.folderMu.Unlock()
+
 	parent := "" // "" == My Drive root for the queries below
 	for _, name := range path {
 		if name == "" {
@@ -238,6 +262,9 @@ func (l *DriveDocLibrary) EnsureFolder(ctx context.Context, path []string) (stri
 	if parent == "" {
 		return "", fmt.Errorf("EnsureFolder: empty path")
 	}
+	l.folderMu.Lock()
+	l.folderCache[cacheKey] = parent
+	l.folderMu.Unlock()
 	return parent, nil
 }
 

@@ -122,17 +122,25 @@ func (s *RcloneTokenSource) Invalidate() {
 
 // broker runs the two-step rclone dance: `rclone about <remote>:` to force a
 // refresh, then `rclone config show <remote>` to read the refreshed token.
+//
+// The rclone subprocesses are detached from the CALLER's deadline
+// (context.WithoutCancel) and given their own timeouts: a short per-scope ctx
+// must not SIGKILL a cold token refresh mid-flight (observed live as
+// "rclone about: signal: killed"). The token is cached for ~the access-token
+// lifetime (~1h) so this expensive path runs at most ~once/hour, not per scope.
 func (s *RcloneTokenSource) broker(ctx context.Context) (*brokeredToken, error) {
+	detached := context.WithoutCancel(ctx)
+
 	// Step 1: force a refresh as a side-effect. We ignore the stats output;
 	// only failure matters (a broken remote means both ingest and recall die).
-	refreshCtx, cancel := context.WithTimeout(ctx, rcloneRefreshTimeout)
+	refreshCtx, cancel := context.WithTimeout(detached, rcloneRefreshTimeout)
 	defer cancel()
 	if _, err := s.runner(refreshCtx, []string{"about", s.remote + ":"}); err != nil {
 		return nil, fmt.Errorf("rclone about %s: %w", s.remote, err)
 	}
 
 	// Step 2: read the refreshed token JSON out of the config dump.
-	showCtx, cancel2 := context.WithTimeout(ctx, rcloneShowTimeout)
+	showCtx, cancel2 := context.WithTimeout(detached, rcloneShowTimeout)
 	defer cancel2()
 	out, err := s.runner(showCtx, []string{"config", "show", s.remote})
 	if err != nil {
