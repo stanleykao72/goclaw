@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -60,8 +61,16 @@ func defaultNLMRunner(ctx context.Context, binary string, args []string) ([]byte
 }
 
 // nlmResponse is the JSON shape returned by `nlm query notebook ...`.
+// nlm wraps the result under a "value" object: {"value":{"answer":"..."}}.
+// Older/flat shapes ({"answer":"..."}) are tolerated via the top-level Answer.
+// Errors arrive as {"status":"error","error":"..."}.
 type nlmResponse struct {
 	Answer string `json:"answer"`
+	Value  *struct {
+		Answer string `json:"answer"`
+	} `json:"value"`
+	Status string `json:"status"`
+	Error  string `json:"error"`
 }
 
 // NotebookRecallTool answers a question grounded in the caller's accumulated
@@ -222,11 +231,23 @@ func (t *NotebookRecallTool) failSoft() *Result {
 	return NewResult(nlmFailSoftMessage)
 }
 
-// parseNLMAnswer extracts the `answer` field from nlm's JSON stdout.
+// parseNLMAnswer extracts the answer from nlm's JSON stdout. nlm returns
+// {"value":{"answer":"..."}} on success and {"status":"error","error":"..."}
+// on failure; a flat {"answer":"..."} is also tolerated. Any non-JSON prefix
+// before the first '{' is skipped.
 func parseNLMAnswer(out []byte) (string, bool) {
+	if i := bytes.IndexByte(out, '{'); i > 0 {
+		out = out[i:]
+	}
 	var resp nlmResponse
 	if err := json.Unmarshal(out, &resp); err != nil {
 		return "", false
+	}
+	if resp.Status == "error" {
+		return "", false
+	}
+	if resp.Value != nil && strings.TrimSpace(resp.Value.Answer) != "" {
+		return strings.TrimSpace(resp.Value.Answer), true
 	}
 	return strings.TrimSpace(resp.Answer), true
 }

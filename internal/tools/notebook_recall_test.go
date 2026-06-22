@@ -264,3 +264,29 @@ func TestNotebookRecall_DefaultRunnerWired(t *testing.T) {
 		t.Fatalf("expected fail-soft message, got: %q", res.ForLLM)
 	}
 }
+
+// TestParseNLMAnswer_ValueWrapper locks the fix for the real nlm output shape
+// {"value":{"answer":...}} (the flat {"answer":...} parser silently fail-softed
+// on it — Phase 1 live bug 2026-06-22).
+func TestParseNLMAnswer_ValueWrapper(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+		ok   bool
+	}{
+		{"value_wrapper", `{"value":{"answer":"林志明、1200萬","citations":{}}}`, "林志明、1200萬", true},
+		{"flat", `{"answer":"hello"}`, "hello", true},
+		{"error_shape", `{"status":"error","error":"Authentication expired"}`, "", false},
+		{"prefix_noise", "Querying...\n{\"value\":{\"answer\":\"ok\"}}", "ok", true},
+		{"garbage", `not json`, "", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, ok := parseNLMAnswer([]byte(c.in))
+			if got != c.want || ok != c.ok {
+				t.Fatalf("parseNLMAnswer(%q) = (%q,%v), want (%q,%v)", c.in, got, ok, c.want, c.ok)
+			}
+		})
+	}
+}
