@@ -40,6 +40,21 @@ func TestClassifyState(t *testing.T) {
 			pane: "Do you trust the contents of this project?\n  Yes   No",
 			want: stateUnknown,
 		},
+		{
+			name: "interactive menu => awaiting input (wins over busy)",
+			pane: "Which city?\n  1. Taipei\n  2. Tokyo\n\n  ↑/↓ Navigate · enter Select · esc Skip\n  esc to cancel",
+			want: stateAwaitingInput,
+		},
+		{
+			name: "menu alternate wording (Confirm) => awaiting input",
+			pane: "Pick one:\n  ↑/↓ Navigate   enter Confirm   esc to cancel",
+			want: stateAwaitingInput,
+		},
+		{
+			name: "prose with Select/Navigate but no arrow => not awaiting (ready)",
+			pane: "Navigate to settings and Select your option.\n> \n  Gemini 3.x Flash (Medium)   ? for shortcuts",
+			want: stateReady,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -303,11 +318,47 @@ func TestWriteGeminiInstructions_WritesFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GEMINI.md not written: %v", err)
 	}
-	if string(got) != prompt {
-		t.Errorf("GEMINI.md content = %q, want %q", got, prompt)
+	// GEMINI.md = system prompt + the always-appended channel directive.
+	want := prompt + agyChannelDirective
+	if string(got) != want {
+		t.Errorf("GEMINI.md content = %q, want %q", got, want)
+	}
+	if !strings.Contains(string(got), prompt) || !strings.Contains(string(got), "TEXT-ONLY") {
+		t.Errorf("GEMINI.md must contain both the system prompt and the channel directive; got %q", got)
 	}
 	if base := filepath.Base(path); base != "GEMINI.md" {
 		t.Errorf("instructions filename = %q, want GEMINI.md", base)
+	}
+}
+
+func TestWriteGeminiInstructions_EmptyPromptStillWritesDirective(t *testing.T) {
+	dir := t.TempDir()
+	syncGeminiInstructions(dir, "")
+	got, err := os.ReadFile(filepath.Join(dir, geminiInstructionsFile))
+	if err != nil {
+		t.Fatalf("GEMINI.md not written for empty prompt: %v", err)
+	}
+	if !strings.Contains(string(got), "TEXT-ONLY") {
+		t.Errorf("empty-prompt GEMINI.md must still contain the channel directive; got %q", got)
+	}
+	if strings.HasPrefix(string(got), "\n") {
+		t.Errorf("empty-prompt GEMINI.md must not start with a blank line; got %q", got)
+	}
+}
+
+func TestWriteGeminiInstructions_OverwritesStale(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, geminiInstructionsFile)
+	if err := os.WriteFile(path, []byte("STALE PRIOR INSTRUCTIONS"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	syncGeminiInstructions(dir, "") // empty prompt: must replace stale with directive-only
+	got, _ := os.ReadFile(path)
+	if strings.Contains(string(got), "STALE") {
+		t.Errorf("stale GEMINI.md content survived; got %q", got)
+	}
+	if !strings.Contains(string(got), "TEXT-ONLY") {
+		t.Errorf("expected directive after overwrite; got %q", got)
 	}
 }
 
