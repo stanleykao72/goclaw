@@ -65,6 +65,20 @@ const (
 // write the system prompt here before launch so it acts as a true system prompt.
 const geminiInstructionsFile = "GEMINI.md"
 
+// agyChannelDirective is always appended to GEMINI.md. agy is agentic and will
+// otherwise render INTERACTIVE choice menus (arrow-key selectors) that a
+// text-only messaging channel (e.g. LINE WORKS) cannot operate — the turn then
+// hangs waiting for a key press that never comes. This directive tells agy the
+// channel is text-only so it answers in plain text instead. Verified on real agy
+// v1.0.10: with this directive agy stopped emitting the menu and replied in text.
+const agyChannelDirective = "\n\n# Channel constraints (text-only)\n" +
+	"You are operating on a TEXT-ONLY messaging channel. The user can only read " +
+	"and type text — they CANNOT use arrow keys, menus, or interactive selectors. " +
+	"NEVER present interactive choice menus, numbered selectors, or multiple-choice " +
+	"prompts. If you need clarification, ask in plain text in ONE short sentence, or " +
+	"make a reasonable assumption and answer directly. ALWAYS produce a final text " +
+	"answer in your reply."
+
 // SessionOptions configures a persistent interactive agy session.
 type SessionOptions struct {
 	Workdir         string        // cwd for the agy process (agy needs an active workspace)
@@ -172,21 +186,22 @@ func applySessionDefaults(o SessionOptions) SessionOptions {
 // must be able to read. Any failure is logged as a warning and swallowed: a
 // missing context file degrades the session but must not abort it.
 func syncGeminiInstructions(workdir, systemPrompt string) {
-	path := filepath.Join(workdir, geminiInstructionsFile)
-	// Empty system prompt: ensure no stale GEMINI.md from a previous run on this
-	// (stable, reused) workdir lingers and silently re-applies old instructions.
+	// GEMINI.md ALWAYS carries at least the channel directive (text-only / no
+	// interactive menus). With a system prompt we write systemPrompt + directive;
+	// without one we write the directive alone (leading newlines stripped). Since
+	// we always overwrite, a stale GEMINI.md from a previous run on this (stable,
+	// reused) workdir is replaced — no separate removal needed.
+	content := systemPrompt + agyChannelDirective
 	if systemPrompt == "" {
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			slog.Warn("agycli: failed to remove stale GEMINI.md", "path", path, "error", err)
-		}
-		return
+		content = strings.TrimLeft(agyChannelDirective, "\n")
 	}
 	if err := os.MkdirAll(workdir, 0o700); err != nil {
 		slog.Warn("agycli: failed to create workdir for GEMINI.md", "dir", workdir, "error", err)
 		return
 	}
-	if err := os.WriteFile(path, []byte(systemPrompt), 0o644); err != nil {
-		slog.Warn("agycli: failed to write GEMINI.md system prompt", "path", path, "error", err)
+	path := filepath.Join(workdir, geminiInstructionsFile)
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		slog.Warn("agycli: failed to write GEMINI.md", "path", path, "error", err)
 	}
 }
 
@@ -355,7 +370,10 @@ func (s *Session) pollUntilReady(ctx context.Context, timeout time.Duration, acc
 		}
 
 		switch classifyState(clean) {
-		case stateReady:
+		case stateReady, stateAwaitingInput:
+			// stateAwaitingInput (interactive menu) is terminal too: agy is blocked
+			// waiting for a key the text channel can't send, so the turn is "done"
+			// — extract the visible question/options as the answer rather than hang.
 			// Post-send guard: ignore ready frames until the turn has actually
 			// started (a non-ready frame seen). This is the stale pre-turn footer.
 			if !leftReady {
@@ -402,15 +420,27 @@ func (s *Session) pollUntilReady(ctx context.Context, timeout time.Duration, acc
 type paneState int
 
 const (
-	stateUnknown paneState = iota // neither marker (trust gate / still booting)
-	stateBusy                     // "esc to cancel" present
-	stateReady                    // "? for shortcuts" present AND no busy marker
+	stateUnknown       paneState = iota // neither marker (trust gate / still booting)
+	stateBusy                           // "esc to cancel" present
+	stateReady                          // "? for shortcuts" present AND no busy marker
+	stateAwaitingInput                  // interactive choice-menu shown; agy waits for a key the text channel can't send — treat as terminal
 )
+
+// awaitSelectHints are the selection/skip cues on the interactive menu footer.
+// They are only honored on a line that ALSO carries the up-arrow glyph, so prose
+// mentioning these words cannot misfire the menu detection.
+var awaitSelectHints = []string{"Select", "Confirm", "Skip"}
 
 // classifyState applies the Phase 0 Q3 rule to already-ANSI-stripped pane text.
 // busy wins over ready when both substrings somehow co-occur in a transient
 // frame (treat as still-busy to avoid a premature ready).
 func classifyState(clean string) paneState {
+	// Awaiting-input (interactive menu) is checked FIRST: the menu footer also
+	// shows the busy marker ("esc to cancel"), so without this the menu would be
+	// misread as busy and the turn would hang forever (the user can't press keys).
+	if isAwaitingInput(clean) {
+		return stateAwaitingInput
+	}
 	hasBusy := strings.Contains(clean, busyMarker)
 	hasReady := strings.Contains(clean, readyMarker)
 	switch {
@@ -421,6 +451,31 @@ func classifyState(clean string) paneState {
 	default:
 		return stateUnknown
 	}
+}
+
+// isAwaitingInput reports whether the pane shows agy's interactive choice menu
+// (agy is blocked waiting for an arrow-key selection). The menu footer renders
+// the up-arrow glyph and a select/skip cue on ONE line (after tmux -J rejoin),
+// e.g. "↑/↓ Navigate · enter Select · esc Skip". Require both ON THE SAME LINE,
+// anchored by the "↑" glyph — prose mentioning "Select"/"Navigate" across the
+// pane (or a streaming fragment) cannot trigger it.
+func isAwaitingInput(clean string) bool {
+	for _, line := range strings.Split(clean, "\n") {
+		if strings.Contains(line, "↑") && containsAny(line, awaitSelectHints) {
+			return true
+		}
+	}
+	return false
+}
+
+// containsAny reports whether s contains any of the given substrings.
+func containsAny(s string, subs []string) bool {
+	for _, sub := range subs {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
 }
 
 // isTrustGate reports whether the (ANSI-stripped) pane shows the first-run trust
