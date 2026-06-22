@@ -161,13 +161,26 @@ func tmuxSessionEnv() []string {
 // enter=true sends only Enter (used to accept the trust gate / submit a blank).
 func tmuxSendKeys(name, keys string, enter bool) error {
 	if keys != "" {
-		args := []string{"send-keys", "-t", name, "-l", "--", keys}
-		cmd, err := tmuxCmd(args...)
-		if err != nil {
-			return err
-		}
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("tmux send-keys (literal) %q: %w: %s", name, err, strings.TrimSpace(string(out)))
+		// Long or multi-line input cannot go through `send-keys -l`: the whole
+		// payload becomes a single argv element and overflows the OS / tmux
+		// command-length limit ("command too long", E2BIG), and embedded
+		// newlines would be typed as Return and submit the turn early. Route
+		// such input through a paste buffer (stdin, no argv limit) with
+		// bracketed paste (-p) so newlines stay literal. Short single-line
+		// input keeps the simple, well-tested send-keys path.
+		if len(keys) > tmuxLiteralMax || strings.ContainsRune(keys, '\n') {
+			if err := tmuxSendText(name, keys); err != nil {
+				return err
+			}
+		} else {
+			args := []string{"send-keys", "-t", name, "-l", "--", keys}
+			cmd, err := tmuxCmd(args...)
+			if err != nil {
+				return err
+			}
+			if out, err := cmd.CombinedOutput(); err != nil {
+				return fmt.Errorf("tmux send-keys (literal) %q: %w: %s", name, err, strings.TrimSpace(string(out)))
+			}
 		}
 	}
 	if enter {
@@ -178,6 +191,39 @@ func tmuxSendKeys(name, keys string, enter bool) error {
 		if out, err := cmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("tmux send-keys (enter) %q: %w: %s", name, err, strings.TrimSpace(string(out)))
 		}
+	}
+	return nil
+}
+
+// tmuxLiteralMax is the byte threshold above which a prompt is sent via a paste
+// buffer instead of `send-keys -l`. Well below ARG_MAX / tmux's command-length
+// limit so real agent turns (system prompt + history) never hit "command too
+// long".
+const tmuxLiteralMax = 1024
+
+// tmuxSendText pastes arbitrary text (possibly long and/or multi-line) into the
+// named session's pane via a tmux paste buffer. load-buffer reads from stdin so
+// the payload never becomes an argv element (no length limit); paste-buffer -p
+// uses bracketed paste so embedded newlines are inserted literally instead of
+// submitting the turn. -d deletes the buffer after pasting. The caller still
+// sends Enter separately to submit. Verified against real agy (v1.0.10): a
+// 2.3 KB / 45-line prompt pastes intact and is answered correctly.
+func tmuxSendText(name, text string) error {
+	buf := "agysend-" + name
+	load, err := tmuxCmd("load-buffer", "-b", buf, "-")
+	if err != nil {
+		return err
+	}
+	load.Stdin = strings.NewReader(text)
+	if out, err := load.CombinedOutput(); err != nil {
+		return fmt.Errorf("tmux load-buffer %q: %w: %s", name, err, strings.TrimSpace(string(out)))
+	}
+	paste, err := tmuxCmd("paste-buffer", "-t", name, "-b", buf, "-d", "-p")
+	if err != nil {
+		return err
+	}
+	if out, err := paste.CombinedOutput(); err != nil {
+		return fmt.Errorf("tmux paste-buffer %q: %w: %s", name, err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }

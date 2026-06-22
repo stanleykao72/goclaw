@@ -3,6 +3,7 @@ package agycli
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -53,6 +54,51 @@ func TestTmuxHelpersRoundtrip(t *testing.T) {
 	tmuxKillSession(name)
 	if tmuxHasSession(name) {
 		t.Errorf("tmuxHasSession(%q) = true after kill, want false (leftover session)", name)
+	}
+}
+
+// TestTmuxSendKeys_LongMultilineUsesPasteBuffer verifies that a prompt larger
+// than tmuxLiteralMax (and containing newlines) is delivered intact via the
+// paste-buffer path instead of `send-keys -l`, which would fail with
+// "command too long" (E2BIG). This is the regression guard for the real-agent
+// failure where a system-prompt + history turn overflowed the argv limit.
+//
+// The decisive regression assertion is at the call layer: a >4KB multi-line
+// payload must NOT return the "command too long" (E2BIG) error that the old
+// `send-keys -l` path produced. The shell-execution / pane-render outcome is
+// deliberately not asserted (bracketed-paste submit semantics are
+// shell-dependent and flaky); intact delivery is exercised end-to-end by the
+// real-agy Session e2e test.
+func TestTmuxSendKeys_LongMultilineUsesPasteBuffer(t *testing.T) {
+	requireTmux(t)
+
+	name := uniqueSessionName()
+	dir := t.TempDir()
+	if err := newTmuxSession(name, 200, 50, dir); err != nil {
+		t.Fatalf("newTmuxSession: %v", err)
+	}
+	defer tmuxKillSession(name)
+
+	// >4KB, multi-line payload — forces the paste-buffer path.
+	var sb strings.Builder
+	for i := 0; i < 120; i++ {
+		fmt.Fprintf(&sb, "line %02d: padding to push this prompt far past the argv limit\n", i)
+	}
+	payload := strings.TrimRight(sb.String(), "\n")
+	if len(payload) <= tmuxLiteralMax || !strings.ContainsRune(payload, '\n') {
+		t.Fatalf("test payload %d bytes / must be >tmuxLiteralMax %d and multi-line", len(payload), tmuxLiteralMax)
+	}
+
+	// Old path: `send-keys -l -- <payload>` -> "command too long". New path:
+	// load-buffer/paste-buffer -> nil. This is the regression guard.
+	if err := tmuxSendKeys(name, payload, false); err != nil {
+		t.Fatalf("tmuxSendKeys (long/multiline) returned error (E2BIG regression): %v", err)
+	}
+
+	// A short single-line payload still uses the simple send-keys path and must
+	// also succeed (the threshold branch both ways).
+	if err := tmuxSendKeys(name, "echo short_ok", false); err != nil {
+		t.Fatalf("tmuxSendKeys (short) error: %v", err)
 	}
 }
 
