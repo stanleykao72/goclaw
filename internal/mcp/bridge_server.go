@@ -33,6 +33,8 @@ var BridgeToolNames = map[string]bool{
 	"memory_search":   true,
 	"memory_get":      true,
 	"notebook_recall": true,
+	"remember_shared": true,
+	"remember_agent":  true,
 	"skill_search":    true,
 	"use_skill":       true,
 	// Media

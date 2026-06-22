@@ -43,6 +43,8 @@ func builtinToolSeedData() []store.BuiltinToolDef {
 			Requires: []string{"memory"},
 		},
 		{Name: "notebook_recall", DisplayName: "Notebook Recall", Description: "Answer a question grounded in the user's accumulated NotebookLM memory/knowledge (server-resolved notebook; nlm CLI)", Category: "memory", Enabled: true},
+		{Name: "remember_shared", DisplayName: "Remember (Shared)", Description: "Save a curated fact to the SHARED NotebookLM memory visible to all agents (server-resolved scope; nlm CLI)", Category: "memory", Enabled: true},
+		{Name: "remember_agent", DisplayName: "Remember (Agent)", Description: "Save a curated fact to THIS agent's own NotebookLM memory (server-resolved scope; nlm CLI)", Category: "memory", Enabled: true},
 		{Name: "knowledge_graph_search", DisplayName: "Knowledge Graph Search", Description: "Search entities, relationships, and observations in the agent's knowledge graph", Category: "memory", Enabled: true,
 			Settings: json.RawMessage(`{"extract_on_memory_write":false,"extraction_provider":"","extraction_model":"","min_confidence":0.75}`),
 			Requires: []string{"knowledge_graph"},

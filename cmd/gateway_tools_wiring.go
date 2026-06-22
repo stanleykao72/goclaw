@@ -150,6 +150,13 @@ func wireExtraTools(
 		}
 	}
 
+	// remember_shared / remember_agent: inject the NLM write stack (provisioner +
+	// Drive Doc library + nlm runner) shared with the ingest worker. Unlike the
+	// ingest worker these are NOT gated by GOCLAW_NLM_INGEST_ENABLED — they are
+	// agent-driven and gated per-agent by memory_mode inside Execute. A nil pointer
+	// store (sqlite stub) leaves them unwired → they fail soft.
+	wireNotebookRememberTools(pgStores, toolsReg)
+
 	// Memory tools are PG-backed; always available.
 	hasMemory = true
 

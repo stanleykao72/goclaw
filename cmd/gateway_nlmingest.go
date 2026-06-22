@@ -39,13 +39,15 @@ func startNLMIngestWorker(pgStores *store.Stores) func() {
 		return func() {}
 	}
 
-	// Drive Doc library (rclone-brokered token) + nlm runner — same wiring the
-	// recall path uses. The Drive root + nlm binary are env-resolved inside the
-	// provisioner / runner (GOCLAW_NLM_DRIVE_ROOT / GOCLAW_NLM_BINARY).
-	tokens := nlmdoc.NewRcloneTokenSource(strings.TrimSpace(os.Getenv("GOCLAW_NLM_RCLONE_REMOTE")))
-	docs := nlmdoc.NewDriveDocLibrary(tokens, nil)
-	runner := tools.NewExecNLMNotebookRunner("")
-	provisioner := tools.NewNotebookProvisioner(pgStores.NotebookPointers, docs, runner, "")
+	// Drive Doc library (rclone-brokered token) + nlm runner + provisioner — the
+	// shared NLM write stack used by BOTH this ingest worker AND the curate tools
+	// (remember_shared / remember_agent). Built once here and re-built identically
+	// in wireExtraTools when ingest is off (the curate tools must NOT be gated by
+	// GOCLAW_NLM_INGEST_ENABLED).
+	stack := buildNLMWriteStack(pgStores)
+	docs := stack.docs
+	runner := stack.runner
+	provisioner := stack.provisioner
 
 	worker := &nlmingest.Worker{
 		Pending:     pgStores.PendingMessages,
@@ -66,6 +68,62 @@ func startNLMIngestWorker(pgStores *store.Stores) func() {
 	cleanup := worker.Start(context.Background())
 	slog.Info("nlm_ingest: ingest worker wired")
 	return cleanup
+}
+
+// nlmWriteStack bundles the constructed NotebookLM write dependencies: the
+// Drive-Doc library, the nlm CLI runner, and the pointer-store-backed
+// provisioner. It is the single source of truth shared by the ingest worker
+// (startNLMIngestWorker) and the curate tools (wireNotebookRememberTools), so a
+// curate call writes to the SAME notebook the worker / recall use.
+type nlmWriteStack struct {
+	docs        *nlmdoc.DriveDocLibrary
+	runner      tools.NLMNotebookRunner
+	provisioner *tools.NotebookProvisioner
+}
+
+// buildNLMWriteStack constructs the Drive Doc library + nlm runner + provisioner.
+// The Drive root + nlm binary are env-resolved inside the provisioner / runner
+// (GOCLAW_NLM_DRIVE_ROOT / GOCLAW_NLM_BINARY). The pointer store is the same one
+// recall + the provisioner use (pgStores.NotebookPointers). Cheap + stateless
+// (folder cache aside), so re-constructing for a second caller is harmless.
+func buildNLMWriteStack(pgStores *store.Stores) nlmWriteStack {
+	tokens := nlmdoc.NewRcloneTokenSource(strings.TrimSpace(os.Getenv("GOCLAW_NLM_RCLONE_REMOTE")))
+	docs := nlmdoc.NewDriveDocLibrary(tokens, nil)
+	runner := tools.NewExecNLMNotebookRunner("")
+	provisioner := tools.NewNotebookProvisioner(pgStores.NotebookPointers, docs, runner, "")
+	return nlmWriteStack{docs: docs, runner: runner, provisioner: provisioner}
+}
+
+// wireNotebookRememberTools injects the NLM write stack into the curate tools
+// (remember_shared / remember_agent). They are registered zero-dep in
+// setupToolRegistry; this upgrades them from the fail-soft unwired state to live
+// writes against the caller's resolved scope notebook. Guarded on a non-nil
+// pointer store (the sqlite stub leaves them unwired → they fail soft). This runs
+// regardless of GOCLAW_NLM_INGEST_ENABLED — the curate tools are agent-driven,
+// not part of the background ingest worker (the per-agent memory_mode gate is
+// their off-switch). The shared stack keeps one source of truth with ingest.
+func wireNotebookRememberTools(pgStores *store.Stores, toolsReg *tools.Registry) {
+	if pgStores == nil || pgStores.NotebookPointers == nil {
+		slog.Info("notebook curate tools left unwired (no pointer store) — they fail soft")
+		return
+	}
+	stack := buildNLMWriteStack(pgStores)
+	for _, name := range []string{"remember_shared", "remember_agent"} {
+		t, ok := toolsReg.Get(name)
+		if !ok {
+			continue
+		}
+		if rt, ok := t.(interface {
+			SetProvisioner(*tools.NotebookProvisioner)
+			SetDocs(nlmdoc.DocLibrary)
+			SetSync(tools.NLMNotebookRunner)
+		}); ok {
+			rt.SetProvisioner(stack.provisioner)
+			rt.SetDocs(stack.docs)
+			rt.SetSync(stack.runner)
+		}
+	}
+	slog.Info("notebook curate tools wired (remember_shared + remember_agent → NLM write stack)")
 }
 
 // defaultTenantResolver resolves the deployment's single tenant (the default
