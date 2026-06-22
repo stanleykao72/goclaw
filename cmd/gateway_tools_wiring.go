@@ -136,6 +136,20 @@ func wireExtraTools(
 		}
 	}
 
+	// notebook_recall: inject the scope→notebook pointer store post-construction
+	// (the tool is registered zero-dep in setupToolRegistry, which lacks
+	// *store.Stores). This upgrades recall from the single test notebook to the
+	// caller's resolved scope SET (resolveNotebookSet). A nil pointer store (the
+	// sqlite stub returns not-found) degrades to the "no memory yet" fail-soft.
+	if t, ok := toolsReg.Get("notebook_recall"); ok {
+		if pa, ok := t.(interface {
+			SetPointerStore(store.NotebookPointerStore)
+		}); ok {
+			pa.SetPointerStore(pgStores.NotebookPointers)
+			slog.Info("notebook_recall pointer store wired (scope-set recall)")
+		}
+	}
+
 	// Memory tools are PG-backed; always available.
 	hasMemory = true
 
