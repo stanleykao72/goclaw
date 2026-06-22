@@ -605,8 +605,23 @@ func stripPromptGlyph(line string) string {
 // Leading/trailing blank lines are trimmed.
 func cleanAnswerLines(lines []string) string {
 	out := make([]string, 0, len(lines))
+	dropThoughtTitle := false
 	for _, ln := range lines {
 		trimmed := strings.TrimRight(ln, " \t")
+		// A "Thought for ..." summary is followed by an indented thought-title
+		// line that carries no glyph (e.g. "Determining the Query's Intent").
+		// Drop that single following non-blank line so the title doesn't leak.
+		if dropThoughtTitle {
+			if strings.TrimSpace(trimmed) == "" {
+				continue // skip blanks between the summary and its title
+			}
+			dropThoughtTitle = false
+			continue // drop the title line itself
+		}
+		if strings.HasPrefix(strings.TrimSpace(trimmed), "Thought for ") {
+			dropThoughtTitle = true
+			continue
+		}
 		if isChromeLine(trimmed) {
 			continue
 		}
@@ -673,6 +688,15 @@ func isChromeLine(trimmed string) bool {
 	if strings.Contains(t, readyMarker) || strings.Contains(t, busyMarker) {
 		return true
 	}
+	// agy agentic-progress chrome rendered in the live TUI (not part of the
+	// answer): thought lines ("▸ Thought for 1s, 380 tokens"), tool-call status
+	// lines ("● WebSearch(...)", "⏺ ...", "✦ ..."), and the "(ctrl+o to expand)"
+	// hint. These start with a distinct status glyph; matching the leading glyph
+	// (after trimming) avoids touching real answer prose, which never starts with
+	// these symbols.
+	if isAgenticProgressLine(t) {
+		return true
+	}
 	// Box-drawing only line (input box top/bottom borders).
 	if isBoxDrawingOnly(t) {
 		return true
@@ -680,6 +704,30 @@ func isChromeLine(trimmed string) bool {
 	// A bare prompt line: just the ">" glyph (optionally inside a box).
 	stripped := strings.TrimSpace(stripPromptGlyph(t))
 	if stripped == "" {
+		return true
+	}
+	return false
+}
+
+// agenticGlyphs are the leading symbols agy uses for live thought/tool-status
+// lines in the interactive TUI. Answer prose never begins with these.
+var agenticGlyphs = []string{"▸", "▾", "▿", "●", "⏺", "✦", "◆", "·"}
+
+// isAgenticProgressLine reports whether t is an agy thought/tool-status chrome
+// line that should not appear in the extracted answer.
+func isAgenticProgressLine(t string) bool {
+	// The "(ctrl+o to expand)" / "(ctrl+r to expand)" hint that agy appends to
+	// collapsed tool-call lines.
+	if strings.Contains(t, "ctrl+o to expand") || strings.Contains(t, "ctrl+r to expand") {
+		return true
+	}
+	for _, g := range agenticGlyphs {
+		if strings.HasPrefix(t, g) {
+			return true
+		}
+	}
+	// "Thought for <n>s" summary line even if the glyph was stripped/wrapped.
+	if strings.HasPrefix(t, "Thought for ") {
 		return true
 	}
 	return false
