@@ -81,6 +81,13 @@ func (r *fakeNotebookRunner) DeleteNotebook(ctx context.Context, notebookID stri
 	return nil
 }
 
+func (r *fakeNotebookRunner) SourceSync(ctx context.Context, notebookID string) error {
+	r.mu.Lock()
+	r.ops = append(r.ops, "sourcesync:"+notebookID)
+	r.mu.Unlock()
+	return nil
+}
+
 func newProvisioner(st store.NotebookPointerStore, docs *fakeDocLibrary, nb *fakeNotebookRunner) *NotebookProvisioner {
 	return NewNotebookProvisioner(st, docs, nb, "goclaw-memory-test")
 }
@@ -214,5 +221,21 @@ func TestGetOrCreate_RaceOnlyOneWins(t *testing.T) {
 	created := int(nb.createCalls)
 	if int(nb.deleteCalls) != created-1 {
 		t.Fatalf("deletes = %d, created = %d, want deletes == created-1 (orphan cleanup)", nb.deleteCalls, created)
+	}
+}
+
+// TestExtractNotebookID locks the fix for the live Phase-2.3 bug where the whole
+// `nlm notebook create` banner was returned as the notebook id (then passed to
+// source add / delete → exit 1/2 → orphan notebooks).
+func TestExtractNotebookID(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"✓ Created notebook: user-2e56b7af-高玉明\n  ID: b72e6774-aeef-4fa6-841a-18ad8cf3321f\n", "b72e6774-aeef-4fa6-841a-18ad8cf3321f"},
+		{"b0dbfb3d-4c18-4006-a01a-a4e09abf597f", "b0dbfb3d-4c18-4006-a01a-a4e09abf597f"},
+		{"no id here", ""},
+	}
+	for _, c := range cases {
+		if got := extractNotebookID(c.in); got != c.want {
+			t.Fatalf("extractNotebookID(%q)=%q want %q", c.in, got, c.want)
+		}
 	}
 }

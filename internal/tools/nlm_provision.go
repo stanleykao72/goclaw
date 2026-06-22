@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"regexp"
 	"strings"
 
 	"github.com/google/uuid"
@@ -76,11 +77,27 @@ func (r *execNLMNotebookRunner) CreateNotebook(ctx context.Context, title string
 	if err != nil {
 		return "", fmt.Errorf("nlm notebook create: %w", err)
 	}
-	id := strings.TrimSpace(string(out))
+	// `nlm notebook create` prints human-readable text, e.g.
+	//   ✓ Created notebook: <title>
+	//     ID: <uuid>
+	// Extract the notebook UUID — NOT the whole output (a stray full string here
+	// would be passed as the notebook id to source add / delete and fail).
+	id := extractNotebookID(string(out))
 	if id == "" {
-		return "", fmt.Errorf("nlm notebook create: empty notebook id")
+		return "", fmt.Errorf("nlm notebook create: no notebook id in output: %q", strings.TrimSpace(string(out)))
 	}
 	return id, nil
+}
+
+// notebookIDRe matches a canonical UUID (the notebook id nlm prints after "ID:").
+// The scope-derived title only carries an 8-hex fragment (e.g. user-2e56b7af-…),
+// which cannot match this full 8-4-4-4-12 pattern, so the first match is the id.
+var notebookIDRe = regexp.MustCompile(`[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`)
+
+// extractNotebookID pulls the notebook UUID from nlm's create output, tolerating
+// either the human-readable banner or a bare id.
+func extractNotebookID(out string) string {
+	return notebookIDRe.FindString(out)
 }
 
 func (r *execNLMNotebookRunner) AddDriveSource(ctx context.Context, notebookID, driveDocID string) error {
