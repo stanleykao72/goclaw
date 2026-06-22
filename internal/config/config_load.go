@@ -222,6 +222,11 @@ func (c *Config) applyEnvOverrides() {
 	envStr("GOCLAW_CLAUDE_CLI_MODEL", &c.Providers.ClaudeCLI.Model)
 	envStr("GOCLAW_CLAUDE_CLI_WORK_DIR", &c.Providers.ClaudeCLI.BaseWorkDir)
 
+	// agy CLI provider
+	envStr("GOCLAW_AGY_CLI_PATH", &c.Providers.AgyCLI.CLIPath)
+	envStr("GOCLAW_AGY_CLI_MODEL", &c.Providers.AgyCLI.Model)
+	envStr("GOCLAW_AGY_CLI_WORK_DIR", &c.Providers.AgyCLI.BaseWorkDir)
+
 	// Default provider/model: env is fallback only (applied when config has no value).
 	// The onboard wizard sets these in .env for initial bootstrap; once the user
 	// saves a provider/model via the Dashboard, the config-file value wins.
