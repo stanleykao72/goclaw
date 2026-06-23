@@ -164,6 +164,22 @@ func TestCleanAnswerLines_PreservesInternalBlanks(t *testing.T) {
 	}
 }
 
+func TestCleanAnswerLines_DropsGlyphThoughtTitle(t *testing.T) {
+	// agy renders the thought summary WITH a leading glyph; the indented
+	// thought-title on the next line must not leak into the answer (regression:
+	// "Locating Access Information" appeared above the real answer).
+	lines := []string{
+		"▸ Thought for 3s, 200 tokens",
+		"  Locating Access Information",
+		"公司訪客的 WiFi 密碼是 guest2026。",
+	}
+	got := cleanAnswerLines(lines)
+	want := "公司訪客的 WiFi 密碼是 guest2026。"
+	if got != want {
+		t.Errorf("cleanAnswerLines = %q, want %q", got, want)
+	}
+}
+
 func TestDedent_StripsGutterPreservesRelative(t *testing.T) {
 	// agy renders a 2-space gutter; nested content keeps its extra indent.
 	in := []string{"  Top line", "    Nested item", "", "  Back to top"}

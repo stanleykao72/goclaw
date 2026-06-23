@@ -623,7 +623,12 @@ func cleanAnswerLines(lines []string) string {
 			dropThoughtTitle = false
 			continue // drop the title line itself
 		}
-		if strings.HasPrefix(strings.TrimSpace(trimmed), "Thought for ") {
+		// Detect the "Thought for ..." summary even when agy renders it with a
+		// leading agentic glyph ("▸ Thought for 3s, 200 tokens"). Without the
+		// glyph-tolerant strip this falls through to isChromeLine, which drops the
+		// summary but leaves dropThoughtTitle false — so the indented thought-title
+		// on the next line (e.g. "Locating Access Information") leaks into the answer.
+		if strings.HasPrefix(stripLeadingAgenticGlyphs(trimmed), "Thought for ") {
 			dropThoughtTitle = true
 			continue
 		}
@@ -717,6 +722,27 @@ func isChromeLine(trimmed string) bool {
 // agenticGlyphs are the leading symbols agy uses for live thought/tool-status
 // lines in the interactive TUI. Answer prose never begins with these.
 var agenticGlyphs = []string{"▸", "▾", "▿", "●", "⏺", "✦", "◆", "·"}
+
+// stripLeadingAgenticGlyphs removes any leading agentic glyphs (and surrounding
+// whitespace) so a "▸ Thought for 3s" line is recognized the same as a bare
+// "Thought for 3s" summary. agy sometimes renders the thought summary with a
+// glyph and sometimes without; callers that match the summary text must tolerate
+// both forms.
+func stripLeadingAgenticGlyphs(t string) string {
+	t = strings.TrimSpace(t)
+	for {
+		changed := false
+		for _, g := range agenticGlyphs {
+			if strings.HasPrefix(t, g) {
+				t = strings.TrimSpace(strings.TrimPrefix(t, g))
+				changed = true
+			}
+		}
+		if !changed {
+			return t
+		}
+	}
+}
 
 // isAgenticProgressLine reports whether t is an agy thought/tool-status chrome
 // line that should not appear in the extracted answer.
