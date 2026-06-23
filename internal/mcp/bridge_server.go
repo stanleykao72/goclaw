@@ -56,6 +56,56 @@ var BridgeToolNames = map[string]bool{
 	"team_tasks": true,
 }
 
+// Memory-tool families gated by the per-agent memory mode. The VAULT family is
+// hidden from a notebook-mode agent and the NOTEBOOK family from a vault-mode
+// agent, so the LLM never sees (and therefore never probes) a tool that would
+// only no-op for its mode. Mode "both" / unset exposes all (default — safe).
+//
+// These names are a SUBSET of BridgeToolNames; the filter touches ONLY these six
+// names. Every other registered bridge tool (read_file, exec, web_search, the
+// per-agent external/odoo MCP tools, …) is left untouched. memory_expand is not
+// currently in BridgeToolNames (so never bridge-exposed) but is named here for
+// registry correctness — naming an absent tool in the filter is a harmless no-op.
+var (
+	vaultMemoryTools = map[string]bool{
+		"memory_search": true,
+		"memory_get":    true,
+		"memory_expand": true,
+	}
+	notebookMemoryTools = map[string]bool{
+		"notebook_recall": true,
+		"remember_shared": true,
+		"remember_agent":  true,
+	}
+)
+
+// memoryModeToolFilter narrows the advertised tool list by the request's resolved
+// memory mode. It runs at tools/list time (mcp-go applies registered filters in
+// handleListTools AFTER the global+session tool merge, with the live request ctx),
+// so it sees the full advertised set and can hide process-global builtins that
+// SetSessionTools cannot. handleToolCall does NOT apply filters, so a hidden tool
+// that is somehow still invoked resolves to its global handler and hits the
+// existing Execute-time no-op gate — defense in depth preserved.
+func memoryModeToolFilter(ctx context.Context, list []mcpgo.Tool) []mcpgo.Tool {
+	var hidden map[string]bool
+	switch store.MemoryModeFromCtx(ctx) {
+	case store.MemoryModeNotebook:
+		hidden = vaultMemoryTools // notebook agent → hide the vault family
+	case store.MemoryModeVault:
+		hidden = notebookMemoryTools // vault agent → hide the notebook family
+	default:
+		return list // "both" / unknown → expose all (safe default)
+	}
+	out := list[:0]
+	for _, t := range list {
+		if hidden[t.Name] {
+			continue
+		}
+		out = append(out, t)
+	}
+	return out
+}
+
 // NewBridgeServer creates a StreamableHTTPServer that exposes GoClaw tools as MCP tools.
 // It reads tools from the registry, filters to BridgeToolNames, and serves them
 // over streamable-http transport (stateless mode).
@@ -64,6 +114,11 @@ var BridgeToolNames = map[string]bool{
 func NewBridgeServer(reg *tools.Registry, version string, msgBus *bus.MessageBus, mcpStore store.MCPServerStore, pool *Pool, grantChecker GrantChecker) http.Handler {
 	srv := mcpserver.NewMCPServer("goclaw-bridge", version,
 		mcpserver.WithToolCapabilities(false),
+		// Per-request visibility gate: hide the wrong-subsystem memory tools so a
+		// notebook/vault agent's LLM never probes a tool that would only no-op.
+		// BridgeToolNames stays the registered superset; the filter only narrows
+		// what each request advertises. The Execute-time no-op gates remain.
+		mcpserver.WithToolFilter(memoryModeToolFilter),
 	)
 
 	// Register each safe tool from the GoClaw registry. These are SHARED builtins

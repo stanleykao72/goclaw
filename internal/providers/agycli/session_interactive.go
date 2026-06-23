@@ -77,7 +77,12 @@ const agyChannelDirective = "\n\n# Channel constraints (text-only)\n" +
 	"NEVER present interactive choice menus, numbered selectors, or multiple-choice " +
 	"prompts. If you need clarification, ask in plain text in ONE short sentence, or " +
 	"make a reasonable assumption and answer directly. ALWAYS produce a final text " +
-	"answer in your reply."
+	"answer in your reply.\n\n" +
+	"# No narration\n" +
+	"Do NOT narrate your plan or your tool usage. Do NOT write sentences like " +
+	"\"I will use the X tool\", \"I will read the schema of …\", \"I will list the " +
+	"schemas …\", or \"I will now …\". Use tools silently and reply ONLY with the " +
+	"final answer to the user's request — nothing else."
 
 // SessionOptions configures a persistent interactive agy session.
 type SessionOptions struct {
