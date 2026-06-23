@@ -106,6 +106,12 @@ func (m *MemoryInterceptor) WouldRouteVault(ctx context.Context, path string) bo
 	if m == nil || m.vaultDir == "" {
 		return false
 	}
+	// Notebook-only agents do not use the vault — the write is NOT intercepted,
+	// so the ACL exemption must NOT fire (the file-writer permission still applies
+	// to the fall-through host write).
+	if store.MemoryModeFromCtx(ctx) == store.MemoryModeNotebook {
+		return false
+	}
 	if store.MemoryBackendFromCtx(ctx) != "vault" {
 		return false
 	}
@@ -115,6 +121,11 @@ func (m *MemoryInterceptor) WouldRouteVault(ctx context.Context, path string) bo
 // ReadFile attempts to read a memory file from the DB.
 // Returns (content, true, nil) if handled, or ("", false, nil) if not a memory path.
 func (m *MemoryInterceptor) ReadFile(ctx context.Context, path string) (string, bool, error) {
+	// Notebook-only agents do not use the vault memory store: do NOT intercept,
+	// so the read falls through to the normal sandbox/host file read.
+	if store.MemoryModeFromCtx(ctx) == store.MemoryModeNotebook {
+		return "", false, nil
+	}
 	ws := effectiveWorkspace(ctx, m.workspace)
 	backend := store.MemoryBackendFromCtx(ctx)
 	if !isMemoryPathForBackend(backend, path, ws) {
@@ -175,6 +186,13 @@ type MemoryWriteResult struct {
 // When appendMode is false and an existing document is overwritten with different content,
 // PreviousContent is populated in the result to allow callers to warn the agent.
 func (m *MemoryInterceptor) WriteFile(ctx context.Context, path, content string, appendMode bool) (MemoryWriteResult, error) {
+	// Notebook-only agents do not use the vault memory store: do NOT intercept or
+	// index this write as memory (no PutDocument/IndexDocument/KG, no vault file).
+	// Returning Handled=false lets the write fall through to the normal sandbox/
+	// host file write so write_file still succeeds and never errors.
+	if store.MemoryModeFromCtx(ctx) == store.MemoryModeNotebook {
+		return MemoryWriteResult{}, nil
+	}
 	ws := effectiveWorkspace(ctx, m.workspace)
 	backend := store.MemoryBackendFromCtx(ctx)
 	if !isMemoryPathForBackend(backend, path, ws) {
@@ -252,6 +270,11 @@ func (m *MemoryInterceptor) WriteFile(ctx context.Context, path, content string,
 // ListFiles lists memory documents from the DB when path is the memory directory.
 // Returns (listing, true, nil) if handled, or ("", false, nil) if not a memory path.
 func (m *MemoryInterceptor) ListFiles(ctx context.Context, path string) (string, bool, error) {
+	// Notebook-only agents do not use the vault memory store: do NOT intercept,
+	// so the listing falls through to the normal sandbox/host directory listing.
+	if store.MemoryModeFromCtx(ctx) == store.MemoryModeNotebook {
+		return "", false, nil
+	}
 	ws := effectiveWorkspace(ctx, m.workspace)
 	if !isMemoryDir(path, ws) {
 		return "", false, nil

@@ -164,6 +164,22 @@ func TestCleanAnswerLines_PreservesInternalBlanks(t *testing.T) {
 	}
 }
 
+func TestCleanAnswerLines_DropsGlyphThoughtTitle(t *testing.T) {
+	// agy renders the thought summary WITH a leading glyph; the indented
+	// thought-title on the next line must not leak into the answer (regression:
+	// "Locating Access Information" appeared above the real answer).
+	lines := []string{
+		"▸ Thought for 3s, 200 tokens",
+		"  Locating Access Information",
+		"公司訪客的 WiFi 密碼是 guest2026。",
+	}
+	got := cleanAnswerLines(lines)
+	want := "公司訪客的 WiFi 密碼是 guest2026。"
+	if got != want {
+		t.Errorf("cleanAnswerLines = %q, want %q", got, want)
+	}
+}
+
 func TestDedent_StripsGutterPreservesRelative(t *testing.T) {
 	// agy renders a 2-space gutter; nested content keeps its extra indent.
 	in := []string{"  Top line", "    Nested item", "", "  Back to top"}
@@ -328,6 +344,28 @@ func TestWriteGeminiInstructions_WritesFile(t *testing.T) {
 	}
 	if base := filepath.Base(path); base != "GEMINI.md" {
 		t.Errorf("instructions filename = %q, want GEMINI.md", base)
+	}
+}
+
+// The channel directive must instruct agy NOT to narrate its plan/tool usage so
+// the model stops streaming "I will use the X tool" prose to the text channel —
+// only the final answer should reach the user (FIX B, CASE 2).
+func TestWriteGeminiInstructions_ContainsNoNarrationDirective(t *testing.T) {
+	dir := t.TempDir()
+	syncGeminiInstructions(dir, "You are TB.")
+	got, err := os.ReadFile(filepath.Join(dir, geminiInstructionsFile))
+	if err != nil {
+		t.Fatalf("GEMINI.md not written: %v", err)
+	}
+	content := string(got)
+	for _, want := range []string{"No narration", "Do NOT narrate", "final answer"} {
+		if !strings.Contains(content, want) {
+			t.Errorf("GEMINI.md must contain the no-narration directive fragment %q; got %q", want, content)
+		}
+	}
+	// The text-only directive must still be present alongside it.
+	if !strings.Contains(content, "TEXT-ONLY") {
+		t.Errorf("GEMINI.md must retain the text-only directive; got %q", content)
 	}
 }
 

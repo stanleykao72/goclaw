@@ -83,6 +83,11 @@ func injectBridgeIdentity(ctx context.Context, id ResolvedIdentity, agentStore s
 				// (ag.ParseMemoryBackend()); defaults to "db" so non-vault
 				// agents are bit-for-bit unchanged.
 				ctx = store.WithMemoryBackend(ctx, ag.ParseMemoryBackend())
+				// Propagate the per-agent memory mode ("notebook" | "vault" |
+				// "both") so bridge memory tools gate the SAME subsystems as the
+				// native agent loop. Mirrors WithMemoryBackend above; defaults to
+				// "both" so non-configured agents keep every subsystem active.
+				ctx = store.WithMemoryMode(ctx, ag.ParseMemoryMode())
 				groups := ag.ParseShellDenyGroups()
 				if groups != nil {
 					ctx = store.WithShellDenyGroups(ctx, groups)

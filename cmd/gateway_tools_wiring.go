@@ -136,6 +136,27 @@ func wireExtraTools(
 		}
 	}
 
+	// notebook_recall: inject the scope→notebook pointer store post-construction
+	// (the tool is registered zero-dep in setupToolRegistry, which lacks
+	// *store.Stores). This upgrades recall from the single test notebook to the
+	// caller's resolved scope SET (resolveNotebookSet). A nil pointer store (the
+	// sqlite stub returns not-found) degrades to the "no memory yet" fail-soft.
+	if t, ok := toolsReg.Get("notebook_recall"); ok {
+		if pa, ok := t.(interface {
+			SetPointerStore(store.NotebookPointerStore)
+		}); ok {
+			pa.SetPointerStore(pgStores.NotebookPointers)
+			slog.Info("notebook_recall pointer store wired (scope-set recall)")
+		}
+	}
+
+	// remember_shared / remember_agent: inject the NLM write stack (provisioner +
+	// Drive Doc library + nlm runner) shared with the ingest worker. Unlike the
+	// ingest worker these are NOT gated by GOCLAW_NLM_INGEST_ENABLED — they are
+	// agent-driven and gated per-agent by memory_mode inside Execute. A nil pointer
+	// store (sqlite stub) leaves them unwired → they fail soft.
+	wireNotebookRememberTools(pgStores, toolsReg)
+
 	// Memory tools are PG-backed; always available.
 	hasMemory = true
 

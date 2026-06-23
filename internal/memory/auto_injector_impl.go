@@ -28,6 +28,13 @@ func (a *pgAutoInjector) Inject(ctx context.Context, params InjectParams) (*Inje
 	if a.episodicStore == nil {
 		return &InjectResult{}, nil
 	}
+	// memory_mode "notebook": the vault/episodic READ path is disabled for this
+	// agent, so do not inject a "## Memory Context" block (and do not point the
+	// model at memory_search, which also no-ops in this mode). No-op, not error —
+	// mirrors the gate in memory.go. Unset/both/vault all fall through.
+	if store.MemoryModeFromCtx(ctx) == store.MemoryModeNotebook {
+		return &InjectResult{}, nil
+	}
 	if isTrivialMessage(params.UserMessage) {
 		return &InjectResult{}, nil
 	}

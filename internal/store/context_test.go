@@ -17,6 +17,57 @@ func TestAgentAudioFromCtx_EmptyContext(t *testing.T) {
 	}
 }
 
+func TestMemoryModeFromContext_DefaultsToBoth(t *testing.T) {
+	t.Parallel()
+	if got := MemoryModeFromContext(context.Background()); got != MemoryModeBoth {
+		t.Fatalf("bare context: got %q, want %q", got, MemoryModeBoth)
+	}
+	if got := MemoryModeFromCtx(context.Background()); got != MemoryModeBoth {
+		t.Fatalf("MemoryModeFromCtx alias: got %q, want %q", got, MemoryModeBoth)
+	}
+}
+
+func TestMemoryModeFromContext_DirectKeyRoundTrip(t *testing.T) {
+	t.Parallel()
+	for _, mode := range []string{MemoryModeNotebook, MemoryModeVault, MemoryModeBoth} {
+		ctx := WithMemoryMode(context.Background(), mode)
+		if got := MemoryModeFromContext(ctx); got != mode {
+			t.Fatalf("WithMemoryMode(%q): got %q", mode, got)
+		}
+	}
+}
+
+func TestMemoryModeFromContext_EmptyDirectKeyFallsBackToDefault(t *testing.T) {
+	t.Parallel()
+	// An explicitly-empty direct key must NOT pin "" — it falls through to default.
+	ctx := WithMemoryMode(context.Background(), "")
+	if got := MemoryModeFromContext(ctx); got != MemoryModeBoth {
+		t.Fatalf("empty direct key: got %q, want %q", got, MemoryModeBoth)
+	}
+}
+
+func TestMemoryModeFromContext_RunContextFallback(t *testing.T) {
+	t.Parallel()
+	ctx := WithRunContext(context.Background(), &RunContext{MemoryMode: MemoryModeVault})
+	if got := MemoryModeFromContext(ctx); got != MemoryModeVault {
+		t.Fatalf("RunContext fallback: got %q, want %q", got, MemoryModeVault)
+	}
+	// Empty RunContext.MemoryMode must default to both, not "".
+	ctx = WithRunContext(context.Background(), &RunContext{})
+	if got := MemoryModeFromContext(ctx); got != MemoryModeBoth {
+		t.Fatalf("empty RunContext.MemoryMode: got %q, want %q", got, MemoryModeBoth)
+	}
+}
+
+func TestMemoryModeFromContext_DirectKeyOverridesRunContext(t *testing.T) {
+	t.Parallel()
+	ctx := WithRunContext(context.Background(), &RunContext{MemoryMode: MemoryModeVault})
+	ctx = WithMemoryMode(ctx, MemoryModeNotebook)
+	if got := MemoryModeFromContext(ctx); got != MemoryModeNotebook {
+		t.Fatalf("direct key should win: got %q, want %q", got, MemoryModeNotebook)
+	}
+}
+
 func TestAgentAudioFromCtx_RoundTrip(t *testing.T) {
 	t.Parallel()
 	id := uuid.New()

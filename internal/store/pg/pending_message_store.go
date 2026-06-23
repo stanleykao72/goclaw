@@ -69,6 +69,34 @@ func (s *PGPendingMessageStore) ListByKey(ctx context.Context, channelName, hist
 	return result, err
 }
 
+// ListSince returns raw (non-summary) pending messages for a channel+historyKey
+// strictly after the composite high-water (afterCreatedAt, afterID). READ-ONLY:
+// used by the NotebookLM ingest worker, which never deletes. The
+// (created_at, id) > (cursor) predicate is collision-safe (AppendBatch stamps
+// one created_at per batch, id is a UUIDv7 tiebreak); is_summary rows are
+// excluded so the worker ingests raw conversation only.
+func (s *PGPendingMessageStore) ListSince(ctx context.Context, channelName, historyKey string, afterCreatedAt time.Time, afterID uuid.UUID, limit int) ([]store.PendingMessage, error) {
+	// Params: $1 channel, $2 history_key, $3 afterCreatedAt, $4 afterID, then the
+	// tenant scope clause starts at $5.
+	tClause, tArgs, _, err := scopeClause(ctx, 5)
+	if err != nil {
+		return nil, err
+	}
+	q := `SELECT id, channel_name, history_key, sender, sender_id, body, platform_msg_id, is_summary, created_at, updated_at
+		 FROM channel_pending_messages
+		 WHERE channel_name = $1 AND history_key = $2
+		   AND is_summary = false
+		   AND (created_at, id) > ($3, $4)` + tClause + `
+		 ORDER BY created_at ASC, id ASC`
+	args := append([]any{channelName, historyKey, afterCreatedAt, afterID}, tArgs...)
+	if limit > 0 {
+		q += fmt.Sprintf(" LIMIT %d", limit)
+	}
+	var result []store.PendingMessage
+	err = pkgSqlxDB.SelectContext(ctx, &result, q, args...)
+	return result, err
+}
+
 func (s *PGPendingMessageStore) DeleteByKey(ctx context.Context, channelName, historyKey string) error {
 	tClause, tArgs, _, err := scopeClause(ctx, 3)
 	if err != nil {

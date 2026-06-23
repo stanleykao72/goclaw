@@ -60,4 +60,14 @@ type Stores struct {
 
 	// UsageCaps is Standard/PostgreSQL only in the first budget-control rollout.
 	UsageCaps UsageCapStore
+
+	// NotebookPointers maps memory scopes to NotebookLM notebooks + Drive Docs
+	// (goclaw × NotebookLM 4-tier memory). PostgreSQL only in the first rollout;
+	// the SQLite backend wires a stub.
+	NotebookPointers NotebookPointerStore
+
+	// IngestCursors persists the per-scope high-water for the NotebookLM ingest
+	// worker (sub-phase 2.3). PostgreSQL only in the first rollout; nil on other
+	// backends → the ingest worker no-ops.
+	IngestCursors IngestCursorStore
 }

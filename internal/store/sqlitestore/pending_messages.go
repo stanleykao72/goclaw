@@ -83,6 +83,46 @@ func (s *SQLitePendingMessageStore) ListByKey(ctx context.Context, channelName, 
 	return result, rows.Err()
 }
 
+// ListSince returns raw (non-summary) pending messages strictly after the
+// composite high-water (afterCreatedAt, afterID). READ-ONLY (used by the
+// NotebookLM ingest worker, which never deletes). The composite boundary is
+// expanded to `created_at > ? OR (created_at = ? AND id > ?)` for portability
+// (SQLite row-value comparison support varies).
+func (s *SQLitePendingMessageStore) ListSince(ctx context.Context, channelName, historyKey string, afterCreatedAt time.Time, afterID uuid.UUID, limit int) ([]store.PendingMessage, error) {
+	tClause, tArgs, err := scopeClause(ctx)
+	if err != nil {
+		return nil, err
+	}
+	args := append([]any{channelName, historyKey, afterCreatedAt, afterCreatedAt, afterID}, tArgs...)
+	q := `SELECT id, channel_name, history_key, sender, sender_id, body, platform_msg_id, is_summary, created_at, updated_at
+		 FROM channel_pending_messages
+		 WHERE channel_name = ? AND history_key = ?
+		   AND is_summary = 0
+		   AND (created_at > ? OR (created_at = ? AND id > ?))` + tClause + `
+		 ORDER BY created_at ASC, id ASC`
+	if limit > 0 {
+		q += fmt.Sprintf(" LIMIT %d", limit)
+	}
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []store.PendingMessage
+	for rows.Next() {
+		var m store.PendingMessage
+		createdAt, updatedAt := scanTimePair()
+		if err := rows.Scan(&m.ID, &m.ChannelName, &m.HistoryKey, &m.Sender, &m.SenderID, &m.Body, &m.PlatformMsgID, &m.IsSummary, createdAt, updatedAt); err != nil {
+			return nil, err
+		}
+		m.CreatedAt = createdAt.Time
+		m.UpdatedAt = updatedAt.Time
+		result = append(result, m)
+	}
+	return result, rows.Err()
+}
+
 func (s *SQLitePendingMessageStore) DeleteByKey(ctx context.Context, channelName, historyKey string) error {
 	tClause, tArgs, err := scopeClause(ctx)
 	if err != nil {

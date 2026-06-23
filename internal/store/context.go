@@ -56,6 +56,8 @@ const (
 	AgentAudioKey contextKey = "goclaw_agent_audio"
 	// MemoryBackendKey carries the per-agent memory backend ("db" | "vault").
 	MemoryBackendKey contextKey = "goclaw_memory_backend"
+	// MemoryModeKey carries the per-agent memory mode ("notebook" | "vault" | "both").
+	MemoryModeKey contextKey = "goclaw_memory_mode"
 )
 
 // AgentAudioSnapshot is an immutable snapshot of agent audio config carried through
@@ -131,6 +133,31 @@ func MemoryBackendFromCtx(ctx context.Context) string {
 		return rc.MemoryBackend
 	}
 	return "db"
+}
+
+// WithMemoryMode returns a new context carrying the per-agent memory mode.
+func WithMemoryMode(ctx context.Context, mode string) context.Context {
+	return context.WithValue(ctx, MemoryModeKey, mode)
+}
+
+// MemoryModeFromContext returns the per-agent memory mode
+// ("notebook" | "vault" | "both"). Reads the direct key first, then falls back
+// to RunContext. Any unset/empty value resolves to "both" so every memory
+// subsystem is active by default (backward compatible).
+func MemoryModeFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(MemoryModeKey).(string); ok && v != "" {
+		return v
+	}
+	if rc := RunContextFromCtx(ctx); rc != nil && rc.MemoryMode != "" {
+		return rc.MemoryMode
+	}
+	return MemoryModeBoth
+}
+
+// MemoryModeFromCtx is an alias for MemoryModeFromContext matching the local
+// MemoryBackendFromCtx naming convention used at the tool gate sites.
+func MemoryModeFromCtx(ctx context.Context) string {
+	return MemoryModeFromContext(ctx)
 }
 
 // WithCredentialUserID returns a new context with the resolved tenant user identity for credential lookups.

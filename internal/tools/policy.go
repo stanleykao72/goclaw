@@ -13,7 +13,7 @@ import (
 // builtinToolGroups is const-like seed data for per-Registry tool groups.
 // Do NOT modify at runtime — each Registry gets a deep copy in NewRegistry().
 var builtinToolGroups = map[string][]string{
-	"memory":     {"memory_search", "memory_get"},
+	"memory":     {"memory_search", "memory_get", "notebook_recall", "remember_shared", "remember_agent"},
 	"web":        {"web_search", "web_fetch"},
 	"fs":         {"read_file", "write_file", "list_files", "edit"},
 	"runtime":    {"exec", "wait"},
@@ -27,7 +27,8 @@ var builtinToolGroups = map[string][]string{
 	"goclaw": {
 		"read_file", "write_file", "list_files", "edit", "exec", "wait",
 		"web_search", "web_fetch", "browser",
-		"memory_search", "memory_get", "memory_expand",
+		"memory_search", "memory_get", "memory_expand", "notebook_recall",
+		"remember_shared", "remember_agent",
 		"knowledge_graph_search", "vault_search", "vault_read",
 		"sessions_list", "sessions_history", "sessions_send", "spawn", "session_status",
 		"delegate",

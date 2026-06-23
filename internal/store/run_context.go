@@ -36,6 +36,12 @@ type RunContext struct {
 	// MemoryBackendFromCtx.
 	MemoryBackend string
 
+	// MemoryMode selects which memory subsystem(s) the agent uses
+	// ("notebook" | "vault" | "both"). Empty is treated as "both" (current
+	// behavior — every subsystem active). Single carrier for the mode flag —
+	// read via MemoryModeFromCtx.
+	MemoryMode string
+
 	// Flags
 	SelfEvolve          bool
 	SharedMemory        bool

@@ -91,6 +91,23 @@ func setupToolRegistry(
 	toolsReg.Register(tools.NewKnowledgeGraphSearchTool())
 	slog.Info("memory + knowledge graph tools registered (PG-backed)")
 
+	// notebook_recall — general builtin available to ALL agent types (native
+	// loop, ACP, CLI bridge). Notebook is resolved server-side inside Execute;
+	// the LLM-facing schema is {question} only. Config/env may override the nlm
+	// binary + the shared notebook id.
+	toolsReg.Register(tools.NewNotebookRecallTool(cfg.Tools.NotebookLM.Binary, cfg.Tools.NotebookLM.NotebookID))
+	slog.Info("notebook_recall tool registered (nlm CLI shell-out)")
+
+	// remember_shared / remember_agent — curate (write) tools available to ALL
+	// agent types. Like notebook_recall they are registered zero-dep here; the NLM
+	// write stack (provisioner + Drive Doc library + nlm runner) is injected in
+	// wireExtraTools once the PG stores are ready. The scope is resolved
+	// server-side inside Execute (shared → ("shared",""); agent → ctx agentKey);
+	// the LLM-facing schema is {content, title} only.
+	toolsReg.Register(tools.NewRememberSharedTool())
+	toolsReg.Register(tools.NewRememberAgentTool())
+	slog.Info("remember_shared + remember_agent curate tools registered (nlm CLI shell-out)")
+
 	// Browser automation tool
 	if cfg.Tools.Browser.Enabled {
 		var opts []browser.Option
