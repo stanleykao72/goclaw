@@ -350,6 +350,11 @@ func runGateway() {
 	server.SetMessageBus(msgBus)
 	server.SetOAuthHandler(httpapi.NewOAuthHandler(pgStores.Providers, pgStores.ConfigSecrets, providerRegistry, msgBus))
 
+	// esmith-ocr: FR expense invoice vision extraction endpoint
+	// (POST /fr/ocr/extract). Env-gated — registers nothing when
+	// ESMITH_OCR_HMAC_SECRET is unset.
+	registerEsmithOcrOnGateway(server)
+
 	// contextFileInterceptor is created inside wireExtras.
 	// Declared here so it can be passed to registerAllMethods → AgentsMethods
 	// for immediate cache invalidation on agents.files.set.

@@ -31,6 +31,7 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/gateway/methods"
 	lw "github.com/nextlevelbuilder/goclaw/internal/lineworks"
 	esmithkm "github.com/nextlevelbuilder/goclaw/internal/plugins/esmith-km"
+	esmithocr "github.com/nextlevelbuilder/goclaw/internal/plugins/esmith-ocr"
 	lineworksautobind "github.com/nextlevelbuilder/goclaw/internal/plugins/lineworks-autobind"
 	lineworksworkflow "github.com/nextlevelbuilder/goclaw/internal/plugins/lineworks-workflow"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
@@ -178,6 +179,58 @@ func registerEsmithKmLiffOnGateway(srv *gateway.Server, lc *linechannel.Channel)
 				"POST /km/meeting/attendees/submit",
 			})
 	})
+}
+
+// buildEsmithOcrHandler constructs the FR expense invoice OCR HTTP handler
+// (POST /fr/ocr/extract). Returns nil when ESMITH_OCR_HMAC_SECRET is not set
+// so the caller can skip registration — safe default: no secret, no endpoint.
+//
+// The secret is shared with Odoo (ir.config_parameter, set by ops on both
+// ends, never committed). ESMITH_OCR_ALLOW_ORIGINS is a comma-separated CORS
+// allowlist; when unset it defaults to the known Odoo staging + production
+// hosts, mirroring the esmith-km LIFF handler defaults.
+func buildEsmithOcrHandler() *esmithocr.Handler {
+	secret := os.Getenv("ESMITH_OCR_HMAC_SECRET")
+	if secret == "" {
+		return nil
+	}
+	origins := strings.Split(os.Getenv("ESMITH_OCR_ALLOW_ORIGINS"), ",")
+	for i, o := range origins {
+		origins[i] = strings.TrimSpace(o)
+	}
+	// Strip empties so a missing env doesn't produce a single empty-string
+	// entry that every origin string trivially compares against.
+	cleaned := origins[:0]
+	for _, o := range origins {
+		if o != "" {
+			cleaned = append(cleaned, o)
+		}
+	}
+	if len(cleaned) == 0 {
+		// Safe defaults: allow the known staging + production Odoo hosts.
+		cleaned = []string{
+			"https://odoo-esmith*.odoo.com",
+			"https://odoo-esmith*.dev.odoo.com",
+		}
+	}
+	return esmithocr.NewHandler(secret, cleaned)
+}
+
+// registerEsmithOcrOnGateway mounts the esmith-ocr handler on the gateway
+// mux. Unlike esmith-km's LIFF handler this has no channel dependency — it is
+// gated purely on the shared HMAC secret being configured.
+func registerEsmithOcrOnGateway(srv *gateway.Server) {
+	if srv == nil {
+		return
+	}
+	handler := buildEsmithOcrHandler()
+	if handler == nil {
+		slog.Info("esmith-ocr disabled: ESMITH_OCR_HMAC_SECRET not set")
+		return
+	}
+	srv.RegisterPluginHandler(handler)
+	slog.Info("esmith-ocr: HTTP handler registered on gateway",
+		"routes", []string{"POST /fr/ocr/extract"})
 }
 
 // makeLineFactoryWithEsmithKm closes over the gateway server so each LINE
