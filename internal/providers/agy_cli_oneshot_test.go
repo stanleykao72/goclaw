@@ -22,6 +22,7 @@ type fakePrintRunner struct {
 	envs     [][]string
 	answers  []string // popped per call; last one repeats when exhausted
 	timedOut bool     // when true, every result reports TimedOut
+	fail     bool     // when true, every result is exit 1 with empty stdout
 	nextConv int
 }
 
@@ -38,6 +39,9 @@ func (f *fakePrintRunner) run(_ context.Context, _ string, opts agycli.PrintOpti
 		}
 	}
 	res := agycli.PrintResult{Stdout: answer + "\n", ExitCode: 0, TimedOut: f.timedOut}
+	if f.fail {
+		res = agycli.PrintResult{Stdout: "", Stderr: "You are not logged into Antigravity\n", ExitCode: 1}
+	}
 	if opts.Conversation == "" {
 		f.nextConv++
 		res.ConversationID = fmt.Sprintf("conv-%d", f.nextConv)
@@ -65,10 +69,15 @@ func (f *fakePrintRunner) env(i int) []string {
 
 func newOneShotProvider(t *testing.T, fr *fakePrintRunner, opts ...AgyCLIOption) *AgyCLIProvider {
 	t.Helper()
+	realGem := newFakeRealGemini(t)
 	base := []AgyCLIOption{
 		WithAgyCLIOneShot(true),
 		WithAgyCLIWorkDir(t.TempDir()),
 		withAgyCLIRunPrint(fr.run),
+		// Every one-shot session builds a fake HOME, so the resolver must be
+		// faked by default — tests must never symlink the developer's real
+		// ~/.gemini. Callers may still override with their own fixture.
+		withAgyCLIRealGeminiDir(func() (string, error) { return realGem, nil }),
 		withAgyCLISessionFactory(func(context.Context, agycli.SessionOptions) (agySession, error) {
 			t.Fatal("interactive session factory must not be used in one-shot mode")
 			return nil, nil
@@ -348,14 +357,53 @@ func TestAgyCLI_OneShot_EphemeralSeedsAndCleansUp(t *testing.T) {
 	}
 }
 
-func TestAgyCLI_OneShot_NoBridgeNoFakeHome(t *testing.T) {
+func TestAgyCLI_OneShot_NoBridgeStillIsolatesHomeAndStripsStaleBridge(t *testing.T) {
 	fr := &fakePrintRunner{}
-	p := newOneShotProvider(t, fr)
+	realGem := newFakeRealGemini(t)
+	// Simulate an interactive session having written a goclaw-bridge entry
+	// into the GLOBAL config: a bridge-less one-shot run must not load it.
+	stale := `{"mcpServers":{"operator-odoo":{"command":"/bin/odoo-mcp"},"goclaw-bridge":{"url":"http://127.0.0.1:59999/mcp/other-session","type":"http"}}}`
+	if err := os.WriteFile(filepath.Join(realGem, "config", "mcp_config.json"), []byte(stale), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := newOneShotProvider(t, fr,
+		withAgyCLIRealGeminiDir(func() (string, error) { return realGem, nil }),
+	)
 	if _, err := p.Chat(context.Background(), oneShotReq("s1", "", "hi")); err != nil {
 		t.Fatal(err)
 	}
-	if env := fr.env(0); len(env) != 0 {
-		t.Fatalf("no-bridge runs must not override env, got %v", env)
+	env := fr.env(0)
+	if len(env) != 1 || !strings.HasPrefix(env[0], "HOME=") {
+		t.Fatalf("bridge-less one-shot must STILL isolate HOME (stale-bridge defense), got %v", env)
+	}
+	fakeHome := strings.TrimPrefix(env[0], "HOME=")
+	raw, err := os.ReadFile(filepath.Join(fakeHome, ".gemini", "config", "mcp_config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "goclaw-bridge") {
+		t.Fatalf("stale bridge entry leaked into the session config: %s", raw)
+	}
+	if !strings.Contains(string(raw), "operator-odoo") {
+		t.Fatalf("operator server dropped from the session config: %s", raw)
+	}
+}
+
+func TestAgyCLI_OneShot_HardFailureSurfacesAsError(t *testing.T) {
+	fr := &fakePrintRunner{}
+	p := newOneShotProvider(t, fr)
+	ctx := context.Background()
+	if _, err := p.Chat(ctx, oneShotReq("s1", "", "warmup")); err != nil {
+		t.Fatal(err)
+	}
+	// Next turn: agy dies with a non-zero exit and nothing on stdout (expired
+	// auth token, invalid conversation id, ...). Must be an error, not an
+	// empty "stop" answer.
+	fr.mu.Lock()
+	fr.fail = true
+	fr.mu.Unlock()
+	if _, err := p.Chat(ctx, oneShotReq("s1", "", "boom")); err == nil {
+		t.Fatal("hard turn failure must surface as an error")
 	}
 }
 

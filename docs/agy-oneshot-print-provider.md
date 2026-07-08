@@ -125,6 +125,11 @@ session B: write config (B 的 URL) → spawn agy_B
 3. 觀測 24–48h：`v3.run.completed` 的 duration/token 對比、無 0-token turn
 4. 過關 → 另開 change 退役 tmux 路徑；不過 → flag off 回滾，記錄失敗模式
 
+## 3.5 已知限制（dual-review 確認，暫不處理）
+
+- **共享 conversations store 洩漏面**（security review F2）：fake HOME symlink 進真 `~/.gemini`（含 conversations db），`--dangerously-skip-permissions` 且無 sandbox 時，用戶 B 可誘導 agy 讀 `$HOME/.gemini/...` 取得用戶 A 的 system prompt / 對話史。interactive 模式同樣暴露（非本 change 引入）。多租戶部署 SHOULD 開 `sandbox: true`；徹底隔離 conversations 會犧牲 resume，留待後續 change 評估。
+- **Close()/reap 期間 in-flight turn**：closeEntry 用 TryLock + 背景 goroutine 延後清理 fake home / bridge listener 至該 turn 結束；行程本身不被殺（最長跑到 hard-kill 上限）。
+
 ## 4. 驗收準則
 
 - one-shot 模式下：同 session_key 跨 turn 記憶正常（三輪 codeword 測試綠）、system prompt 生效且不回聲、bridge 工具呼叫身分正確（雙用戶併發無串線）

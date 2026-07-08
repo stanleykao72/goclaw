@@ -247,34 +247,58 @@ func TestRunPrint_ExtraEnvOverridesHome(t *testing.T) {
 	}
 }
 
-func TestRunPrint_HardKillOnWedge(t *testing.T) {
+// writeWedgeStub writes a stub that ignores --print-timeout and sleeps
+// forever, reproducing the W0 wedge failure mode.
+func writeWedgeStub(t *testing.T) string {
+	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX shell stub")
 	}
-	dir := t.TempDir()
-	// A stub that ignores --print-timeout and sleeps forever, reproducing the
-	// W0 wedge failure mode.
-	bin := filepath.Join(dir, "agy-wedge")
+	bin := filepath.Join(t.TempDir(), "agy-wedge")
 	if err := os.WriteFile(bin, []byte("#!/bin/sh\nsleep 600\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	return bin
+}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
+func TestRunPrint_HardKillOnWedge(t *testing.T) {
+	bin := writeWedgeStub(t)
+	oldGrace := printTimeoutGrace
+	printTimeoutGrace = 500 * time.Millisecond
+	t.Cleanup(func() { printTimeoutGrace = oldGrace })
+
 	start := time.Now()
-	res, err := RunPrint(ctx, bin, PrintOptions{
+	res, err := RunPrint(context.Background(), bin, PrintOptions{
 		Prompt:       "hi",
 		Conversation: "1ea82809-3482-44b6-ac01-4abdf0bd7fa2",
-		PrintTimeout: time.Hour, // internal timeout never fires; ctx bounds the run
+		PrintTimeout: 200 * time.Millisecond, // hard kill at 700ms
 	}, nil)
 	if err != nil {
 		t.Fatalf("RunPrint error: %v", err)
 	}
 	if !res.TimedOut {
-		t.Fatal("expected TimedOut=true")
+		t.Fatal("expected TimedOut=true on the hard-timeout wedge kill")
 	}
 	if elapsed := time.Since(start); elapsed > 30*time.Second {
 		t.Fatalf("hard kill too slow: %v", elapsed)
+	}
+}
+
+func TestRunPrint_CallerCancelIsNotTimeout(t *testing.T) {
+	bin := writeWedgeStub(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	res, err := RunPrint(ctx, bin, PrintOptions{
+		Prompt:       "hi",
+		Conversation: "1ea82809-3482-44b6-ac01-4abdf0bd7fa2",
+		PrintTimeout: time.Hour,
+	}, nil)
+	if err == nil {
+		t.Fatal("caller cancellation must surface as an error")
+	}
+	if res.TimedOut {
+		t.Fatal("caller cancellation must NOT be labeled TimedOut (never-retry contract is for wedge kills)")
 	}
 }
 

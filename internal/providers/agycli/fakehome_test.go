@@ -185,3 +185,40 @@ func TestRealGeminiDir_EnvOverride(t *testing.T) {
 		t.Fatalf("RealGeminiDir() = %q", got)
 	}
 }
+
+func TestBuildFakeHome_StripsStaleGlobalBridgeEntry(t *testing.T) {
+	real := newRealGemini(t)
+	// An interactive session wrote its own goclaw-bridge entry into the
+	// GLOBAL config; copying it into a session's isolated config would hand
+	// this session another session's bridge identity.
+	stale := `{"mcpServers":{"operator-odoo":{"command":"/usr/local/bin/odoo-mcp"},"goclaw-bridge":{"url":"http://127.0.0.1:59999/mcp/other","type":"http"}}}`
+	if err := os.WriteFile(filepath.Join(real, "config", "mcp_config.json"), []byte(stale), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fakeHome := filepath.Join(t.TempDir(), "fh")
+
+	// No bridge for this session: the stale entry must simply vanish.
+	if err := BuildFakeHome(fakeHome, real, nil); err != nil {
+		t.Fatal(err)
+	}
+	doc := readMCPConfig(t, filepath.Join(fakeHome, ".gemini", "config", "mcp_config.json"))
+	mcp, _ := doc["mcpServers"].(map[string]any)
+	if _, leaked := mcp["goclaw-bridge"]; leaked {
+		t.Fatal("stale global bridge entry leaked into the isolated config")
+	}
+	if _, ok := mcp["operator-odoo"]; !ok {
+		t.Fatal("operator server must survive the strip")
+	}
+
+	// With a bridge: THIS session's entry replaces the stale one.
+	fakeHome2 := filepath.Join(t.TempDir(), "fh2")
+	if err := BuildFakeHome(fakeHome2, real, BuildAgyBridgeServers("http://127.0.0.1:40001/mcp", "")); err != nil {
+		t.Fatal(err)
+	}
+	doc2 := readMCPConfig(t, filepath.Join(fakeHome2, ".gemini", "config", "mcp_config.json"))
+	mcp2, _ := doc2["mcpServers"].(map[string]any)
+	bridge, _ := mcp2["goclaw-bridge"].(map[string]any)
+	if bridge == nil || bridge["url"] != "http://127.0.0.1:40001/mcp" {
+		t.Fatalf("session bridge entry wrong: %v", mcp2["goclaw-bridge"])
+	}
+}

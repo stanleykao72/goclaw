@@ -3,6 +3,7 @@ package agycli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -28,8 +29,9 @@ import (
 
 // printTimeoutGrace is how much longer than --print-timeout the hard kill
 // waits. The grace covers agy's normal post-answer teardown; past it we assume
-// the wedge failure mode and kill the process group.
-const printTimeoutGrace = 30 * time.Second
+// the wedge failure mode and kill the process group. A var (not const) only so
+// tests can shrink it to exercise the hard-kill path quickly.
+var printTimeoutGrace = 30 * time.Second
 
 // createdConversationRE captures the conversation ID agy logs on a fresh run
 // ("Created conversation <uuid>"). W0 verified this line appears in the file
@@ -64,8 +66,10 @@ type PrintResult struct {
 //     under extraEnv for parity with the PTY path.
 //   - The child runs in its own process group and the ENTIRE group is killed
 //     on timeout/cancel (agy spawns tool children).
-//   - A timed-out run returns TimedOut=true and a nil error: the caller
-//     decides how to surface it, and must not retry (double-execution).
+//   - A hard-timeout run returns TimedOut=true and a nil error: the caller
+//     decides how to surface it, and must not retry (double-execution). A
+//     CALLER-cancelled run instead returns ctx.Err() so cancellation is never
+//     mislabeled as the wedge-timeout failure mode.
 func RunPrint(ctx context.Context, binary string, opts PrintOptions, extraEnv []string) (PrintResult, error) {
 	if opts.PrintTimeout <= 0 {
 		opts.PrintTimeout = DefaultRunTimeout
@@ -99,31 +103,45 @@ func RunPrint(ctx context.Context, binary string, opts PrintOptions, extraEnv []
 
 	start := time.Now()
 
-	// Not exec.CommandContext: teardown must target the whole process group
-	// (agy spawns child tools), mirroring RunWithPTY.
-	cmd := exec.Command(binary, args...)
+	cmd := exec.CommandContext(runCtx, binary, args...)
 	cmd.Env = buildEnv(extraEnv)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// Teardown must target the whole process group (agy spawns child tools),
+	// mirroring RunWithPTY — override the default single-process Kill.
+	cmd.Cancel = func() error {
+		killProcessGroup(cmd)
+		return nil
+	}
+	// Bound Wait's pipe drain: if a tool child escaped the process group and
+	// holds the stdout/stderr pipe open past the kill, give up on the pipes
+	// after 5s instead of wedging this session's entry.mu forever.
+	cmd.WaitDelay = 5 * time.Second
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	cmd.Stdin = nil // /dev/null; W0 confirmed non-TTY --print completes normally
 
-	if err := cmd.Start(); err != nil {
-		return PrintResult{ExitCode: -1, Duration: time.Since(start)}, fmt.Errorf("agycli: start %s: %w", binary, err)
+	runErr := cmd.Run()
+	if runErr != nil && runCtx.Err() == nil && !errors.Is(runErr, exec.ErrWaitDelay) {
+		if _, isExit := runErr.(*exec.ExitError); !isExit {
+			// Spawn-level failure (binary missing, not executable, ...).
+			return PrintResult{ExitCode: -1, Duration: time.Since(start)}, fmt.Errorf("agycli: run %s: %w", binary, runErr)
+		}
 	}
 
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-
-	timedOut := false
-	select {
-	case <-runCtx.Done():
-		timedOut = true
-		killProcessGroup(cmd)
-		<-done // reap; bounded because the group was SIGKILLed
-	case <-done:
+	// Distinguish caller cancellation from the hard-timeout wedge kill: a
+	// cancelled run is the caller's decision and must surface as ctx.Err(),
+	// NOT as TimedOut (which carries the never-retry double-execution
+	// contract for turns that may have completed server-side).
+	if ctx.Err() != nil {
+		return PrintResult{
+			Stdout:   stdout.String(),
+			Stderr:   stderr.String(),
+			ExitCode: exitCodeOf(cmd),
+			Duration: time.Since(start),
+		}, ctx.Err()
 	}
+	timedOut := runCtx.Err() != nil
 
 	res := PrintResult{
 		Stdout:   stdout.String(),

@@ -120,9 +120,35 @@ func closeEntry(entry *sessionEntry) error {
 	}
 	if entry.fakeHome != "" {
 		// One-shot mode: only symlinks + this session's private config live
-		// here; RemoveAll never touches the real ~/.gemini targets.
-		if err := os.RemoveAll(entry.fakeHome); err != nil && firstErr == nil {
-			firstErr = err
+		// here; RemoveAll never touches the real ~/.gemini targets. An
+		// in-flight turn (entry.mu held) still has a running agy child with
+		// HOME under this dir — deleting it out from under the child would
+		// break that turn, so cleanup is deferred until the turn releases the
+		// lock. Close() must not block for up to a full turn, hence TryLock +
+		// background finish rather than a plain Lock.
+		fakeHome := entry.fakeHome
+		bridgeCloser := entry.bridgeCloser
+		if entry.mu.TryLock() {
+			entry.mu.Unlock()
+			if err := os.RemoveAll(fakeHome); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		} else {
+			go func() {
+				entry.mu.Lock()
+				defer entry.mu.Unlock()
+				if err := os.RemoveAll(fakeHome); err != nil {
+					slog.Warn("agy-cli: deferred fake-home cleanup failed", "dir", fakeHome, "error", err)
+				}
+				if bridgeCloser != nil {
+					if err := bridgeCloser(); err != nil {
+						slog.Warn("agy-cli: deferred bridge close failed", "error", err)
+					}
+				}
+			}()
+			// The goroutine owns the bridge closer too (the in-flight turn may
+			// still be talking to the bridge); skip the synchronous close below.
+			return firstErr
 		}
 	}
 	if entry.bridgeCloser != nil {
@@ -696,32 +722,38 @@ func (p *AgyCLIProvider) createOneShotEntry(ctx context.Context, sessionKey, mod
 		}
 	}
 
+	// A fake HOME is built for EVERY one-shot session, bridge or not: the real
+	// global mcp_config.json may carry another (interactive) session's
+	// goclaw-bridge entry, and a bridge-less run against the real HOME would
+	// load it and assume that session's identity. BuildFakeHome additionally
+	// strips any stale goclaw-bridge key from the copied base config.
+	var servers map[string]any
 	if bridge != nil {
 		bridgeURL, closer, err := bridge.StartForBridgeContext(bc, sessionKey)
 		if err != nil {
 			return nil, fmt.Errorf("agy-cli: start bridge listener: %w", err)
 		}
 		bridgeCloser = closer
-
-		realGemini, err := p.realGeminiDir()
-		if err != nil {
-			cleanupOnErr()
-			return nil, fmt.Errorf("agy-cli: resolve real gemini dir: %w", err)
-		}
-		// MkdirTemp (not a fixed name) so concurrent ephemeral entries — which
-		// share the "default" workdir segment — never collide on one fake home.
-		fakeHome, err = os.MkdirTemp(workDir, "home-*")
-		if err != nil {
-			cleanupOnErr()
-			return nil, fmt.Errorf("agy-cli: mint fake home: %w", err)
-		}
-		servers := agycli.BuildAgyBridgeServers(bridgeURL, gatewayToken)
-		if err := agycli.BuildFakeHome(fakeHome, realGemini, servers); err != nil {
-			cleanupOnErr()
-			return nil, err
-		}
-		env = []string{"HOME=" + fakeHome}
+		servers = agycli.BuildAgyBridgeServers(bridgeURL, gatewayToken)
 	}
+
+	realGemini, err := p.realGeminiDir()
+	if err != nil {
+		cleanupOnErr()
+		return nil, fmt.Errorf("agy-cli: resolve real gemini dir: %w", err)
+	}
+	// MkdirTemp (not a fixed name) so concurrent ephemeral entries — which
+	// share the "default" workdir segment — never collide on one fake home.
+	fakeHome, err = os.MkdirTemp(workDir, "home-*")
+	if err != nil {
+		cleanupOnErr()
+		return nil, fmt.Errorf("agy-cli: mint fake home: %w", err)
+	}
+	if err := agycli.BuildFakeHome(fakeHome, realGemini, servers); err != nil {
+		cleanupOnErr()
+		return nil, err
+	}
+	env = []string{"HOME=" + fakeHome}
 
 	// Seed turn: install standing instructions (system prompt + text-only
 	// channel directive) and mint the conversation ID. Its answer is discarded.
@@ -782,6 +814,13 @@ func (p *AgyCLIProvider) oneShotTurnLocked(ctx context.Context, entry *sessionEn
 		timedOut = true
 	}
 	entry.lastUsed = time.Now()
+
+	// A hard failure (non-zero exit, nothing salvageable) must surface as an
+	// error, not as a silent empty "stop" answer — expired auth tokens and
+	// invalid conversation ids land here.
+	if !timedOut && res.ExitCode != 0 && answer == "" {
+		return nil, fmt.Errorf("agy-cli: print turn failed (exit %d, stderr tail: %s)", res.ExitCode, tailForLog(res.Stderr))
+	}
 
 	if conf == agycli.ConfidenceLow {
 		slog.Debug("agy-cli: low-confidence answer extraction", "name", p.name, "one_shot", true)

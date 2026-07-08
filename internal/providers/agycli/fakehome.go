@@ -1,6 +1,7 @@
 package agycli
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -91,6 +92,17 @@ func BuildFakeHome(fakeHome, realGemini string, servers map[string]any) error {
 		return fmt.Errorf("agycli: read real mcp config %s: %w", realConfig, rerr)
 	}
 
+	// The global config may carry a goclaw-bridge entry written by an
+	// INTERACTIVE session (MergeAgyMCPConfig still writes globally on that
+	// path). Copying it verbatim would hand THIS session another session's
+	// bridge URL — the exact cross-user identity path this isolation exists
+	// to close — so the stale key is always dropped before merging; only the
+	// caller's own servers may (re)introduce it.
+	baseRaw, err = stripServerKey(baseRaw, bridgeServerName)
+	if err != nil {
+		return fmt.Errorf("agycli: strip stale bridge entry: %w", err)
+	}
+
 	merged, err := mergeMCPServersDoc(baseRaw, servers)
 	if err != nil {
 		return fmt.Errorf("agycli: merge fake-home mcp config: %w", err)
@@ -100,6 +112,28 @@ func BuildFakeHome(fakeHome, realGemini string, servers map[string]any) error {
 		return fmt.Errorf("agycli: write %s: %w", cfgPath, err)
 	}
 	return nil
+}
+
+// stripServerKey removes one key from the top-level "mcpServers" map of a raw
+// mcp_config.json document, preserving everything else. nil/empty input passes
+// through unchanged.
+func stripServerKey(raw []byte, key string) ([]byte, error) {
+	if len(raw) == 0 {
+		return raw, nil
+	}
+	top := map[string]any{}
+	if err := json.Unmarshal(raw, &top); err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	mcpServers, _ := top["mcpServers"].(map[string]any)
+	if mcpServers == nil {
+		return raw, nil
+	}
+	if _, present := mcpServers[key]; !present {
+		return raw, nil
+	}
+	delete(mcpServers, key)
+	return json.Marshal(top)
 }
 
 // RealGeminiDir returns the operator's real ~/.gemini directory (the symlink
