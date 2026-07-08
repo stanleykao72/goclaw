@@ -1,6 +1,6 @@
 # agy one-shot print provider — change spec
 
-**Status**: PROPOSED（待 probe wave 後開工）
+**Status**: W0 DONE（probes 完成，見 `test-evidence/agy-oneshot-w0/RESULTS.md`）→ 待 W1 實作
 **Branch**: `feature/agy-oneshot-print`
 **Supersedes**: `docs/agy-cli-enhancement-plan.md` Phase 0 Q1 結論、`internal/providers/agycli/doc.go` empirical baseline 第 1、3 點
 **靈感來源**: [PeterPanSwift/fox-ai-roundtable](https://github.com/PeterPanSwift/fox-ai-roundtable)（零相依 `spawn` 驅動 `agy -p` + `--conversation` 續談，實證可行）
@@ -56,8 +56,8 @@
 | 元件 | interactive（現行） | one-shot（新） |
 |------|--------------------|---------------|
 | `sessionEntry.sess` | 常駐 `agycli.Session`（tmux 行程） | **nil** — 改存 `conversationID string` + `workDir string` |
-| turn 執行 | `sess.SendPrompt`（send-keys + capture-pane） | `exec.CommandContext` 跑 `agy` 一次，stdout 即答案 |
-| system prompt | GEMINI.md at session create | 同機制：首 turn 前寫 `<workDir>/GEMINI.md`（probe P1 驗證 print mode 會讀） |
+| turn 執行 | `sess.SendPrompt`（send-keys + capture-pane） | `exec.CommandContext` 跑 `agy` 一次，stdout 即答案。**必須 ctx hard-kill**（P3：`--print-timeout` 在 1.0.10 實測會被 wedge 穿透）；**timeout 的 turn 不得自動重試**（P3：被 kill 的 turn server 端可能已完成 = 重試會重複執行） |
+| system prompt | GEMINI.md at session create | **seed-turn**（P1 證實 print mode 不載 GEMINI.md — 無 workspace 概念）：session 首 turn 前先送一輪 `SYSTEM INSTRUCTIONS (standing rules...): <prompt> ... Acknowledge with exactly one word: OK`，輸出棄置；後續 turn 靠 conversation 記憶持續生效（P1b 驗證無回聲）。= claude_cli k-2 cold-seed 同型 |
 | 首 turn | NewSession 啟動 tmux | 帶 `--log-file <tmpfile>`，結束後 regex `Created conversation ([a-f0-9-]+)` 存入 entry（取代 session.go snapshot-diff — 該法自我降級為觀測用，log-file 法 race-free） |
 | 續 turn | 同一 tmux 行程 | `--conversation <id> -p <msg>` |
 | 併發 | `entry.mu` 序列化同 session | 同 — `entry.mu` 序列化同 conversation 的 turn |
@@ -70,7 +70,11 @@
 
 ### 2.4 輸出處理
 
-實測純文字 turn 的 stdout 是乾淨答案（無 TUI 殘影）。保留 `StripANSI` 作為安全網；`parse.go` 的重型啟發式（cursor-up/spinner 對抗）不進 one-shot 路徑。**工具型 turn 的 stdout 形狀未知 → probe P5**。
+實測（P5）：工具路徑明確時 stdout 是乾淨答案；flail（找不到目標）時會混逐行敘事 + `Error: timeout`。提取規則：
+- 保留 `StripANSI` 安全網；複用 PR #29 的 agentic-narration strip 過濾敘事行
+- **1.0.14 會在正常回覆後附 `**Summary of work:**` 尾段 → 需 strip**（1.0.10 無）
+- 檔案/圖片引用一律**絕對路徑寫進 prompt**（P5：cwd 與 `--add-dir` 都不被當 workspace，相對路徑會觸發全家目錄亂搜）
+- `parse.go` 的重型啟發式（cursor-up/spinner 對抗）不進 one-shot 路徑
 
 ### 2.5 設計難點：MCP bridge 的 per-run config race（本 change 最大風險）
 
@@ -90,11 +94,11 @@ session B: write config (B 的 URL) → spawn agy_B
 | O2 全域 write→spawn→exit 鎖 | provider 級 mutex 罩住「寫 config → 行程結束」 | 跨 session 的 turn 全序列化（turn 10–60s），多 bot 併發直接排隊；且嚴格說 agy 讀檔時點在 spawn 後，鎖到 exit 才安全 → 吞吐最差但絕對正確 |
 | ~~O3 per-session entry name~~ | `goclaw-bridge-<hash>` 各 session 一條 | **否決** — agy 啟動連**所有** configured servers，session A 的 agy 會連到 B 的 listener（bearer 共用、port 即身分）= 跨用戶工具存取，security no-go |
 
-**決策規則**：P2 證實可隔離 → O1；否則 fallback O2（VPS 目前流量低，可接受），並在 doc 記明吞吐代價。`AGY_CONFIG_DIR` 是 goclaw 測試 seam（只影響 goclaw 的 writer），**不是** agy 原生 env，不可誤用。
+**決策（W0 P2）**：**O1 定案** — Linux（部署目標）實測通過：fake HOME 內 `~/.gemini` 逐項 symlink（除 `config/` 用 per-session 獨立目錄）→ auth 經 symlink 共用成功 + 隔離 mcp_config.json 被讀。O2 不需要。macOS 本機 auth 因 Keychain 交互失敗（不影響部署）。`AGY_CONFIG_DIR` 是 goclaw 測試 seam（只影響 goclaw 的 writer），**不是** agy 原生 env，不可誤用。
 
 ## 3. Wave 計畫
 
-### W0 — Probes（不寫產品碼；每項留 test-evidence）
+### W0 — Probes ✅ DONE 2026-07-08（結果：`test-evidence/agy-oneshot-w0/RESULTS.md`）
 
 | # | 問題 | 方法 | 過關準則 |
 |---|------|------|---------|
