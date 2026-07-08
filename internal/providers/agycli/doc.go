@@ -33,4 +33,20 @@
 //  4. agy is highly agentic: even a trivial prompt may run tools, ask questions,
 //     or TIMEOUT. => the parser must tolerate heavy tool UI and the absence of a
 //     clean answer.
+//
+// # W0 correction (2026-07-08, agy v1.0.10 local + v1.0.14 deploy target)
+//
+// Points 1 and 3 above were OVERTURNED by the W0 probes
+// (docs/agy-oneshot-print-provider.md, test-evidence/agy-oneshot-w0/):
+// non-TTY "agy -p" completes normally with stdout intact, and
+// "--conversation <agy-minted-id>" (captured from --log-file's
+// "Created conversation" line) resumes with full cross-process context.
+// Phase 0's contrary result was almost certainly polluted by a stale
+// Antigravity OAuth token (same symptom signature as the 2026-06-22
+// esmith-general incident). The one-shot plumbing lives in oneshot.go /
+// fakehome.go; this package is now WIRED into providers via
+// agy_cli_provider.go in both interactive and one-shot modes. Two Phase 0
+// findings SURVIVE: print mode never loads a workspace (GEMINI.md unread,
+// cwd/--add-dir ignored — file refs must be absolute paths in the prompt),
+// and --print-timeout can be wedged through, so runs need a hard kill.
 package agycli

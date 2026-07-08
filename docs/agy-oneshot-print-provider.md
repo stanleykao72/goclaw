@@ -1,6 +1,6 @@
 # agy one-shot print provider — change spec
 
-**Status**: W0 DONE（probes 完成，見 `test-evidence/agy-oneshot-w0/RESULTS.md`）→ 待 W1 實作
+**Status**: W1 DONE（實作完成，gates 全綠）→ 待 W2 VPS A/B 驗證
 **Branch**: `feature/agy-oneshot-print`
 **Supersedes**: `docs/agy-cli-enhancement-plan.md` Phase 0 Q1 結論、`internal/providers/agycli/doc.go` empirical baseline 第 1、3 點
 **靈感來源**: [PeterPanSwift/fox-ai-roundtable](https://github.com/PeterPanSwift/fox-ai-roundtable)（零相依 `spawn` 驅動 `agy -p` + `--conversation` 續談，實證可行）
@@ -109,7 +109,7 @@ session B: write config (B 的 URL) → spawn agy_B
 | P5 | 工具型 turn 的 stdout 形狀 | 要求 agy 讀一個檔案再回答 → 檢查 stdout 是否混入工具進度 | 界定答案可提取的規則（若髒，定義最小 strip） |
 | P6 | `--conversation` 對已滿/巨大 conversation 的行為 | 20+ turn 後 resume | 無退化（記憶仍在、延遲可控） |
 
-### W1 — 實作（P1–P5 過關後）
+### W1 — 實作 ✅ DONE 2026-07-08（gates: go build ./... + vet + test ./internal/providers/... ./internal/config -race 全綠）
 
 1. `argbuilder.go`：`PrintOptions.Conversation` / `.LogFile` + tests
 2. `agycli` 新增 one-shot runner（`RunPrint(ctx, binary, opts) (stdout, conversationID, err)`，內含 log-file 建立/regex/清理；只依賴 stdlib，維持套件零耦合）+ tests

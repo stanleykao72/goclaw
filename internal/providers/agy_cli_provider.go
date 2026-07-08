@@ -6,31 +6,30 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/nextlevelbuilder/goclaw/internal/providers/agycli"
 )
 
-// agy_cli_provider.go bridges goclaw's Provider interface to a persistent
-// interactive agy ("Google Antigravity CLI") session.
+// agy_cli_provider.go bridges goclaw's Provider interface to agy ("Google
+// Antigravity CLI") in one of two modes:
 //
-// THE CRITICAL CONSTRAINT (Phase 0, agy v1.0.10): "agy --print" has NO
-// cross-turn memory — every --print invocation is a fresh conversation and
-// --conversation/-c do NOT replay prior context. The ONLY way to get multi-turn
-// memory is to keep ONE live interactive agy process open (an agycli.Session,
-// driven over tmux) and feed every subsequent turn into the SAME process.
+//   - INTERACTIVE (default): a persistent tmux-driven agy session per goclaw
+//     session_key. Built when Phase 0 (agy v1.0.10) concluded "--print" had no
+//     cross-turn memory. System prompt rides <workdir>/GEMINI.md at session
+//     creation; every turn sends only the user message into the live process.
+//   - ONE-SHOT (WithAgyCLIOneShot / config one_shot): W0 probes (2026-07-08,
+//     docs/agy-oneshot-print-provider.md) overturned Phase 0 — "--print
+//     --conversation <agy-minted-id>" DOES resume with full context — so each
+//     turn is an independent --print run resuming the session's conversation.
+//     GEMINI.md is NOT read in print mode (no workspace concept), so standing
+//     instructions install via a discarded seed turn instead.
 //
-// Therefore this provider keeps a map of live sessions keyed by the goclaw
-// session_key (OptSessionKey). The system prompt is delivered out-of-band: it is
-// written to <workdir>/GEMINI.md at session creation (see
-// agycli.SessionOptions.SystemPrompt), which agy auto-reads as system/context
-// instructions and FOLLOWS without echoing. It is NOT concatenated into any turn
-// prompt — agy's --print path has no system/user separation and would otherwise
-// echo the whole system prompt back as user content. Every turn therefore sends
-// only the user message; the live agy process remembers earlier turns. An empty
-// session_key yields a per-call ephemeral session that is Closed at the end of
-// that call.
+// Both modes keep a map of sessions keyed by the goclaw session_key
+// (OptSessionKey). An empty session_key yields a per-call ephemeral session
+// that is Closed at the end of that call.
 //
 // agy is NOT a token-streaming engine — it renders a TUI and we salvage the
 // final answer once the turn reaches the ready footer. ChatStream therefore
@@ -95,6 +94,17 @@ type sessionEntry struct {
 	mu           sync.Mutex
 	lastUsed     time.Time
 	bridgeCloser func() error
+
+	// One-shot mode only (sess == nil): there is no live process.
+	// conversationID is the agy-minted conversation every turn resumes
+	// (captured from the seed turn's --log-file); model is pinned at creation
+	// for launch-parity with the interactive path; env carries the per-session
+	// HOME override pointing at fakeHome, the isolated home dir built for
+	// MCP-config identity isolation (O1) and removed on Close/reap.
+	conversationID string
+	model          string
+	env            []string
+	fakeHome       string
 }
 
 // closeEntry closes the live agy session and tears down its per-session bridge
@@ -105,6 +115,13 @@ func closeEntry(entry *sessionEntry) error {
 	var firstErr error
 	if entry.sess != nil {
 		if err := entry.sess.Close(); err != nil {
+			firstErr = err
+		}
+	}
+	if entry.fakeHome != "" {
+		// One-shot mode: only symlinks + this session's private config live
+		// here; RemoveAll never touches the real ~/.gemini targets.
+		if err := os.RemoveAll(entry.fakeHome); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -125,6 +142,7 @@ type AgyCLIProvider struct {
 	baseWorkDir     string // base dir for per-session agy workspaces
 	sandbox         bool   // launch agy with --sandbox
 	skipPermissions bool   // launch agy with --dangerously-skip-permissions
+	oneShot         bool   // drive one-shot --print runs instead of a persistent tmux session
 	idleTTL         time.Duration
 
 	mu       sync.Mutex // protects the sessions map + workdir creation
@@ -149,6 +167,15 @@ type AgyCLIProvider struct {
 	// newSession is the session factory, injectable for tests. The default wraps
 	// agycli.NewSession (which takes binary as its 2nd arg) by closing over cliPath.
 	newSession func(ctx context.Context, opts agycli.SessionOptions) (agySession, error)
+
+	// runPrint executes one one-shot --print run (one-shot mode only).
+	// Injectable for tests so unit tests can fake agy turns without spawning a
+	// process. The default is agycli.RunPrint.
+	runPrint func(ctx context.Context, binary string, opts agycli.PrintOptions, extraEnv []string) (agycli.PrintResult, error)
+
+	// realGeminiDir resolves the operator's real ~/.gemini (the fake-home
+	// symlink source). Injectable for tests. Default: agycli.RealGeminiDir.
+	realGeminiDir func() (string, error)
 
 	closed    chan struct{} // closed by Close() to stop the reaper
 	closeOnce sync.Once     // makes Close idempotent
@@ -198,6 +225,17 @@ func WithAgyCLISkipPermissions(v bool) AgyCLIOption {
 	}
 }
 
+// WithAgyCLIOneShot toggles one-shot mode: every turn is an independent
+// "agy --print --conversation <id>" run instead of a persistent interactive
+// tmux session. Multi-turn memory rides on agy's conversation store (W0
+// probes, docs/agy-oneshot-print-provider.md). Off (the default) preserves the
+// interactive path bit-for-bit.
+func WithAgyCLIOneShot(v bool) AgyCLIOption {
+	return func(p *AgyCLIProvider) {
+		p.oneShot = v
+	}
+}
+
 // WithAgyCLIIdleTTL sets how long an idle live session is kept before the reaper
 // closes it. Non-positive values are ignored (the default is retained).
 func WithAgyCLIIdleTTL(d time.Duration) AgyCLIOption {
@@ -242,6 +280,25 @@ func withAgyCLISessionFactory(f func(ctx context.Context, opts agycli.SessionOpt
 	}
 }
 
+// withAgyCLIRunPrint injects a custom one-shot runner (test-only seam).
+func withAgyCLIRunPrint(f func(ctx context.Context, binary string, opts agycli.PrintOptions, extraEnv []string) (agycli.PrintResult, error)) AgyCLIOption {
+	return func(p *AgyCLIProvider) {
+		if f != nil {
+			p.runPrint = f
+		}
+	}
+}
+
+// withAgyCLIRealGeminiDir injects a custom real-gemini resolver (test-only seam)
+// so fake-home tests never touch the developer's actual ~/.gemini.
+func withAgyCLIRealGeminiDir(f func() (string, error)) AgyCLIOption {
+	return func(p *AgyCLIProvider) {
+		if f != nil {
+			p.realGeminiDir = f
+		}
+	}
+}
+
 // withAgyCLIWriteBridgeConfig injects a custom bridge-config writer (test-only
 // seam) so tests can capture the servers map passed at launch without touching
 // the real agy config dir.
@@ -276,6 +333,9 @@ func NewAgyCLIProvider(cliPath string, opts ...AgyCLIOption) *AgyCLIProvider {
 	// (AGY_CONFIG_DIR-overridable). Injectable so tests assert the written shape
 	// against a temp dir without touching real ~/.gemini.
 	p.writeBridgeConfig = agycli.MergeAgyMCPConfig
+	// One-shot mode defaults (unused while oneShot is false).
+	p.runPrint = agycli.RunPrint
+	p.realGeminiDir = agycli.RealGeminiDir
 	for _, opt := range opts {
 		opt(p)
 	}
@@ -373,6 +433,10 @@ func (p *AgyCLIProvider) turnOnEntry(ctx context.Context, entry *sessionEntry, u
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
 
+	if entry.sess == nil {
+		return p.oneShotTurnLocked(ctx, entry, userMsg)
+	}
+
 	turn, err := entry.sess.SendPrompt(ctx, userMsg)
 	if err != nil {
 		return nil, fmt.Errorf("agy-cli: send prompt: %w", err)
@@ -457,6 +521,10 @@ func (p *AgyCLIProvider) getOrCreateEntry(ctx context.Context, sessionKey, model
 // If anything fails after the listener is started, the listener is torn down so
 // no loopback port leaks.
 func (p *AgyCLIProvider) createEntry(ctx context.Context, sessionKey, model, systemPrompt string, bc BridgeContext) (*sessionEntry, error) {
+	if p.oneShot {
+		return p.createOneShotEntry(ctx, sessionKey, model, systemPrompt, bc)
+	}
+
 	// Snapshot bridge deps under the lock (SetBridge may run concurrently).
 	p.mu.Lock()
 	bridge := p.bridge
@@ -577,4 +645,164 @@ func (p *AgyCLIProvider) reapIdle(now time.Time) {
 			slog.Warn("agy-cli: failed to close idle session", "error", err)
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// One-shot --print mode (docs/agy-oneshot-print-provider.md)
+// ---------------------------------------------------------------------------
+//
+// W0 probes (2026-07-08) overturned the Phase 0 constraint quoted in this
+// file's header: "agy --print --conversation <agy-minted-id>" DOES resume with
+// full context across processes (verified on v1.0.10 and on the v1.0.14 deploy
+// target). One-shot mode therefore keeps NO live process: each turn is an
+// independent --print run resuming the session's conversation. The system
+// prompt cannot ride on GEMINI.md here (print mode never loads a workspace),
+// so it is installed by a discarded SEED TURN whose run also mints the
+// conversation ID (agycli.BuildSeedPrompt).
+
+// agyOneShotPrintTimeout is the --print-timeout for one-shot turns; the hard
+// wall-clock kill sits printTimeoutGrace above it inside agycli.RunPrint.
+const agyOneShotPrintTimeout = agycli.DefaultRunTimeout
+
+// createOneShotEntry provisions a one-shot session: per-session bridge
+// listener, isolated fake HOME (O1) when a bridge is wired, then a seed turn
+// that installs the standing instructions and mints the conversation ID.
+//
+// Bridge provisioning order matters just like the interactive path — the fake
+// home's mcp_config.json must exist before the FIRST run so the seed turn's
+// agy already sees this session's bridge entry. Unlike the interactive path,
+// the GLOBAL config is never written: isolation is the whole point (O1,
+// spec §2.5), so writeBridgeConfig is not used here.
+func (p *AgyCLIProvider) createOneShotEntry(ctx context.Context, sessionKey, model, systemPrompt string, bc BridgeContext) (*sessionEntry, error) {
+	// Snapshot bridge deps under the lock (SetBridge may run concurrently).
+	p.mu.Lock()
+	bridge := p.bridge
+	gatewayToken := p.gatewayToken
+	p.mu.Unlock()
+
+	workDir := p.ensureWorkDir(sessionKey)
+
+	var (
+		bridgeCloser func() error
+		fakeHome     string
+		env          []string
+	)
+	cleanupOnErr := func() {
+		if fakeHome != "" {
+			_ = os.RemoveAll(fakeHome)
+		}
+		if bridgeCloser != nil {
+			_ = bridgeCloser()
+		}
+	}
+
+	if bridge != nil {
+		bridgeURL, closer, err := bridge.StartForBridgeContext(bc, sessionKey)
+		if err != nil {
+			return nil, fmt.Errorf("agy-cli: start bridge listener: %w", err)
+		}
+		bridgeCloser = closer
+
+		realGemini, err := p.realGeminiDir()
+		if err != nil {
+			cleanupOnErr()
+			return nil, fmt.Errorf("agy-cli: resolve real gemini dir: %w", err)
+		}
+		// MkdirTemp (not a fixed name) so concurrent ephemeral entries — which
+		// share the "default" workdir segment — never collide on one fake home.
+		fakeHome, err = os.MkdirTemp(workDir, "home-*")
+		if err != nil {
+			cleanupOnErr()
+			return nil, fmt.Errorf("agy-cli: mint fake home: %w", err)
+		}
+		servers := agycli.BuildAgyBridgeServers(bridgeURL, gatewayToken)
+		if err := agycli.BuildFakeHome(fakeHome, realGemini, servers); err != nil {
+			cleanupOnErr()
+			return nil, err
+		}
+		env = []string{"HOME=" + fakeHome}
+	}
+
+	// Seed turn: install standing instructions (system prompt + text-only
+	// channel directive) and mint the conversation ID. Its answer is discarded.
+	seed, err := p.runPrint(ctx, p.cliPath, agycli.PrintOptions{
+		Prompt:          agycli.BuildSeedPrompt(systemPrompt),
+		Model:           model,
+		Sandbox:         p.sandbox,
+		SkipPermissions: p.skipPermissions,
+		PrintTimeout:    agyOneShotPrintTimeout,
+	}, env)
+	if err != nil {
+		cleanupOnErr()
+		return nil, fmt.Errorf("agy-cli: seed turn: %w", err)
+	}
+	if seed.TimedOut {
+		cleanupOnErr()
+		return nil, fmt.Errorf("agy-cli: seed turn timed out after %s (stderr tail: %s)", seed.Duration, tailForLog(seed.Stderr))
+	}
+	if seed.ConversationID == "" {
+		cleanupOnErr()
+		return nil, fmt.Errorf("agy-cli: seed turn produced no conversation id (stderr tail: %s)", tailForLog(seed.Stderr))
+	}
+
+	return &sessionEntry{
+		lastUsed:       time.Now(),
+		bridgeCloser:   bridgeCloser,
+		conversationID: seed.ConversationID,
+		model:          model,
+		env:            env,
+		fakeHome:       fakeHome,
+	}, nil
+}
+
+// oneShotTurnLocked runs one user turn as an independent --print run resuming
+// the entry's conversation. Caller holds entry.mu.
+//
+// A timed-out run maps to FinishReason "error" and is NEVER retried here: W0
+// P3 showed a killed turn may have completed server-side (the conversation
+// advances), so a retry could double-execute the user's request.
+func (p *AgyCLIProvider) oneShotTurnLocked(ctx context.Context, entry *sessionEntry, userMsg string) (*ChatResponse, error) {
+	// Bump at turn START too, so a long-running turn is not reaped mid-run.
+	entry.lastUsed = time.Now()
+
+	res, err := p.runPrint(ctx, p.cliPath, agycli.PrintOptions{
+		Prompt:          userMsg,
+		Model:           entry.model,
+		Sandbox:         p.sandbox,
+		SkipPermissions: p.skipPermissions,
+		PrintTimeout:    agyOneShotPrintTimeout,
+		Conversation:    entry.conversationID,
+	}, entry.env)
+	if err != nil {
+		return nil, fmt.Errorf("agy-cli: print turn: %w", err)
+	}
+
+	answer, conf, timedOut := agycli.ExtractPrintAnswer(res.Stdout)
+	if res.TimedOut {
+		timedOut = true
+	}
+	entry.lastUsed = time.Now()
+
+	if conf == agycli.ConfidenceLow {
+		slog.Debug("agy-cli: low-confidence answer extraction", "name", p.name, "one_shot", true)
+	}
+
+	finishReason := "stop"
+	if timedOut {
+		finishReason = "error"
+	}
+	return &ChatResponse{
+		Content:      answer,
+		FinishReason: finishReason,
+	}, nil
+}
+
+// tailForLog returns the last ~200 bytes of s, newline-flattened, for embedding
+// in error messages without dumping whole streams into logs.
+func tailForLog(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) > 200 {
+		s = s[len(s)-200:]
+	}
+	return strings.ReplaceAll(s, "\n", " | ")
 }

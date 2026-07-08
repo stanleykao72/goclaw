@@ -412,6 +412,9 @@ func registerAgyCLIFromConfig(registry *providers.Registry, cfg *config.Config) 
 	if cfg.Providers.AgyCLI.SkipPermissions {
 		opts = append(opts, providers.WithAgyCLISkipPermissions(true))
 	}
+	if cfg.Providers.AgyCLI.OneShot {
+		opts = append(opts, providers.WithAgyCLIOneShot(true))
+	}
 	// The per-session goclaw MCP bridge is NOT wired here: the gateway's
 	// BridgeSessionListeners is built later in BuildMux. cmd/gateway calls
 	// wireAgyBridge after BuildMux to supply it via SetBridge. (The claude path's

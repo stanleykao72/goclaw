@@ -110,6 +110,26 @@ func TestBuildPrintArgs(t *testing.T) {
 			want: []string{"-p", "hi", "--add-dir", "/tmp/a", "--add-dir", "/tmp/b"},
 		},
 		{
+			name: "conversation set",
+			opts: PrintOptions{Prompt: "hi", Conversation: "1ea82809-3482-44b6-ac01-4abdf0bd7fa2"},
+			want: []string{"-p", "hi", "--conversation", "1ea82809-3482-44b6-ac01-4abdf0bd7fa2"},
+		},
+		{
+			name: "conversation empty omitted",
+			opts: PrintOptions{Prompt: "hi", Conversation: ""},
+			want: []string{"-p", "hi"},
+		},
+		{
+			name: "log file set",
+			opts: PrintOptions{Prompt: "hi", LogFile: "/tmp/run.log"},
+			want: []string{"-p", "hi", "--log-file", "/tmp/run.log"},
+		},
+		{
+			name: "log file empty omitted",
+			opts: PrintOptions{Prompt: "hi", LogFile: ""},
+			want: []string{"-p", "hi"},
+		},
+		{
 			name: "all flags together in canonical order",
 			opts: PrintOptions{
 				Prompt:          "do the thing",
@@ -118,6 +138,8 @@ func TestBuildPrintArgs(t *testing.T) {
 				SkipPermissions: true,
 				PrintTimeout:    2 * time.Minute,
 				AddDirs:         []string{"/work/one", "/work/two"},
+				Conversation:    "5cb5ca2f-753a-48f9-81d2-c6c301d4bd86",
+				LogFile:         "/tmp/agy-run.log",
 			},
 			want: []string{
 				"-p", "do the thing",
@@ -125,6 +147,8 @@ func TestBuildPrintArgs(t *testing.T) {
 				"--sandbox",
 				"--dangerously-skip-permissions",
 				"--print-timeout", "2m0s",
+				"--conversation", "5cb5ca2f-753a-48f9-81d2-c6c301d4bd86",
+				"--log-file", "/tmp/agy-run.log",
 				"--add-dir", "/work/one",
 				"--add-dir", "/work/two",
 			},
