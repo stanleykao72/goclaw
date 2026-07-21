@@ -138,7 +138,7 @@ func TestExtractRunnerNilResult(t *testing.T) {
 
 func TestExtractRunnerError(t *testing.T) {
 	h := newTestHandler(func(ctx context.Context, imagePath string) (*Result, error) {
-		return nil, fmt.Errorf("claude CLI not found")
+		return nil, fmt.Errorf("agy CLI not found")
 	})
 	mux := newMux(h)
 	token := makeToken(testSecret, "7", time.Now().Add(time.Minute).Unix())

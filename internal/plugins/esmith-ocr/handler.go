@@ -2,8 +2,9 @@
 // job_field_recorder WOFF expense wizard. The browser POSTs a base64 receipt
 // image plus a short-lived HMAC token minted by Odoo (fr_expense_api
 // ocr_token); the handler verifies the token locally with the shared secret,
-// writes the image to a temp file, and runs a one-shot `claude -p` vision
-// extraction bounded by a concurrency semaphore and a hard timeout.
+// writes the image to a temp file, and runs a one-shot vision CLI extraction
+// (provider-pluggable: agy / claude / codex / grok / gemini / …) bounded by a
+// concurrency semaphore and a hard timeout.
 //
 // Trust boundary: the token is `uid.exp.hexsig` where hexsig =
 // hex(hmac_sha256(secret, uid+"."+exp)). Verification failures always return
@@ -27,15 +28,14 @@ import (
 )
 
 // maxImageBytes is the decoded-image size cap. Anything larger is rejected
-// before touching disk or claude.
+// before touching disk or the vision CLI.
 const maxImageBytes = 10 * 1024 * 1024
 
-// runnerTimeout is the hard limit for a single claude invocation. On expiry
+// runnerTimeout is the hard limit for a single vision CLI invocation. On expiry
 // the process is killed (via context) and the request resolves to result:null.
 const runnerTimeout = 60 * time.Second
 
-// maxConcurrentRunners caps simultaneous claude processes. Shared subscription
-// rate limit with e-smith-hub — see the fr-expense-invoice-ocr design doc.
+// maxConcurrentRunners caps simultaneous vision CLI processes.
 const maxConcurrentRunners = 2
 
 // Result is the structured invoice extraction returned by the vision runner.
@@ -64,8 +64,8 @@ type Handler struct {
 	now func() time.Time
 }
 
-// NewHandler wires a production handler using the claude CLI runner and a
-// semaphore of maxConcurrentRunners.
+// NewHandler wires a production handler using the pluggable vision CLI runner
+// and a semaphore of maxConcurrentRunners.
 func NewHandler(secret string, allowOrigins []string) *Handler {
 	return &Handler{
 		Secret:       secret,
@@ -277,10 +277,19 @@ func (h *Handler) handleExtract(w http.ResponseWriter, r *http.Request) {
 
 	result, err := h.runner(ctx, tmpPath)
 	if err != nil {
-		// Runner infrastructure failure (e.g. claude CLI missing). Degrade
+		// Runner infrastructure failure (e.g. vision CLI binary missing). Degrade
 		// to result:null — the frontend falls back to manual entry.
 		slog.Warn("esmith-ocr: runner failed", "err", err)
 		result = nil
 	}
+	sellerVat := ""
+	if result != nil && result.SellerVat != nil {
+		sellerVat = *result.SellerVat
+	}
+	invNo := ""
+	if result != nil && result.InvoiceNo != nil {
+		invNo = *result.InvoiceNo
+	}
+	slog.Info("esmith-ocr: extract ok", "invoice_no", invNo, "seller_vat", sellerVat, "has_result", result != nil)
 	writeJSON(w, http.StatusOK, extractResponse{Success: true, Result: result})
 }
