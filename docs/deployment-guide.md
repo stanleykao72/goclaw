@@ -9,6 +9,18 @@ Production target uses a hybrid deployment:
 - Nginx reverse proxies public HTTP/HTTPS traffic to GoClaw on localhost.
 - Codex CLI is installed on the host for future agent-controlled CLI work.
 
+> **Actual current runtime (verified 2026-07-22, Oracle ARM64 VPS).** The live host does **not** use the `/opt/goclaw/releases` + `goclaw-upgrade-release` release-tarball model documented in the sections below (that pipeline pulls GitHub Releases from `digitopvn/goclaw` and is not active here). Instead the gateway runs from a **git checkout at `/home/ubuntu/goclaw`** (remote `fork` → the esmith fork, branch `esmith/main`), built in place with `make build` (`CGO_ENABLED=0 go build`; Go toolchain at `/usr/local/go/bin`, `go.mod` pins `go 1.26.0` so an older host `go` auto-downloads the matching toolchain), and supervised by a **user-level** systemd unit — `systemctl --user … goclaw`, parented by `systemd --user` — **not** the system-level `goclaw.service` (which is present but `inactive`). The binary listens on `127.0.0.1:18790` behind Nginx.
+>
+> **Deploy on this host** = update the checkout, rebuild, restart, verify:
+> ```bash
+> cd /home/ubuntu/goclaw
+> git fetch fork && git merge --ff-only fork/esmith/main
+> PATH=$PATH:/usr/local/go/bin make build          # produces ./goclaw
+> systemctl --user restart goclaw
+> curl -fsS http://127.0.0.1:18790/health           # expect {"status":"ok","protocol":3}
+> ```
+> DB migrations run via `make migrate` (docker compose) or `goclaw upgrade` when a release changes the schema. The `/opt/goclaw` + release-pipeline sections below are retained as a documented alternative/target, not the current mechanism.
+
 Current VPS shape:
 
 | Item | Value |
