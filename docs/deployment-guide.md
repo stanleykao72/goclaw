@@ -44,6 +44,33 @@ export GOCLAW_SSH_PORT=<ssh-port>
 export GOCLAW_DOMAIN=<public-domain>
 ```
 
+## Provider Configuration (config.json vs DB)
+
+LLM providers are configured in **two** places. Keep this split intentional:
+
+**`config.json` → `providers.*`** — static, file-declared providers. This is the single home for all CLI-subprocess and API-key providers:
+
+| Provider | `config.json` key | Notes |
+|---|---|---|
+| Claude CLI | `providers.claude_cli` | `cli_path` (e.g. `/home/ubuntu/.local/bin/claude`) |
+| Grok CLI | `providers.grok_cli` | `cli_path` (`~/.grok/bin/grok`), `model` `grok-4.5`, `perm_mode` `bypassPermissions` |
+| Agy CLI | `providers.agy_cli` | `cli_path` (`~/.local/bin/agy`) |
+| ACP (Gemini/other) | `providers.acp` | `binary` |
+| API providers | `providers.{anthropic,openai,xai,gemini,…}` | api key + endpoint |
+
+Each also has an env fallback (`GOCLAW_<NAME>_CLI_PATH`, …), but **prefer `config.json`** so there is one source of truth — do not set both (env overrides file and re-splits the config).
+
+**Database `llm_providers` (managed via `goclaw providers …`)** — for providers whose auth is **not** a static file value:
+
+| Provider | Why DB, not `config.json` |
+|---|---|
+| `openai-codex` (`chatgpt_oauth`) | Uses `oauth.NewDBTokenSource` — OAuth access/refresh tokens live in the DB secretStore and are rotated at runtime. There is **no** `config.json` block for `chatgpt_oauth`, and OAuth tokens must not sit in a plaintext config file. **Codex stays in the DB by design.** |
+| `acp-claude` (`acp`) | Dynamically managed ACP agent row. |
+
+Manage DB providers with `goclaw providers list|add|update|delete` (talks to the running gateway). Moving a static CLI provider from DB → `config.json`: add its `providers.<type>` block, `goclaw providers delete <id> --force`, then restart. Verify with `journalctl --user -u goclaw | grep "registered provider"` — file providers log `registered provider name=…`, DB providers log `registered provider from DB name=…`.
+
+**Rule of thumb:** CLI-subprocess + static API-key providers → `config.json`; OAuth-token-backed providers (`chatgpt_oauth`) → DB.
+
 ## Server Layout
 
 | Path | Purpose |
