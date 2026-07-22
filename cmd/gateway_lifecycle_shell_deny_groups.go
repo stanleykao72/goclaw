@@ -64,6 +64,7 @@ func reloadShellDenyProviderPolicies(providerReg *providers.Registry, provStore 
 	}
 	snapshot := cfg.Clone()
 	registerClaudeCLIFromConfig(providerReg, snapshot)
+	registerGrokCLIFromConfig(providerReg, snapshot)
 	if snapshot.Providers.ACP.Binary != "" {
 		registerACPFromConfig(providerReg, snapshot.Providers.ACP, snapshot.ShellDenyGroupsSnapshot())
 	}
@@ -83,6 +84,8 @@ func reloadShellDenyProviderPolicies(providerReg *providers.Registry, provStore 
 		switch p.ProviderType {
 		case store.ProviderClaudeCLI:
 			registerClaudeCLIFromDB(providerReg, p, gatewayAddr, snapshot.Gateway.Token, mcpStore, snapshot)
+		case store.ProviderGrokCLI:
+			registerGrokCLIFromDB(providerReg, p)
 		case store.ProviderACP:
 			registerACPFromDB(providerReg, p, snapshot.ShellDenyGroupsSnapshot())
 		}

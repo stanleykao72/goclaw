@@ -360,6 +360,7 @@ type ProvidersConfig struct {
 	Ollama         OllamaConfig    `json:"ollama"`       // local Ollama instance (no API key needed)
 	OllamaCloud    ProviderConfig  `json:"ollama_cloud"` // Ollama Cloud (API key required)
 	ClaudeCLI      ClaudeCLIConfig `json:"claude_cli"`
+	GrokCLI        GrokCLIConfig   `json:"grok_cli"`
 	AgyCLI         AgyCLIConfig    `json:"agy_cli"`
 	ACP            ACPConfig       `json:"acp"`
 	Novita         ProviderConfig  `json:"novita"`          // Novita AI (OpenAI-compatible endpoint)
@@ -391,6 +392,14 @@ type ClaudeCLIConfig struct {
 	Model       string `json:"model" yaml:"model"`                 // default model alias (default: "sonnet")
 	BaseWorkDir string `json:"base_work_dir" yaml:"base_work_dir"` // base dir for agent workspaces
 	PermMode    string `json:"perm_mode" yaml:"perm_mode"`         // permission mode (default: "bypassPermissions")
+}
+
+// GrokCLIConfig configures the Grok CLI provider (uses grok.com subscription, not API key).
+type GrokCLIConfig struct {
+	CLIPath     string `json:"cli_path" yaml:"cli_path"`           // path to grok binary (default: "grok")
+	Model       string `json:"model" yaml:"model"`                 // default model alias (default: "grok-4.5")
+	PermMode    string `json:"perm_mode" yaml:"perm_mode"`         // permission mode (default: "bypassPermissions")
+	BaseWorkDir string `json:"base_work_dir" yaml:"base_work_dir"` // base dir for agent workspaces
 }
 
 // AgyCLIConfig configures the agy CLI provider (uses Gemini/Google auth, not API key).
@@ -489,6 +498,7 @@ func (c *Config) HasAnyProvider() bool {
 		p.Ollama.Host != "" ||
 		p.OllamaCloud.APIKey != "" ||
 		p.ClaudeCLI.CLIPath != "" ||
+		p.GrokCLI.CLIPath != "" ||
 		p.AgyCLI.CLIPath != "" ||
 		p.ACP.Binary != "" ||
 		p.Novita.APIKey != "" ||

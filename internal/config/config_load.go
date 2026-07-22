@@ -222,6 +222,11 @@ func (c *Config) applyEnvOverrides() {
 	envStr("GOCLAW_CLAUDE_CLI_MODEL", &c.Providers.ClaudeCLI.Model)
 	envStr("GOCLAW_CLAUDE_CLI_WORK_DIR", &c.Providers.ClaudeCLI.BaseWorkDir)
 
+	// Grok CLI provider
+	envStr("GOCLAW_GROK_CLI_PATH", &c.Providers.GrokCLI.CLIPath)
+	envStr("GOCLAW_GROK_CLI_MODEL", &c.Providers.GrokCLI.Model)
+	envStr("GOCLAW_GROK_CLI_WORK_DIR", &c.Providers.GrokCLI.BaseWorkDir)
+
 	// agy CLI provider
 	envStr("GOCLAW_AGY_CLI_PATH", &c.Providers.AgyCLI.CLIPath)
 	envStr("GOCLAW_AGY_CLI_MODEL", &c.Providers.AgyCLI.Model)

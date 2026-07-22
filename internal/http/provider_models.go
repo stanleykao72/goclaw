@@ -56,6 +56,12 @@ func (h *ProvidersHandler) handleListProviderModels(w http.ResponseWriter, r *ht
 		return
 	}
 
+	// Grok CLI doesn't need an API key — return hardcoded models
+	if p.ProviderType == store.ProviderGrokCLI {
+		respond(grokCLIModels())
+		return
+	}
+
 	if p.ProviderType == store.ProviderChatGPTOAuth {
 		respond(chatGPTOAuthModels())
 		return

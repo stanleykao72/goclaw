@@ -173,6 +173,9 @@ func (h *ProvidersHandler) RegisterRoutes(mux *http.ServeMux) {
 
 	// Claude CLI auth status (global — not per-provider)
 	mux.HandleFunc("GET /v1/providers/claude-cli/auth-status", h.auth(h.handleClaudeCLIAuthStatus))
+
+	// Grok CLI auth status (global — not per-provider)
+	mux.HandleFunc("GET /v1/providers/grok-cli/auth-status", h.auth(h.handleGrokCLIAuthStatus))
 }
 
 func (h *ProvidersHandler) auth(next http.HandlerFunc) http.HandlerFunc {
@@ -237,6 +240,28 @@ func (h *ProvidersHandler) registerInMemory(p *store.LLMProviderData) providerRu
 			cliOpts = append(cliOpts, providers.WithClaudeCLIMCPConfigData(mcpData))
 		}
 		h.providerReg.RegisterForTenant(p.TenantID, providers.NewClaudeCLIProvider(cliPath, cliOpts...))
+		return providerRuntimeRegistered
+	}
+	// Grok CLI doesn't need an API key — register immediately (routes through grok.com subscription).
+	if p.ProviderType == store.ProviderGrokCLI {
+		cliPath := p.APIBase // reuse APIBase field for CLI path
+		if cliPath == "" {
+			cliPath = "grok"
+		}
+		// Validate: only accept "grok" or absolute path (mirrors startup path in cmd/gateway_providers.go).
+		// Prevents DB-poisoning attacks where a relative path resolves against CWD.
+		if cliPath != "grok" && !filepath.IsAbs(cliPath) {
+			slog.Warn("security.grok_cli: invalid path, using default", "path", cliPath, "provider", p.Name)
+			cliPath = "grok"
+		}
+		if _, err := exec.LookPath(cliPath); err != nil {
+			slog.Warn("grok-cli: binary not found, skipping in-memory registration", "path", cliPath, "provider", p.Name, "error", err)
+			return providerRuntimeInvalidConfig
+		}
+		cliOpts := []providers.GrokCLIOption{
+			providers.WithGrokCLIName(p.Name),
+		}
+		h.providerReg.RegisterForTenant(p.TenantID, providers.NewGrokCLIProvider(cliPath, cliOpts...))
 		return providerRuntimeRegistered
 	}
 	// Ollama doesn't need an API key — handle before the key guard (same as startup).
@@ -396,6 +421,9 @@ func validateProviderURL(rawURL string, providerType string) error {
 	if providerType == store.ProviderClaudeCLI {
 		return validateClaudeCLIExecutablePath(rawURL)
 	}
+	if providerType == store.ProviderGrokCLI {
+		return validateGrokCLIExecutablePath(rawURL)
+	}
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return fmt.Errorf("invalid URL: %w", err)
@@ -478,6 +506,19 @@ func validateClaudeCLIExecutablePath(path string) error {
 	return fmt.Errorf("Claude CLI api_base must be %q or an absolute executable path, got %q", "claude", path)
 }
 
+func validateGrokCLIExecutablePath(path string) error {
+	if strings.Contains(path, "\x00") {
+		return fmt.Errorf("Grok CLI executable path cannot contain NUL byte")
+	}
+	if _, err := url.ParseRequestURI(path); err == nil && strings.Contains(path, "://") {
+		return fmt.Errorf("Grok CLI api_base must be an executable path or %q, got URL %q", "grok", path)
+	}
+	if path == "grok" || filepath.IsAbs(path) {
+		return nil
+	}
+	return fmt.Errorf("Grok CLI api_base must be %q or an absolute executable path, got %q", "grok", path)
+}
+
 // --- Provider CRUD ---
 
 func (h *ProvidersHandler) handleListProviders(w http.ResponseWriter, r *http.Request) {
@@ -532,6 +573,23 @@ func (h *ProvidersHandler) handleCreateProvider(w http.ResponseWriter, r *http.R
 			if ep.ProviderType == store.ProviderClaudeCLI {
 				writeJSON(w, http.StatusConflict, map[string]string{
 					"error": i18n.T(locale, i18n.MsgAlreadyExists, "Claude CLI provider", "only one is allowed per instance"),
+				})
+				return
+			}
+		}
+	}
+
+	// Only one Grok CLI provider is allowed per instance (1 machine = 1 auth session).
+	// Mutex serializes check+create to prevent TOCTOU race.
+	if p.ProviderType == store.ProviderGrokCLI {
+		h.cliMu.Lock()
+		defer h.cliMu.Unlock()
+
+		existing, _ := h.store.ListProviders(r.Context())
+		for _, ep := range existing {
+			if ep.ProviderType == store.ProviderGrokCLI {
+				writeJSON(w, http.StatusConflict, map[string]string{
+					"error": i18n.T(locale, i18n.MsgAlreadyExists, "Grok CLI provider", "only one is allowed per instance"),
 				})
 				return
 			}

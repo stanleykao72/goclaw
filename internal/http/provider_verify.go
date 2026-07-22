@@ -100,6 +100,20 @@ func (h *ProvidersHandler) handleVerifyProvider(w http.ResponseWriter, r *http.R
 		return
 	}
 
+	// Grok CLI: validate model alias locally (no LLM call needed).
+	if p.ProviderType == store.ProviderGrokCLI {
+		if pingMode {
+			writeJSON(w, http.StatusOK, map[string]any{"valid": true})
+			return
+		}
+		if req.Model == "" || strings.HasPrefix(strings.ToLower(req.Model), "grok") {
+			writeJSON(w, http.StatusOK, map[string]any{"valid": true})
+		} else {
+			writeJSON(w, http.StatusOK, map[string]any{"valid": false, "error": "Invalid model. Use a grok-* alias (e.g. grok-4.5)"})
+		}
+		return
+	}
+
 	if h.providerReg == nil {
 		writeJSON(w, http.StatusOK, map[string]any{"valid": false, "error": "no provider registry available"})
 		return
@@ -190,6 +204,45 @@ func (h *ProvidersHandler) handleClaudeCLIAuthStatus(w http.ResponseWriter, r *h
 		"email":             status.Email,
 		"subscription_type": status.SubscriptionType,
 		"in_docker":         inDocker,
+	})
+}
+
+// handleGrokCLIAuthStatus checks whether the Grok CLI is authenticated on the server.
+//
+//	GET /v1/providers/grok-cli/auth-status
+//	Response: {"logged_in": true, "account": "grok.com"}
+//	     or: {"logged_in": false, "error": "..."}
+func (h *ProvidersHandler) handleGrokCLIAuthStatus(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	// Try to find CLI path from an existing Grok CLI provider in DB.
+	cliPath := "grok"
+	if existing, err := h.store.ListProviders(r.Context()); err == nil {
+		for _, p := range existing {
+			if p.ProviderType == store.ProviderGrokCLI && p.APIBase != "" {
+				cliPath = p.APIBase
+				break
+			}
+		}
+	}
+
+	inDocker := config.InDocker()
+
+	status, err := providers.CheckGrokAuthStatus(ctx, cliPath)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"logged_in": false,
+			"error":     err.Error(),
+			"in_docker": inDocker,
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"logged_in": status.LoggedIn,
+		"account":   status.Account,
+		"in_docker": inDocker,
 	})
 }
 
