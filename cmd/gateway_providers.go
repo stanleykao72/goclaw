@@ -197,6 +197,8 @@ func registerProviders(registry *providers.Registry, cfg *config.Config, modelRe
 
 	registerClaudeCLIFromConfig(registry, cfg)
 
+	registerGrokCLIFromConfig(registry, cfg)
+
 	registerAgyCLIFromConfig(registry, cfg)
 
 	// ACP provider (config-based) — orchestrates any ACP-compatible agent binary
@@ -228,6 +230,11 @@ func registerProvidersFromDB(registry *providers.Registry, provStore store.Provi
 		}
 		if p.ProviderType == store.ProviderClaudeCLI {
 			registerClaudeCLIFromDB(registry, p, gatewayAddr, gatewayToken, mcpStore, cfg)
+			continue
+		}
+		// Grok CLI doesn't need an API key (routes through grok.com subscription).
+		if p.ProviderType == store.ProviderGrokCLI {
+			registerGrokCLIFromDB(registry, p)
 			continue
 		}
 		// ACP provider — no API key needed (agents manage their own auth).
@@ -394,6 +401,25 @@ func registerClaudeCLIFromConfig(registry *providers.Registry, cfg *config.Confi
 	slog.Info("registered provider", "name", "claude-cli")
 }
 
+func registerGrokCLIFromConfig(registry *providers.Registry, cfg *config.Config) {
+	if cfg == nil || cfg.Providers.GrokCLI.CLIPath == "" {
+		return
+	}
+	cliPath := cfg.Providers.GrokCLI.CLIPath
+	var opts []providers.GrokCLIOption
+	if cfg.Providers.GrokCLI.Model != "" {
+		opts = append(opts, providers.WithGrokCLIModel(cfg.Providers.GrokCLI.Model))
+	}
+	if cfg.Providers.GrokCLI.BaseWorkDir != "" {
+		opts = append(opts, providers.WithGrokCLIWorkDir(cfg.Providers.GrokCLI.BaseWorkDir))
+	}
+	if cfg.Providers.GrokCLI.PermMode != "" {
+		opts = append(opts, providers.WithGrokCLIPermMode(cfg.Providers.GrokCLI.PermMode))
+	}
+	registry.Register(providers.NewGrokCLIProvider(cliPath, opts...))
+	slog.Info("registered provider", "name", "grok-cli")
+}
+
 func registerAgyCLIFromConfig(registry *providers.Registry, cfg *config.Config) {
 	if cfg == nil || cfg.Providers.AgyCLI.CLIPath == "" {
 		return
@@ -474,6 +500,27 @@ func registerClaudeCLIFromDB(registry *providers.Registry, p store.LLMProviderDa
 		cliOpts = append(cliOpts, providers.WithClaudeCLIMCPConfigData(mcpData))
 	}
 	registry.RegisterForTenant(p.TenantID, providers.NewClaudeCLIProvider(cliPath, cliOpts...))
+	slog.Info("registered provider from DB", "name", p.Name)
+	return true
+}
+
+func registerGrokCLIFromDB(registry *providers.Registry, p store.LLMProviderData) bool {
+	cliPath := p.APIBase // reuse APIBase field for CLI path
+	if cliPath == "" {
+		cliPath = "grok"
+	}
+	// Validate: only accept "grok" or absolute path
+	if cliPath != "grok" && !filepath.IsAbs(cliPath) {
+		slog.Warn("security.grok_cli: invalid path from DB, using default", "path", cliPath)
+		cliPath = "grok"
+	}
+	if _, err := exec.LookPath(cliPath); err != nil {
+		slog.Warn("grok-cli: binary not found, skipping", "path", cliPath, "error", err)
+		return false
+	}
+	var cliOpts []providers.GrokCLIOption
+	cliOpts = append(cliOpts, providers.WithGrokCLIName(p.Name))
+	registry.RegisterForTenant(p.TenantID, providers.NewGrokCLIProvider(cliPath, cliOpts...))
 	slog.Info("registered provider from DB", "name", p.Name)
 	return true
 }

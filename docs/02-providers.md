@@ -85,6 +85,7 @@ Supported price units: input, output, cache read, cache write, reasoning, reques
 |----------|------|----------|---------------|
 | **anthropic** | Native HTTP + SSE | API key required | `claude-sonnet-4-5-20250929` |
 | **claude_cli** | stdio subprocess + MCP | Binary path (default: `claude`) | `sonnet` |
+| **grok_cli** | stdio subprocess | Binary path (default: `grok`) | `grok-4.5` |
 | **codex** | OAuth Responses API | OAuth token source | `gpt-5.5` |
 | **acp** | JSON-RPC 2.0 subagents | Binary + workspace dir | `claude` |
 | **dashscope** | OpenAI-compat wrapper | API key + custom models | `qwen3-max` |
@@ -594,6 +595,43 @@ Per-session MCP servers are configured via `MCPConfigData`. The CLI automaticall
 ### Thinking Support
 
 Claude CLI inherits thinking support from the underlying Claude model. Thinking blocks are passed through in streaming chunks if the model supports them.
+
+---
+
+## 11.1 Grok CLI Provider
+
+The Grok CLI provider (`provider_type = "grok_cli"`) delegates requests to a local **Grok Build CLI** (`grok`) using the user's grok.com subscription — no xAI API key. Like Claude CLI it is a thin subprocess proxy: the CLI manages session history, tools, and context; GoClaw forwards the latest prompt and streams back text + thinking. This is distinct from the `xai` HTTP provider (OpenAI-compatible, API-key based).
+
+### Configuration
+
+Via `config.json`:
+
+```json5
+{
+  "providers": {
+    "grok_cli": {
+      "cli_path": "grok",              // binary path or name (default: grok)
+      "model": "grok-4.5",            // default model
+      "perm_mode": "bypassPermissions", // grok --permission-mode
+      "base_work_dir": "/tmp/agents"  // workspace directory (grok --cwd)
+    }
+  }
+}
+```
+
+Or via environment: `GOCLAW_GROK_CLI_PATH`, `GOCLAW_GROK_CLI_MODEL`, `GOCLAW_GROK_CLI_WORK_DIR`.
+Or via the database `llm_providers` table with `provider_type = "grok_cli"` (`api_base` is the CLI binary selector, not an HTTP URL — no SSRF opt-in applies).
+
+### Invocation
+
+- **Chat**: `grok -p <prompt> --permission-mode bypassPermissions --output-format json [--rules <system>] [--cwd <dir>] [--model <m>]`
+- **ChatStream**: same with `--output-format streaming-json`, parsing line-delimited `{"type":"thought"|"text"|"end"}` events.
+- **System prompt**: injected via `--rules` (appends to grok's system prompt).
+- **Sessions**: a deterministic UUID (`deriveSessionUUID(session_key)`) is passed as `--session-id` on the first turn and `--resume` on later turns; existence is detected by stat-ing `~/.grok/sessions/<encoded-cwd>/<uuid>/`.
+
+### Auth status
+
+`GET /v1/providers/grok-cli/auth-status` → `{"logged_in": true, "account": "grok.com"}` (runs `grok models` to detect login).
 
 ---
 

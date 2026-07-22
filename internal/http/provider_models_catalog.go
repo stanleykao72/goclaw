@@ -76,6 +76,13 @@ func claudeCLIModels() []ModelInfo {
 	}
 }
 
+// grokCLIModels returns the model aliases accepted by the Grok CLI.
+func grokCLIModels() []ModelInfo {
+	return []ModelInfo{
+		{ID: "grok-4.5", Name: "Grok 4.5"},
+	}
+}
+
 // acpModels returns the model aliases for ACP-compatible coding agents.
 func acpModels() []ModelInfo {
 	return []ModelInfo{

@@ -70,7 +70,8 @@ accepted though not in `--help`), `--model` optional. For the provider swap
 | working dir | `--cwd <CWD>` |
 | permissions | `--permission-mode bypassPermissions` (proven) / `--allow` / `--deny` / `--always-approve` |
 | disable tools | `--disallowed-tools`, `--disable-web-search` |
-| system prompt / agent | `--agent <NAME\|file>`, `--agents <JSON>` |
+| system prompt | **`--rules <STR>`** — "Extra rules to append to the system prompt" (probed: lands in system-prompt layer, argv-safe, no temp file) |
+| agent def (alt) | `--agent <NAME\|file>`, `--agents <JSON>` |
 | MCP | `grok mcp …` |
 
 ## 3. Design
@@ -110,11 +111,14 @@ Simplifications vs claude_cli:
 3. **Sessions** (`--session-id`/`--resume`).
 4. **Tools/MCP + security** (T6 perm, T11, T12).
 
-## 6. Open questions (resolve in P0 probes)
-- **System prompt**: no CLAUDE.md equivalent confirmed. Options: `--agent <file>` gen def, or prepend to prompt. Needs probe.
-- **`--session-id` stability**: caller-supplied UUID for new session + `--resume` continuation. Needs probe.
-- **Deny-pattern parity**: grok `--deny` grammar vs claude hook patterns — may need translation or `--disallowed-tools` + restricted `--allow`.
-- Cost (`total_cost_usd`) surfacing; per-session dir locking (reuse `lockSession`); binary PATH discovery.
+## 6. Open questions
+RESOLVED by P0 probes:
+- **System prompt** ✅ → inject via first-class `--rules <systemPrompt>` (appends to grok's system prompt; argv-safe, no temp file). Emit only when non-empty. Prepend-to-prompt kept as fallback for older builds lacking `--rules`.
+- **Session lifecycle** ✅ → reuse `deriveSessionUUID(sessionKey)` (v5 UUID, accepted). Turn 1: `--session-id <uuid>`; later turns: `--resume <uuid>`. Grok hard-errors both ways ("already in use" / "does not exist"), so the provider MUST branch first-vs-later via `grokSessionExists` (stat `~/.grok/sessions/<pct-enc EvalSymlinks(cwd)>/<uuid>/`, per-cwd namespaced). Never `--fork-session` for continuation (mints a new v7). Sessions are namespaced by `--cwd`.
+
+Still open (deferred):
+- **Deny-pattern parity**: grok `--deny` grammar vs claude hook patterns — may need translation or `--disallowed-tools` + restricted `--allow`. (spec §3 defers security-hook confinement)
+- Cost (`total_cost_usd`) surfacing; binary PATH discovery. (`lockSession` per-session locking already reused.)
 
 ## 7. Test plan
 - Unit: parse fixtures (§2.1/§2.2), argv builder, session UUID (T4).
