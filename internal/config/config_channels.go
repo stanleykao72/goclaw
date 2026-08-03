@@ -409,6 +409,7 @@ type AgyCLIConfig struct {
 	BaseWorkDir     string `json:"base_work_dir" yaml:"base_work_dir"`       // base dir for agent workspaces
 	Sandbox         bool   `json:"sandbox" yaml:"sandbox"`                   // run agy in sandbox mode
 	SkipPermissions bool   `json:"skip_permissions" yaml:"skip_permissions"` // skip agy permission prompts
+	OneShot         bool   `json:"one_shot" yaml:"one_shot"`                 // one-shot --print turns instead of a persistent tmux session (docs/agy-oneshot-print-provider.md)
 }
 
 // ACPConfig configures the ACP (Agent Client Protocol) provider.

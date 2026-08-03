@@ -47,6 +47,36 @@ func AgyMCPConfigPath() string {
 	return filepath.Join(AgyConfigDir(), "mcp_config.json")
 }
 
+// mergeMCPServersDoc merges servers into the top-level "mcpServers" map of an
+// existing mcp_config.json document (existingRaw may be nil/empty for a fresh
+// file) and returns the marshaled result. Unknown top-level keys are preserved
+// verbatim; on key collision inside "mcpServers" the caller's entries win. If
+// the existing "mcpServers" value is some other JSON type (malformed config),
+// it is replaced with a fresh map rather than failing — the caller's intent is
+// to install servers. Shared by MergeAgyMCPConfig (global config) and
+// BuildFakeHome (per-session isolated config).
+func mergeMCPServersDoc(existingRaw []byte, servers map[string]any) ([]byte, error) {
+	top := map[string]any{}
+	if len(existingRaw) > 0 {
+		if err := json.Unmarshal(existingRaw, &top); err != nil {
+			return nil, fmt.Errorf("parse existing config: %w", err)
+		}
+	}
+	mcpServers, _ := top["mcpServers"].(map[string]any)
+	if mcpServers == nil {
+		mcpServers = map[string]any{}
+	}
+	for name, entry := range servers {
+		mcpServers[name] = entry
+	}
+	top["mcpServers"] = mcpServers
+	data, err := json.MarshalIndent(top, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("marshal mcp config: %w", err)
+	}
+	return data, nil
+}
+
 // bridgeServerName is the key under "mcpServers" for the goclaw bridge entry in
 // agy's global config. Stable so MergeAgyMCPConfig overwrites the same key each
 // session launch rather than accumulating per-session entries.
@@ -125,31 +155,9 @@ func MergeAgyMCPConfig(servers map[string]any) (string, error) {
 		return "", nil
 	}
 
-	// Decode the existing top-level object (preserving every key) into a generic
-	// map. A missing/empty file starts from an empty object.
-	top := map[string]any{}
-	if hadFile && len(existingRaw) > 0 {
-		if err := json.Unmarshal(existingRaw, &top); err != nil {
-			return "", fmt.Errorf("agycli: parse existing %s: %w", path, err)
-		}
-	}
-
-	// Locate (or create) the top-level "mcpServers" map. If the existing value is
-	// some other JSON type (malformed config), replace it with a fresh map rather
-	// than failing — the caller's intent is to install servers.
-	mcpServers, _ := top["mcpServers"].(map[string]any)
-	if mcpServers == nil {
-		mcpServers = map[string]any{}
-	}
-	// Merge by key: caller wins on collision, existing untouched keys preserved.
-	for name, entry := range servers {
-		mcpServers[name] = entry
-	}
-	top["mcpServers"] = mcpServers
-
-	data, err := json.MarshalIndent(top, "", "  ")
+	data, err := mergeMCPServersDoc(existingRaw, servers)
 	if err != nil {
-		return "", fmt.Errorf("agycli: marshal mcp config: %w", err)
+		return "", fmt.Errorf("agycli: merge %s: %w", path, err)
 	}
 
 	dir := AgyConfigDir()

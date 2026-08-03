@@ -23,6 +23,8 @@ type PrintOptions struct {
 	SkipPermissions bool          // true => --dangerously-skip-permissions
 	PrintTimeout    time.Duration // optional => --print-timeout <dur>
 	AddDirs         []string      // optional => repeated --add-dir <d>
+	Conversation    string        // optional => --conversation <id> (resume an agy-minted conversation)
+	LogFile         string        // optional => --log-file <path> (per-run CLI log; used for first-turn conversation-ID capture)
 }
 
 // BuildPrintArgs returns the argv (everything after the binary) for a one-shot
@@ -30,9 +32,9 @@ type PrintOptions struct {
 //
 // The result always starts with ["-p", o.Prompt] followed by the requested
 // flags, in this order: --model, --sandbox, --dangerously-skip-permissions,
-// --print-timeout, then one --add-dir <d> per AddDirs entry. Empty optional
-// fields are omitted. Sandbox and SkipPermissions are independent: either, both,
-// or neither may be set.
+// --print-timeout, --conversation, --log-file, then one --add-dir <d> per
+// AddDirs entry. Empty optional fields are omitted. Sandbox and SkipPermissions
+// are independent: either, both, or neither may be set.
 //
 // It returns ErrEmptyPrompt (and a nil argv) when o.Prompt is empty, since an
 // empty prompt would let the next flag slide into -p's value and silently drop
@@ -58,6 +60,12 @@ func BuildPrintArgs(o PrintOptions) ([]string, error) {
 		// agy parses Go-style durations (e.g. "5m0s"); time.Duration.String()
 		// emits exactly that form.
 		args = append(args, "--print-timeout", o.PrintTimeout.String())
+	}
+	if o.Conversation != "" {
+		args = append(args, "--conversation", o.Conversation)
+	}
+	if o.LogFile != "" {
+		args = append(args, "--log-file", o.LogFile)
 	}
 	for _, d := range o.AddDirs {
 		if d == "" {
